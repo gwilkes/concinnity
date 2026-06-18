@@ -1,0 +1,124 @@
+#version 450
+// GPU-compute particle simulation kernel for the Vulkan backend. Mirrors the
+// `particle_simulate` kernel in src/metal/shaders/particle.metal and the
+// `main` kernel in src/directx/shaders/particle_simulate.hlsl: one thread per
+// slot in the per-emitter particle pool. Each thread ages + integrates the
+// slot's current particle; if the slot is dead (lifetime == 0) and the per-
+// frame spawn budget still has room, it atomically claims one slot and
+// respawns a fresh particle inside a cone of half-angle `acos(spread_cos)`
+// around `direction`.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// One particle slot. Layout must match `GpuParticle` in
+// vulkan/particle.rs (32 bytes per slot - 0/12/16/28). std430 packs a
+// (vec3, float) pair into a single 16-byte block.
+struct Particle {
+    vec3  position;
+    float age;
+    vec3  velocity;
+    float lifetime;
+};
+
+// Particle pool - read-write storage buffer at set 0 binding 0.
+layout(set = 0, binding = 0, std430) buffer Pool {
+    Particle data[];
+} pool;
+
+// One u32 atomic counter at set 0 binding 1, holding the remaining spawn
+// budget for this dispatch. Threads racing to spawn `atomicAdd` it with
+// 0xFFFFFFFFu (i.e. -1 in two's complement) and only the threads that
+// observed a positive remaining count actually spawn.
+layout(set = 0, binding = 1, std430) buffer SpawnCounter {
+    uint value;
+} spawn_counter;
+
+// Per-frame compute uniform. Layout mirrors `ParticleParams` in
+// gfx/render_types.rs (112 bytes) field-for-field; std140 / std430 both
+// pack a (vec3, float) pair into a single 16-byte block, matching the
+// Rust `[f32; 3]` + `f32` packing exactly.
+layout(push_constant) uniform ParticleParamsBlock {
+    vec3  position;
+    float spread_cos;
+    vec3  direction;
+    float speed_min;
+    vec3  gravity;
+    float speed_max;
+    vec4  color_start;
+    vec4  color_end;
+    float lifetime_min;
+    float lifetime_max;
+    float size_start;
+    float size_end;
+    float dt;
+    uint  spawn_budget;
+    uint  random_seed;
+    uint  max_particles;
+} params;
+
+// Cheap fixed-point hash → unit float in [0, 1). Mirrors the `prng` helper
+// in particle.metal / particle_simulate.hlsl. Mutating in-place so a thread
+// that needs several uncorrelated samples advances the state between calls.
+float prng(inout uint state) {
+    state = state * 1664525u + 1013904223u;
+    return float(state >> 8) * (1.0 / 16777216.0);
+}
+
+// Sample a unit vector inside a cone of half-angle `acos(cone_cos)` centred
+// on `axis`. Mirrors `sample_cone` in particle.metal.
+vec3 sample_cone(inout uint rng, vec3 axis, float cone_cos) {
+    float u = mix(cone_cos, 1.0, prng(rng));
+    float r = sqrt(max(1.0 - u * u, 0.0));
+    float phi = prng(rng) * 6.2831853;
+    vec3  local = vec3(r * cos(phi), r * sin(phi), u);
+
+    vec3 up = abs(axis.y) < 0.9 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    vec3 t = normalize(cross(up, axis));
+    vec3 b = cross(axis, t);
+    return normalize(local.x * t + local.y * b + local.z * axis);
+}
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= params.max_particles) {
+        return;
+    }
+    Particle pt = pool.data[id];
+
+    // 1. Age the existing particle in this slot, if any. A `lifetime` of 0
+    //    flags a dead slot; everything else is live.
+    if (pt.lifetime > 0.0) {
+        pt.age += params.dt;
+        if (pt.age >= pt.lifetime) {
+            pt.lifetime = 0.0;
+        } else {
+            pt.velocity = pt.velocity + params.gravity * params.dt;
+            pt.position = pt.position + pt.velocity * params.dt;
+        }
+    }
+
+    // 2. If this slot is dead and the per-frame spawn budget still has room,
+    //    try to claim one slot from the atomic counter. The counter holds
+    //    "remaining" spawns; when it hits zero, no further threads spawn.
+    if (pt.lifetime == 0.0 && params.spawn_budget > 0u) {
+        // atomicAdd with 0xFFFFFFFFu adds -1 in two's-complement, returning
+        // the original (pre-subtract) value - exact parity with Metal's
+        // `atomic_fetch_sub_explicit(&counter, 1u, relaxed)`.
+        uint claimed = atomicAdd(spawn_counter.value, 0xFFFFFFFFu);
+        if (claimed > 0u && claimed <= params.spawn_budget) {
+            uint rng = (id * 747796405u) ^ (params.random_seed * 2891336453u);
+            // Warm up the RNG so adjacent threads decorrelate. `prng`
+            // mutates `rng` in-place; the returned float is dropped.
+            float _warm = prng(rng);
+            vec3 dir = sample_cone(rng, normalize(params.direction), params.spread_cos);
+            float speed = mix(params.speed_min, params.speed_max, prng(rng));
+            float life  = mix(params.lifetime_min, params.lifetime_max, prng(rng));
+            pt.position = params.position;
+            pt.velocity = dir * speed;
+            pt.age      = 0.0;
+            pt.lifetime = max(life, 0.001);
+        }
+    }
+
+    pool.data[id] = pt;
+}

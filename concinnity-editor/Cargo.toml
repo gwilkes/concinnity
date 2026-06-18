@@ -1,0 +1,124 @@
+[package]
+name = "concinnity-editor"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "concinnity"
+path = "src/main.rs"
+
+# The editor crate owns the full C-ABI surface now that it has moved out of the
+# runtime crate. The lib is named `concinnity_editor` (not `concinnity`) so it
+# does not collide with the `concinnity` bin: on Windows a bin and a cdylib that
+# share a name both emit `<name>.pdb`, which Cargo rejects as an output filename
+# collision. The cdylib is therefore `libconcinnity_editor.dylib` (macOS) /
+# `concinnity_editor.dll` (Windows). The Swift app (concinnity-xcode) link
+# settings and bridging header must reference that artifact name; the generated
+# C header path (include/concinnity.h) is unchanged.
+[lib]
+name = "concinnity_editor"
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+doctest = false
+
+[features]
+# Mirror the client's Vulkan feature so an editor build can target the Vulkan
+# backend; forwards to the runtime crate, the compile pipeline, and core.
+vulkan = [
+    "dep:ash",
+    "dep:glfw",
+    "dep:shaderc",
+    "concinnity-client/vulkan",
+    "concinnity-cook/vulkan",
+    "concinnity-core/vulkan",
+]
+
+[dependencies]
+# The runtime crate (rlib): the editor drives a live App and the renderer
+# through the runtime's public API.
+concinnity-client = { path = "../concinnity-client" }
+# The asset compile pipeline: cn build / cn add / cn debug / the editor FFI.
+# Carries the gltf/png/jpeg decoders; the editor calls them through
+# concinnity_cook::{glb,texture,color_lut,mesh_reimport}.
+concinnity-cook = { path = "../concinnity-cook" }
+# Direct core access for the world/geometry/ecs types the moved build code names
+# (concinnity_core::{world,build,geometry,ecs}).
+concinnity-core = { path = "../concinnity-core" }
+argon2 = "0.5"
+async-stream = "0.3.6"
+ciborium = "0.2"
+bitflags = "2.0"
+chrono = "0.4.44"
+clap = { version = "4", features = ["derive"] }
+ctrlc = "3.5.2"
+directories = "6.0.0"
+futures = "0.3.32"
+gltf = { version = "1", default-features = false, features = ["utils", "names"] }
+hex = "0.4.3"
+hmac = "0.12.1"
+ignore = "0.4.25"
+jsonwebtoken = "9"
+libloading = "0.9.0"
+notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
+rand = "0.8"
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11.19"
+serde_json = { version = "1", features = ["preserve_order"] }
+slotmap = "1.1.1"
+thiserror = "2.0.18"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+tokio-util = { version = "0.7.18", features = ["rt"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+ureq = { version = "3.2.0", features = ["json"] }
+
+[target.'cfg(not(any(target_os = "macos", target_os = "windows")))'.dependencies]
+ash = "0.38"
+glfw = "0.61.0"
+shaderc = "0.10.1"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Direct3D_Dxc",
+    "Win32_Graphics_Direct3D_Fxc",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_UI_Input",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+ash = { version = "0.38", optional = true }
+glfw = { version = "0.61.0", optional = true }
+shaderc = { version = "0.10.1", optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6.2"
+core-foundation = "0.10.1"
+dispatch2 = "0.3.1"
+objc2 = "0.6.4"
+objc2-app-kit = "0.3.2"
+objc2-core-graphics = "0.3.2"
+objc2-foundation = "0.3.2"
+objc2-metal = "0.3.2"
+objc2-metal-fx = "0.3.2"
+objc2-metal-kit = "0.3.2"
+objc2-quartz-core = "0.3.2"
+
+[dev-dependencies]
+tempfile = "3.25.0"
+
+[build-dependencies]
+cbindgen = "0.29"
+concinnity-toolchain = { path = "../concinnity-toolchain" }

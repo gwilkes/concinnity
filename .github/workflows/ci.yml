@@ -1,0 +1,95 @@
+name: Continuous Integration
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+    branches: ["main", "master"]
+
+# Cancel an in-progress run when a newer commit is pushed to the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Job 1: Ensure code conforms to standard formatting rules
+  format:
+    name: Check Formatting
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Install Stable Toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: rustfmt
+
+      - name: Run Cargo Fmt
+        run: cargo fmt --all -- --check
+
+  # Job 2: Vet the dependency graph (advisories, licenses, bans, sources).
+  # Reads Cargo.lock and metadata only, so it needs no system libraries.
+  deny:
+    name: Dependency Advisories & Licenses
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Run Cargo Deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  # Job 3: Catch common idiomatic mistakes and bugs
+  lint:
+    name: Lint Code base
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Install Linux Dependencies
+        uses: ./.github/actions/install-linux-deps
+
+      - name: Install Stable Toolchain & Enable Cache
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: clippy
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  # Job 4: Compile every backend (Metal on macOS, DirectX on Windows, Vulkan on
+  # Linux) and run the test suite. The build step type-checks the platform-gated
+  # renderer code the Linux jobs never see. Tests run only on Linux because the
+  # macOS and Windows runners are headless (no GPU device to create).
+  build:
+    name: Build & Test
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      # No-op on macOS and Windows (guarded by runner.os inside the action).
+      - name: Install Linux Dependencies
+        uses: ./.github/actions/install-linux-deps
+
+      # Automatic smart caching of target/ and ~/.cargo/ registers
+      - name: Install Stable Toolchain & Warm Cache
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Compile Code
+        run: cargo build --all-targets --verbose
+
+      - name: Run Test Suites
+        if: runner.os == 'Linux'
+        run: cargo test --verbose

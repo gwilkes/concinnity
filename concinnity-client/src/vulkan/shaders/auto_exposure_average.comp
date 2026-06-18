@@ -1,0 +1,63 @@
+#version 450
+
+// Auto-exposure histogram average kernel - GLSL port of the matching kernel
+// in metal/shaders/auto_exposure.metal and directx/shaders/auto_exposure.hlsl.
+// One threadgroup of HISTOGRAM_BINS threads. Each thread reads its bin's
+// count, clears the bin for the next frame's build pass, then participates in
+// a parallel reduction that writes the count-weighted average log-luminance
+// to `output_avg.value`. Bin 0 is treated as "below sensor floor" and
+// weighted out, so a mostly-black frame still produces a finite EV.
+
+const uint HISTOGRAM_BINS = 256u;
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) buffer HistogramBlock {
+    uint bins[];
+} histogram;
+
+layout(std430, set = 0, binding = 1) buffer OutputBlock {
+    float value;
+} output_avg;
+
+layout(push_constant) uniform AutoExposureParams {
+    float lum_log2_min;
+    float lum_log2_range;
+    float lum_to_bin_scale;
+    float _pad;
+} params;
+
+shared uint  reduce_counts[HISTOGRAM_BINS];
+shared float reduce_weighted[HISTOGRAM_BINS];
+
+void main() {
+    uint tid = gl_LocalInvocationIndex;
+
+    uint count = histogram.bins[tid];
+    // Clear for the next frame's build pass. Safe because every thread has
+    // already read its bin and the reduction below operates on the shared
+    // copies.
+    histogram.bins[tid] = 0u;
+
+    // Drop the sub-floor bin so mostly-black frames don't peg the average.
+    uint effective_count = (tid == 0u) ? 0u : count;
+    float step = params.lum_log2_range / float(HISTOGRAM_BINS);
+    float centre = params.lum_log2_min + (float(tid) + 0.5) * step;
+    reduce_counts[tid]   = effective_count;
+    reduce_weighted[tid] = centre * float(effective_count);
+    barrier();
+
+    for (uint stride = HISTOGRAM_BINS / 2u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            reduce_counts[tid]   += reduce_counts[tid + stride];
+            reduce_weighted[tid] += reduce_weighted[tid + stride];
+        }
+        barrier();
+    }
+
+    if (tid == 0u) {
+        output_avg.value = (reduce_counts[0] > 0u)
+            ? (reduce_weighted[0] / float(reduce_counts[0]))
+            : params.lum_log2_min;
+    }
+}

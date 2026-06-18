@@ -1,0 +1,107 @@
+[package]
+name = "concinnity-client"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "concinnity_client"
+crate-type = ["rlib"]
+path = "src/lib.rs"
+doctest = false
+
+[features]
+# Build the Windows client against the Vulkan backend instead of the default
+# DirectX one. Linux always uses Vulkan and macOS always uses Metal regardless
+# of this feature; build.rs resolves the backend cfg from the target and this
+# feature. On non-Windows targets the feature is inert (the deps it activates
+# are Windows-only optional deps).
+vulkan = [
+    "dep:ash",
+    "dep:glfw",
+    "dep:shaderc",
+    "concinnity-core/vulkan",
+]
+
+[dependencies]
+# Renderer-free shared foundation: the crate-wide result type and the
+# backend-agnostic GPU data layouts, re-exported under crate::result and
+# crate::gfx so existing internal paths keep resolving.
+# Runtime foundation only: the runtime reads pre-compiled blobs and links no
+# image/glTF decoder. Those decoders live in concinnity-cook, which the
+# build/edit/debug paths reach through the concinnity-editor crate, not here.
+concinnity-core = { path = "../concinnity-core" }
+ciborium = "0.2"
+bitflags = "2.0"
+ctrlc = "3.5.2"
+directories = "6.0.0"
+kira = "0.12"
+libloading = "0.9.0"
+mint = "0.5"
+notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
+png = "0.18.1"
+rand = "0.8"
+rapier3d = "0.32"
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11.19"
+serde_json = { version = "1", features = ["preserve_order"] }
+slotmap = "1.1.1"
+thiserror = "2.0.18"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7.18", features = ["rt"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+
+[target.'cfg(not(any(target_os = "macos", target_os = "windows")))'.dependencies]
+ash = "0.38"
+glfw = "0.61.0"
+shaderc = "0.10.1"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Direct3D_Dxc",
+    "Win32_Graphics_Direct3D_Fxc",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_UI_Input",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+# Activated by the `vulkan` feature for a Vulkan build on Windows. `ash` loads
+# Vulkan dynamically (no build-time linking); `glfw` provides windowing/input;
+# `shaderc` compiles GLSL to SPIR-V (used by both the build pipeline and the
+# Vulkan backend's runtime shader compilation). `shaderc` links the Vulkan
+# SDK's prebuilt library when SHADERC_LIB_DIR points at it, otherwise it builds
+# from source -- see README/docs.
+ash = { version = "0.38", optional = true }
+glfw = { version = "0.61.0", optional = true }
+shaderc = { version = "0.10.1", optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6.2"
+core-foundation = "0.10.1"
+dispatch2 = "0.3.1"
+objc2 = "0.6.4"
+objc2-app-kit = "0.3.2"
+objc2-core-graphics = "0.3.2"
+objc2-foundation = "0.3.2"
+objc2-metal = "0.3.2"
+objc2-metal-fx = "0.3.2"
+objc2-metal-kit = "0.3.2"
+objc2-quartz-core = "0.3.2"
+
+[dev-dependencies]
+tempfile = "3.25.0"
+
+[build-dependencies]
+concinnity-toolchain = { path = "../concinnity-toolchain" }

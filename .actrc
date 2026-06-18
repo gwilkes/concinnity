@@ -1,0 +1,4 @@
+# Most GitHub Action images are amd64; run them under emulation on Apple Silicon.
+--container-architecture linux/amd64
+# Full-featured runner image so apt-get and the Rust tooling are available.
+-P ubuntu-latest=catthehacker/ubuntu:act-latest

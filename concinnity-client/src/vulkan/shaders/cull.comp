@@ -1,0 +1,283 @@
+#version 450
+
+layout(local_size_x = 64) in;
+
+struct GpuObjectData {
+    mat4  model;
+    vec3  tint;      float roughness;
+    vec3  emissive;  float metallic;
+    uint  albedo_index;
+    uint  normal_index;
+    float macro_variation;
+    float terrain_blend;
+    vec3  bb_min;    float cull_distance;
+    vec3  bb_max;    float secondary_blend_sharpness;
+    uint  albedo_secondary_index;
+    uint  normal_secondary_index;
+    uint  _pad2;
+    uint  _pad3;
+};
+
+struct GpuDrawArgs {
+    uint index_count;
+    uint index_offset;
+    uint base_vertex;
+    uint flags;
+};
+
+// Matches VkDrawIndexedIndirectCommand (20 bytes).
+struct DrawIndexedIndirectCommand {
+    uint index_count;
+    uint instance_count;
+    uint first_index;
+    int  vertex_offset;
+    uint first_instance;
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer ObjectBlock {
+    GpuObjectData objects[];
+} obj_buf;
+
+layout(std430, set = 0, binding = 1) readonly buffer DrawArgsBlock {
+    GpuDrawArgs args[];
+} arg_buf;
+
+layout(std430, set = 0, binding = 2) writeonly buffer CommandBlock {
+    DrawIndexedIndirectCommand cmds[];
+} cmd_buf;
+
+// The GPU-driven shadow cull (`SHADOW_CULL`) is frustum + distance only -- sun
+// cascades have no prior-frame light-space depth pyramid, so there is no Hi-Z
+// test and no two-pass occlusion. It therefore omits the status SSBO (binding 3)
+// and the whole set-1 Hi-Z block, leaving a lean 3-SSBO set-0 layout; its push
+// constant carries each cascade's light frustum.
+#ifndef SHADOW_CULL
+// Per-object outcome of phase-1 cull, written for two-pass occlusion. The
+// phase-2 kernel (CULL_PHASE2) reads it to decide which objects to re-test
+// against the rebuilt Hi-Z. Always bound + written so phase 2 sees valid data;
+// under single-pass occlusion the values are simply ignored. Mirrors
+// directx/shaders/cull.hlsl and metal/shaders/cull.metal.
+layout(std430, set = 0, binding = 3) buffer StatusBlock {
+    uint status[];
+} status_buf;
+#endif
+
+layout(push_constant) uniform CullParams {
+    vec4  planes[6];
+    vec3  cam_pos;
+    uint  object_count;
+} cull;
+
+#ifndef SHADOW_CULL
+// Hi-Z occlusion inputs (set 1). The pyramid is built at the end of the
+// previous frame from that frame's main depth; `prev_view_proj` is that
+// frame's un-jittered view-projection, so projecting an AABB through it lands
+// in the depth space the pyramid was reduced from. `hiz_enabled` is 0 on the
+// first frame and immediately after a resize (no valid pyramid yet), where the
+// kernel falls back to frustum + distance only. Layout mirrors
+// `vulkan::hiz::CullHizParams` (80 bytes, std140) and the Metal / DirectX
+// CullUniforms tail.
+layout(set = 1, binding = 0) uniform sampler2D hiz_tex;
+layout(std140, set = 1, binding = 1) uniform CullHizParams {
+    mat4  prev_view_proj;
+    vec2  hiz_size;
+    uint  hiz_mip_count;
+    uint  hiz_enabled;
+} hiz;
+#endif // !SHADOW_CULL
+
+const uint DRAW_ENABLED  = 1u;
+const uint DRAW_CULLABLE = 2u;
+
+// `cull_status` values. STATUS_HIZ_CANDIDATE is the only outcome phase 2
+// re-tests against the rebuilt pyramid; the others are settled by phase 1.
+// Mirrors directx/shaders/cull.hlsl.
+const uint STATUS_DRAWN         = 0u; // visible in phase 1 -> never re-tested
+const uint STATUS_HIZ_CANDIDATE = 1u; // Hi-Z-occluded in phase 1 -> candidate
+const uint STATUS_CULLED        = 2u; // frustum/distance/disabled -> settled
+
+// AABB entirely behind any plane -> outside the frustum. Negation of
+// gfx::frustum::Frustum::intersects_aabb (the p-vertex test).
+bool frustum_culled(vec3 bb_min, vec3 bb_max) {
+    for (uint i = 0u; i < 6u; ++i) {
+        vec3 n = cull.planes[i].xyz;
+        vec3 farthest = vec3(
+            n.x >= 0.0 ? bb_max.x : bb_min.x,
+            n.y >= 0.0 ? bb_max.y : bb_min.y,
+            n.z >= 0.0 ? bb_max.z : bb_min.z);
+        if (dot(n, farthest) + cull.planes[i].w < 0.0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Squared distance from the camera to the closest point on the AABB; 0 when
+// the camera is inside. Mirrors gfx::frustum::aabb_distance_sq.
+float aabb_distance_sq(vec3 bb_min, vec3 bb_max) {
+    vec3 d = max(max(bb_min - cull.cam_pos, cull.cam_pos - bb_max), vec3(0.0));
+    return dot(d, d);
+}
+
+#ifndef SHADOW_CULL
+// Project the eight AABB corners through the previous frame's un-jittered VP
+// and reduce to a screen-space rect (NDC.xy in [-1, 1]) plus the AABB's closest
+// NDC depth. Returns false if any corner ended up behind the camera (w <= 0),
+// in which case the caller conservatively keeps the object. Mirrors
+// metal/shaders/cull.metal::project_aabb.
+bool project_aabb(vec3 bb_min, vec3 bb_max,
+                  out vec2 ndc_min, out vec2 ndc_max, out float min_depth) {
+    ndc_min = vec2( 1.0,  1.0);
+    ndc_max = vec2(-1.0, -1.0);
+    min_depth = 1.0;
+    for (uint i = 0u; i < 8u; ++i) {
+        vec3 corner = vec3(
+            (i & 1u) != 0u ? bb_max.x : bb_min.x,
+            (i & 2u) != 0u ? bb_max.y : bb_min.y,
+            (i & 4u) != 0u ? bb_max.z : bb_min.z);
+        vec4 clip = hiz.prev_view_proj * vec4(corner, 1.0);
+        if (clip.w <= 0.0) {
+            return false;
+        }
+        vec3 ndc = clip.xyz / clip.w;
+        ndc_min = min(ndc_min, ndc.xy);
+        ndc_max = max(ndc_max, ndc.xy);
+        min_depth = min(min_depth, ndc.z);
+    }
+    return true;
+}
+
+// True when the AABB is fully occluded by the Hi-Z pyramid (built from the
+// previous frame's depth). Conservative: any uncertain case returns false
+// (keep the object). Mirrors metal/shaders/cull.metal::hiz_occluded. The NDC
+// y-flip (`0.5 - ndc.y * 0.5`) matches the main pass's negative-height
+// viewport, and depth is the standard Vulkan [0, 1] range so MAX-reduced texels
+// store the farthest occluder.
+bool hiz_occluded(vec3 bb_min, vec3 bb_max) {
+    vec2 ndc_min, ndc_max;
+    float aabb_min_depth;
+    if (!project_aabb(bb_min, bb_max, ndc_min, ndc_max, aabb_min_depth)) {
+        return false;
+    }
+    // Clip to NDC bounds so the UV math stays sane (an AABB straddling the
+    // viewport on both sides of an axis is already kept by the frustum test).
+    ndc_min = max(ndc_min, vec2(-1.0, -1.0));
+    ndc_max = min(ndc_max, vec2( 1.0,  1.0));
+    if (any(greaterThan(ndc_min, ndc_max))) {
+        return false;
+    }
+    // Standard depth: nearest point of the AABB at NDC.z near 0. Behind-near or
+    // behind-far means we conservatively keep the AABB.
+    if (aabb_min_depth < 0.0 || aabb_min_depth > 1.0) {
+        return false;
+    }
+    // Map NDC -> UV (y flips because NDC y is up, UV v is down).
+    vec2 uv_min = vec2(ndc_min.x * 0.5 + 0.5, 0.5 - ndc_max.y * 0.5);
+    vec2 uv_max = vec2(ndc_max.x * 0.5 + 0.5, 0.5 - ndc_min.y * 0.5);
+    // Size of the rect at mip 0, in texels.
+    vec2 size_tex = (uv_max - uv_min) * hiz.hiz_size;
+    float max_dim = max(size_tex.x, size_tex.y);
+    // Pick the mip whose texels are roughly the rect size so a 2x2 footprint
+    // covers the rect (the standard Hi-Z 4-tap pattern).
+    int mip = int(ceil(log2(max(max_dim, 1.0))));
+    mip = clamp(mip, 0, int(hiz.hiz_mip_count) - 1);
+    vec2 mip_dim = max(hiz.hiz_size / float(1u << uint(mip)), vec2(1.0, 1.0));
+    ivec2 lo = ivec2(floor(uv_min * mip_dim));
+    ivec2 hi = ivec2(floor(uv_max * mip_dim));
+    ivec2 max_xy = ivec2(mip_dim) - ivec2(1, 1);
+    lo = clamp(lo, ivec2(0, 0), max_xy);
+    hi = clamp(hi, ivec2(0, 0), max_xy);
+    float d0 = texelFetch(hiz_tex, ivec2(lo.x, lo.y), mip).r;
+    float d1 = texelFetch(hiz_tex, ivec2(hi.x, lo.y), mip).r;
+    float d2 = texelFetch(hiz_tex, ivec2(lo.x, hi.y), mip).r;
+    float d3 = texelFetch(hiz_tex, ivec2(hi.x, hi.y), mip).r;
+    float occluder_depth = max(max(d0, d1), max(d2, d3));
+    // If the AABB's closest projected depth is strictly behind the farthest
+    // previously-rasterised surface in this region, the whole AABB is hidden.
+    return aabb_min_depth > occluder_depth;
+}
+#endif // !SHADOW_CULL
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= cull.object_count) {
+        return;
+    }
+    GpuDrawArgs a = arg_buf.args[i];
+
+    DrawIndexedIndirectCommand c;
+    c.index_count = a.index_count;
+    c.instance_count = 1u;
+    c.first_index = a.index_offset;
+    c.vertex_offset = int(a.base_vertex);
+    c.first_instance = i;
+
+#ifdef SHADOW_CULL
+    // GPU-driven shadow cull: light-frustum only (against this cascade's
+    // `cull.planes`). No Hi-Z (no light-space pyramid), no status (single-pass),
+    // and -- deliberately -- NO per-object distance cull: the cascade light
+    // frustum already bounds the shadow draw distance via the cascade extents,
+    // and the per-object view `cull_distance` is a view-LOD-fade concept that must
+    // not silence shadows (the legacy CPU shadow pass drew every caster; an
+    // off-screen caster beyond cull_distance can still cast into the visible
+    // scene). `first_instance = i` delivers the record id to the depth-only shadow
+    // VS's gl_InstanceIndex.
+    if ((a.flags & DRAW_ENABLED) == 0u) {
+        c.instance_count = 0u;
+    } else if ((a.flags & DRAW_CULLABLE) != 0u) {
+        GpuObjectData obj = obj_buf.objects[i];
+        if (frustum_culled(obj.bb_min, obj.bb_max)) {
+            c.instance_count = 0u;
+        }
+    }
+    cmd_buf.cmds[i] = c;
+#elif defined(CULL_PHASE2)
+    // Phase-2 cull for two-pass occlusion. Runs after `HizBuild` rebuilt the
+    // pyramid from this frame's phase-1 depth. Re-tests only the objects phase
+    // 1 marked STATUS_HIZ_CANDIDATE against the fresh pyramid (projected
+    // through this frame's VP, carried in `prev_view_proj` exactly as phase 1
+    // used the previous frame's), and emits a draw for any that turn out
+    // visible. Everything else becomes an instance_count-0 no-op. Mirrors
+    // directx/shaders/cull.hlsl::main_phase2.
+    if (status_buf.status[i] != STATUS_HIZ_CANDIDATE) {
+        // Drawn or frustum/distance/disabled in phase 1: phase 1 settled it.
+        c.instance_count = 0u;
+    } else {
+        GpuObjectData obj = obj_buf.objects[i];
+        // A candidate still occluded by this frame's actual depth stays culled;
+        // one now visible is redrawn.
+        if (hiz.hiz_enabled != 0u && hiz_occluded(obj.bb_min, obj.bb_max)) {
+            c.instance_count = 0u;
+        }
+    }
+    cmd_buf.cmds[i] = c;
+#else
+    // Phase-1 cull. Records the outcome in `status_buf` for two-pass occlusion:
+    // a Hi-Z cull is the only outcome phase 2 reconsiders against the rebuilt
+    // pyramid; everything else is settled here.
+    uint status = STATUS_DRAWN;
+    if ((a.flags & DRAW_ENABLED) == 0u) {
+        c.instance_count = 0u;
+        status = STATUS_CULLED;
+    } else if ((a.flags & DRAW_CULLABLE) != 0u) {
+        GpuObjectData obj = obj_buf.objects[i];
+        if (frustum_culled(obj.bb_min, obj.bb_max)) {
+            c.instance_count = 0u;
+            status = STATUS_CULLED;
+        } else if (obj.cull_distance > 0.0
+                && aabb_distance_sq(obj.bb_min, obj.bb_max)
+                    > obj.cull_distance * obj.cull_distance) {
+            c.instance_count = 0u;
+            status = STATUS_CULLED;
+        } else if (hiz.hiz_enabled != 0u && hiz_occluded(obj.bb_min, obj.bb_max)) {
+            // Hi-Z occlusion: cull when the AABB is fully behind the previous
+            // frame's depth pyramid. Skipped on the first frame / after a
+            // resize (`hiz_enabled == 0`), where no valid pyramid exists yet.
+            c.instance_count = 0u;
+            status = STATUS_HIZ_CANDIDATE;
+        }
+    }
+    cmd_buf.cmds[i] = c;
+    status_buf.status[i] = status;
+#endif
+}

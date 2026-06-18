@@ -1,0 +1,23 @@
+[package]
+name = "example-common"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "example_common"
+path = "lib.rs"
+
+[features]
+# Pass-through so a Windows host can target the Vulkan backend, matching the
+# rest of the workspace. Inert on macOS (always Metal) and Linux (always Vulkan).
+vulkan = ["concinnity-client/vulkan", "concinnity-cook/vulkan"]
+
+[dependencies]
+# The runtime: world loop, ECS, renderer backends. What a shipped game links.
+concinnity-client = { path = "../../concinnity-client" }
+# The asset compile pipeline: turns world.jsonl + source files into the
+# compiled blob the runtime plays. Deliberately not the editor crate.
+concinnity-cook = { path = "../../concinnity-cook" }

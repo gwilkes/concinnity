@@ -1,0 +1,44 @@
+#version 450
+
+// Hi-Z downsample: build mip M+1 from mip M. Each destination texel reads the
+// four corresponding source texels and takes their MAX (standard depth, so the
+// result is the farthest visible surface in that region). Source and
+// destination are single-level R32F storage image views; the whole Hi-Z image
+// stays in GENERAL during the build, with a memory barrier between each step
+// ordering the prior write before this read. Mirrors the `downsample` kernels
+// in directx/shaders/hiz_build.hlsl and metal/shaders/hiz_build.metal.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, r32f) uniform readonly image2D src_mip;
+layout(set = 0, binding = 1, r32f) uniform writeonly image2D dst_mip;
+
+// Shared push-constant block with the init kernel (16 bytes). Only the
+// destination dimensions are used here; the source mip is bound directly.
+layout(push_constant) uniform HizParams {
+    uint dst_width;
+    uint dst_height;
+    uint src_mip;
+    uint sample_count;
+} p;
+
+void main() {
+    uvec2 tid = gl_GlobalInvocationID.xy;
+    if (tid.x >= p.dst_width || tid.y >= p.dst_height) {
+        return;
+    }
+    ivec2 src_size = imageSize(src_mip);
+    int sx = int(tid.x) * 2;
+    int sy = int(tid.y) * 2;
+    // For odd source dimensions we'd lose a texel at the right/bottom edge, but
+    // max-reduction is conservative so dropping a half-row is harmless -- it can
+    // only make the cull more conservative, never wrongly cull a visible
+    // object. Clamp the +1 taps so an odd edge reuses the in-bounds texel.
+    int sx1 = min(sx + 1, src_size.x - 1);
+    int sy1 = min(sy + 1, src_size.y - 1);
+    float d0 = imageLoad(src_mip, ivec2(sx, sy)).r;
+    float d1 = imageLoad(src_mip, ivec2(sx1, sy)).r;
+    float d2 = imageLoad(src_mip, ivec2(sx, sy1)).r;
+    float d3 = imageLoad(src_mip, ivec2(sx1, sy1)).r;
+    imageStore(dst_mip, ivec2(tid), vec4(max(max(d0, d1), max(d2, d3)), 0.0, 0.0, 0.0));
+}

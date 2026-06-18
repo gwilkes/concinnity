@@ -1,0 +1,18 @@
+[package]
+name = "concinnity-toolchain"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# Build-script support: rendering-backend cfg resolution and graphics SDK
+# detection/bundling, shared by every package whose build script produces a
+# final Windows artifact (the editor binary, the example binaries) plus the
+# runtime crate's own tests. This is distinct from `concinnity-cook`, which is
+# the asset compile pipeline; this crate is consumed only under
+# `[build-dependencies]` and never linked into a shipped binary.
+[lib]
+name = "concinnity_toolchain"
+path = "src/lib.rs"
+doctest = false

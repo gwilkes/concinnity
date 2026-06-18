@@ -1,0 +1,59 @@
+[package]
+name = "concinnity-cook"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "concinnity_cook"
+path = "src/lib.rs"
+doctest = false
+
+[features]
+# Mirror of core's `vulkan` feature: selects backend_vk on Windows so the
+# backend-conditional shader compilation path matches the backend the client
+# picks, and pulls in `shaderc` so the build pipeline can compile GLSL to
+# SPIR-V. Inert on Linux (always vk, shaderc always present) and macOS (always
+# metal, shader compile shells out to xcrun).
+vulkan = ["dep:shaderc", "concinnity-core/vulkan"]
+
+[dependencies]
+# The compile pipeline decodes source files (glTF/PNG/JPEG); those decoders and
+# the gltf/png/jpeg-decoder crates live here in the build crate, so a
+# runtime-only consumer of concinnity-core links none of them.
+concinnity-core = { path = "../concinnity-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+thiserror = "2.0.18"
+tracing = "0.1.44"
+postcard = { version = "1", default-features = false, features = ["use-std"] }
+fbxcel = { version = "0.9.0", default-features = false, features = ["tree"] }
+fontdue = "0.9"
+gltf = { version = "1", default-features = false, features = ["utils", "names"] }
+jpeg-decoder = "0.3"
+kira = "0.12"
+png = "0.18.1"
+rayon = "1"
+sha2 = "0.10.9"
+time = { version = "0.3.47", features = ["formatting", "parsing"] }
+
+# Linux (and any non-macOS/non-Windows target) always builds the Vulkan backend
+# layouts; `shaderc` compiles GLSL to SPIR-V in the build pipeline.
+[target.'cfg(not(any(target_os = "macos", target_os = "windows")))'.dependencies]
+shaderc = "0.10.1"
+
+# Windows default build is DirectX: the build pipeline compiles HLSL via the
+# Direct3D `Fxc` compiler from the `windows` crate. `shaderc` is optional and
+# activated by the `vulkan` feature for a Vulkan build on Windows.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D_Fxc",
+] }
+shaderc = { version = "0.10.1", optional = true }
+
+[dev-dependencies]
+tempfile = "3.25.0"

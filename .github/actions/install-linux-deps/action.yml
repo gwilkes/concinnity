@@ -1,0 +1,26 @@
+# Installs the system development libraries needed to build Concinnity on Linux.
+# The package set mirrors concinnity-docs/development/building.md (Linux/Vulkan).
+# Does nothing on macOS or Windows. Checkout the repository before using it.
+
+name: Install Linux dependencies
+description: Installs the system libraries required to build Concinnity on Linux.
+runs:
+  using: composite
+  steps:
+    - name: Install Linux dependencies
+      shell: bash
+      if: ${{ runner.os == 'Linux' }}
+      run: |
+        sudo apt-get update
+        # When no linkable system GLFW is found, glfw-sys builds GLFW 3.4 from
+        # source with both the X11 and Wayland backends enabled, so the build
+        # also needs the Wayland scanner, dev libraries, and protocol files
+        # (libwayland-bin / libwayland-dev / wayland-protocols) alongside the
+        # X11 headers.
+        sudo apt-get install --no-install-recommends -y \
+          build-essential cmake pkg-config git python3 \
+          libssl-dev libasound2-dev \
+          libglfw3 libglfw3-dev \
+          libwayland-dev libwayland-bin wayland-protocols \
+          libx11-dev libxkbcommon-dev libxrandr-dev libxinerama-dev \
+          libxcursor-dev libxi-dev

@@ -1,0 +1,86 @@
+#version 460
+
+// Compute skinning for ray tracing (Vulkan). The main pass skins in the vertex
+// shader, so no deformed-vertex buffer exists for the BVH to trace against.
+// This kernel produces one: it reads the bind-pose skinned vertices + a
+// per-object joint palette and writes posed (model-space) plain `Vertex`s into
+// a shared deformed buffer, which the RT acceleration-structure build then
+// traces. One dispatch per skinned object over its vertex range; the deformed
+// buffer mirrors the skinned vertex buffer's indexing so the existing (u16)
+// skinned index buffer addresses it directly. Ports directx/shaders/rt_skin.hlsl
+// / metal/shaders/rt_skin.metal.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// 80-byte `SkinnedVertex` (gfx::mesh_payload::SkinnedVertex), read raw as a flat
+// float/uint array so the std430 byte layout is pinned exactly: pos@0, normal@12,
+// tangent@24, color@36, uv@48 (all floats), uint16 joints[4]@56 (two packed
+// uints), float4 weights@64. The SkinnedVertex buffer is bound with
+// `SHADER_DEVICE_ADDRESS`-free std430 indexing (20 floats / words per vertex).
+// 80 bytes = 20 4-byte words; the four u16 joints occupy words 14..15.
+layout(set = 0, binding = 0, std430) readonly buffer SrcVerts { float src[]; };
+// This object's joint palette (one column-major mat4 per joint).
+layout(set = 0, binding = 1, std430) readonly buffer Palette { mat4 joints[]; } palette;
+// Deformed (posed) vertices in the static 56-byte `Vertex` layout
+// (gfx::mesh_payload::Vertex): pos@0, normal@12, tangent@24, color@36, uv@48.
+// 56 bytes = 14 floats per vertex.
+layout(set = 0, binding = 2, std430) writeonly buffer DstVerts { float dst[]; };
+
+// Which slice of the shared buffers this dispatch deforms. Matches the 16-byte
+// `SkinParams` in vulkan/raytrace.rs.
+layout(push_constant) uniform SkinParams {
+    uint vertex_base;   // first vertex of this object in the shared buffers
+    uint vertex_count;  // vertices to deform this dispatch
+    uint joint_count;   // palette size (joint indices are clamped below it)
+    uint _pad;
+} pc;
+
+// Words per vertex in each buffer (SkinnedVertex = 80 B / 4, Vertex = 56 B / 4).
+const uint SKINNED_WORDS = 20u;
+const uint VERTEX_WORDS  = 14u;
+
+vec3 src_vec3(uint base, uint w) {
+    return vec3(src[base + w], src[base + w + 1u], src[base + w + 2u]);
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= pc.vertex_count) return;
+    uint idx   = pc.vertex_base + gid;
+    uint sbase = idx * SKINNED_WORDS;
+
+    vec3 pos     = src_vec3(sbase, 0u);
+    vec3 normal  = src_vec3(sbase, 3u);
+    vec3 tangent = src_vec3(sbase, 6u);
+    vec3 color   = src_vec3(sbase, 9u);
+    vec2 uv      = vec2(src[sbase + 12u], src[sbase + 13u]);
+
+    // joints[4] are two packed u16 pairs in words 14 and 15; weights[4] are
+    // floats in words 16..19.
+    uint jw0 = floatBitsToUint(src[sbase + 14u]);
+    uint jw1 = floatBitsToUint(src[sbase + 15u]);
+    vec4 weights = vec4(src[sbase + 16u], src[sbase + 17u], src[sbase + 18u], src[sbase + 19u]);
+
+    uint j0 = jw0 & 0xFFFFu;
+    uint j1 = (jw0 >> 16) & 0xFFFFu;
+    uint j2 = jw1 & 0xFFFFu;
+    uint j3 = (jw1 >> 16) & 0xFFFFu;
+
+    uint last = pc.joint_count == 0u ? 0u : pc.joint_count - 1u;
+    mat4 skin = weights.x * palette.joints[min(j0, last)]
+              + weights.y * palette.joints[min(j1, last)]
+              + weights.z * palette.joints[min(j2, last)]
+              + weights.w * palette.joints[min(j3, last)];
+    mat3 skin3 = mat3(skin);
+
+    vec3 o_pos     = (skin * vec4(pos, 1.0)).xyz;
+    vec3 o_normal  = normalize(skin3 * normal);
+    vec3 o_tangent = skin3 * tangent;
+
+    uint dbase = idx * VERTEX_WORDS;
+    dst[dbase + 0u]  = o_pos.x;     dst[dbase + 1u]  = o_pos.y;     dst[dbase + 2u]  = o_pos.z;
+    dst[dbase + 3u]  = o_normal.x;  dst[dbase + 4u]  = o_normal.y;  dst[dbase + 5u]  = o_normal.z;
+    dst[dbase + 6u]  = o_tangent.x; dst[dbase + 7u]  = o_tangent.y; dst[dbase + 8u]  = o_tangent.z;
+    dst[dbase + 9u]  = color.x;     dst[dbase + 10u] = color.y;     dst[dbase + 11u] = color.z;
+    dst[dbase + 12u] = uv.x;        dst[dbase + 13u] = uv.y;
+}

@@ -1,0 +1,62 @@
+#version 450
+
+// Auto-exposure histogram build kernel - GLSL port of the matching kernel in
+// metal/shaders/auto_exposure.metal and directx/shaders/auto_exposure.hlsl.
+// One thread per HDR-resolve pixel. Each threadgroup keeps a local 256-bin
+// histogram in shared memory, atomically increments its bin per pixel, and
+// merges the local counts into the global histogram on exit. The local stage
+// absorbs most of the contention so global atomics scale to large HDR resolves
+// cheaply.
+
+#extension GL_KHR_shader_subgroup_basic : enable
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+const uint HISTOGRAM_BINS = 256u;
+
+layout(set = 0, binding = 0) uniform sampler2D hdr_texture;
+
+layout(std430, set = 0, binding = 1) buffer HistogramBlock {
+    uint bins[];
+} histogram;
+
+layout(push_constant) uniform AutoExposureParams {
+    float lum_log2_min;
+    float lum_log2_range;
+    float lum_to_bin_scale;
+    float _pad;
+} params;
+
+shared uint local_hist[HISTOGRAM_BINS];
+
+void main() {
+    uint tid = gl_LocalInvocationIndex;
+    if (tid < HISTOGRAM_BINS) {
+        local_hist[tid] = 0u;
+    }
+    barrier();
+
+    ivec2 size = textureSize(hdr_texture, 0);
+    ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
+    if (gid.x < size.x && gid.y < size.y) {
+        vec3 c = texelFetch(hdr_texture, gid, 0).rgb;
+        // Rec. 709 luminance. The 1.0e-6 floor keeps log2 finite on a fully
+        // black pixel.
+        float lum = max(dot(c, vec3(0.2126, 0.7152, 0.0722)), 1.0e-6);
+        float lum_log2 = clamp(
+            log2(lum),
+            params.lum_log2_min,
+            params.lum_log2_min + params.lum_log2_range);
+        float t = (lum_log2 - params.lum_log2_min) * params.lum_to_bin_scale;
+        uint bin = min(uint(t), HISTOGRAM_BINS - 1u);
+        atomicAdd(local_hist[bin], 1u);
+    }
+    barrier();
+
+    if (tid < HISTOGRAM_BINS) {
+        uint count = local_hist[tid];
+        if (count > 0u) {
+            atomicAdd(histogram.bins[tid], count);
+        }
+    }
+}

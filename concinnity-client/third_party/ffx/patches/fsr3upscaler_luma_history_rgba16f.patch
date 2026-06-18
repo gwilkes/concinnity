@@ -1,0 +1,15 @@
+# FidelityFX SDK v1.1.4: match the FSR3 luma_history UAV shader format to its view.
+#
+# The GLSL callback declares rw_luma_history as rgba8, but the C++ creates the
+# LumaHistory resource as R16G16B16A16_FLOAT (ffx_fsr3upscaler.cpp), so the Vulkan
+# validation layer flags a storage-image format mismatch and reads/stores are UB.
+# Declaring rgba16f matches the view exactly:
+# https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/issues/161
+#
+# scripts/setup_ffx_vk_dll.ps1 applies this change directly (regex on the line
+# below) rather than via `patch`/`git apply`, so it survives minor line drift.
+--- a/sdk/include/FidelityFX/gpu/fsr3upscaler/ffx_fsr3upscaler_callbacks_glsl.h
++++ b/sdk/include/FidelityFX/gpu/fsr3upscaler/ffx_fsr3upscaler_callbacks_glsl.h
+@@ -398,1 +398,1 @@
+-layout (set = 0, binding = FSR3UPSCALER_BIND_UAV_LUMA_HISTORY, rgba8) uniform image2D  rw_luma_history;
++layout (set = 0, binding = FSR3UPSCALER_BIND_UAV_LUMA_HISTORY, rgba16f) uniform image2D  rw_luma_history;

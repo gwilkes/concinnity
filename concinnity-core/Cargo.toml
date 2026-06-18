@@ -1,0 +1,42 @@
+[package]
+name = "concinnity-core"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "concinnity_core"
+path = "src/lib.rs"
+doctest = false
+
+[features]
+# Selects backend_vk on Windows (via build.rs reading CARGO_FEATURE_VULKAN) so
+# the backend-conditional gfx data layouts and Platform::current() compile for
+# the same backend the client picks. Activates no extra dependency: the shader
+# compiler that used to live behind this feature moved to the concinnity-cook
+# crate. Inert on Linux (always vk) and macOS (always metal).
+vulkan = []
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+serde_json = { version = "1", features = ["preserve_order"] }
+thiserror = "2.0.18"
+tracing = "0.1.44"
+# Runtime + payload-format support. The runtime always needs the blob def-table
+# read (postcard) and the IBL CPU convolutions (rayon). `time` stamps nothing
+# here but is used by world::find. This crate links no image / glTF decoders:
+# the file -> pixels decoders live in concinnity-cook, and a shipped runtime
+# reads pre-compiled payloads (the `deserialise` family). The asset COMPILE deps
+# (fbxcel, fontdue, shaderc, kira, sha2, gltf, png, jpeg-decoder, the windows
+# Fxc compiler) all live in concinnity-cook.
+# default-features off drops postcard's `heapless-cas` default (heapless ->
+# atomic-polyfill, an unmaintained transitive dep we don't need); `use-std`
+# gives the std Vec encode/decode path (`to_stdvec` / `from_bytes`).
+postcard = { version = "1", default-features = false, features = ["use-std"] }
+rayon = "1"
+time = { version = "0.3.47", features = ["formatting", "parsing"] }
+
+[dev-dependencies]
+tempfile = "3.25.0"

@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "concinnity-core",
+    "concinnity-cook",
+    "concinnity-toolchain",
+    "concinnity-client",
+    "concinnity-editor",
+    "concinnity-docs",
+    "examples/common",
+    "examples/bistro",
+]
+
+default-members = [
+    "concinnity-core",
+    "concinnity-cook",
+    "concinnity-toolchain",
+    "concinnity-client",
+    "concinnity-editor",
+    "concinnity-docs",
+]
+
+[workspace.package]
+version = "0.1.0"
+authors = ["Grant Wilkes <grant@concinnity.gg>"]
+edition = "2024"
+license = "MIT"
+
+[profile.dev]
+opt-level = 2

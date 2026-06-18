@@ -1,0 +1,48 @@
+#version 450
+
+// Hi-Z mip 0 builder: reduce this frame's main depth into mip 0 of the Hi-Z
+// pyramid. The depth attachment is MSAA when the world runs multisampled, so
+// the `USE_MSAA` variant (injected as a `#define` after `#version`, mirroring
+// the decal shader's MSAA split) takes the MAX over every sample to stay
+// conservative (standard depth: larger = farther). The single-sample variant
+// reads sample 0 directly.
+//
+// The destination mip is a single-level R32F storage image view; the whole
+// Hi-Z image stays in GENERAL during the build. Mirrors the `init` kernels in
+// directx/shaders/hiz_build.hlsl and metal/shaders/hiz_build.metal.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+#if USE_MSAA
+layout(set = 0, binding = 0) uniform sampler2DMS src_depth;
+#else
+layout(set = 0, binding = 0) uniform sampler2D src_depth;
+#endif
+layout(set = 0, binding = 1, r32f) uniform writeonly image2D dst_mip;
+
+// Shared push-constant block for both Hi-Z build kernels (16 bytes). `src_mip`
+// is unused by the init kernel (it always writes mip 0); `sample_count` drives
+// the MSAA reduction.
+layout(push_constant) uniform HizParams {
+    uint dst_width;
+    uint dst_height;
+    uint src_mip;
+    uint sample_count;
+} p;
+
+void main() {
+    uvec2 tid = gl_GlobalInvocationID.xy;
+    if (tid.x >= p.dst_width || tid.y >= p.dst_height) {
+        return;
+    }
+    ivec2 coord = ivec2(tid);
+    float d = 0.0;
+#if USE_MSAA
+    for (uint s = 0u; s < p.sample_count; ++s) {
+        d = max(d, texelFetch(src_depth, coord, int(s)).r);
+    }
+#else
+    d = texelFetch(src_depth, coord, 0).r;
+#endif
+    imageStore(dst_mip, coord, vec4(d, 0.0, 0.0, 0.0));
+}

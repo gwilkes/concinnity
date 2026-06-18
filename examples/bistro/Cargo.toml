@@ -1,0 +1,30 @@
+[package]
+name = "bistro"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "bistro"
+path = "main.rs"
+
+[features]
+# Pass-through so a Windows host can target the Vulkan backend, matching the
+# rest of the workspace. Inert on macOS (always Metal) and Linux (always Vulkan).
+vulkan = ["example-common/vulkan"]
+
+[dependencies]
+# Shared host glue: compile a world.jsonl in memory and run it on the runtime.
+example-common = { path = "../common" }
+# First-run asset fetch. ureq downloads the archive (HTTP, already used
+# elsewhere in the workspace); zip unpacks it. deflate-only to keep the
+# dependency lean. These are example-only and never reach the engine crates.
+ureq = "3.2.0"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[build-dependencies]
+# Links the NGX import lib and bundles the graphics-SDK runtime DLLs next to the
+# .exe, the same setup the editor binary runs.
+concinnity-toolchain = { path = "../../concinnity-toolchain" }

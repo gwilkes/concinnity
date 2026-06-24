@@ -14,4 +14,5 @@
 {"name": "camera_chip", "type": "TextLabel", "args": {"font": "hud_font", "x": 352, "y": 36, "scale": 0.7, "color": [1, 1, 1], "background": [0.0, 0.18, 0.32, 0.85], "padding": 5}}
 {"name": "stat_hud", "type": "StatHud", "args": {"fps_label": "fps_chip", "vram_label": "vram_chip", "passes_label": "passes_chip", "mouse_label": "mouse_chip", "camera_label": "camera_chip"}}
 {"name": "bistro_exterior", "type": "SceneImport", "args": {"source": "assets/Bistro_v5_2/BistroExterior.fbx", "texture_max_size": 512}}
+{"name":"lobby", "type":"ReflectionProbe", "args": {"position": [-3.34, 1.7, 0.82], "half_extents": [5, 4, 5]}}
 {"name": "main_menu", "type": "MainMenu", "args": {"title": "Bistro_v5_2", "initial": false}}

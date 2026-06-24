@@ -247,6 +247,38 @@ pub struct MtlContext {
     // valid. `prefilter_mip_count == 0` is the "IBL disabled" signal the
     // shader uses to fall back to the legacy ambient/skybox path.
     pub(super) env_map: EnvironmentMapTextures,
+    // Local reflection probes: the scene captured into one cube per placement
+    // (metal/probe.rs). Distinct from `env_map` (which stays the sky -- it drives
+    // the skybox + diffuse irradiance) so the bake never corrupts the visible
+    // sky. Each surface's specular reflection samples the nearest probe whose box
+    // contains it; the skybox + diffuse keep the sky.
+    //
+    // `probe_placements` is the where/box list (declared `ReflectionProbe` assets
+    // or `auto_seed_probes`); `probe_maps` is the baked cube per placement
+    // (parallel index); `probe_set` is the box uniform pushed to the shader.
+    pub(super) probe_placements: Vec<crate::gfx::reflection_probe::ProbePlacement>,
+    pub(super) probe_maps: Vec<EnvironmentMapTextures>,
+    // Staggered bake cursor. Reset to the placement count when placements are set;
+    // each eligible frame bakes a bounded budget and advances it, so the load cost
+    // spreads over several frames instead of one. See metal/probe.rs.
+    pub(super) probe_bake_queue: crate::gfx::reflection_probe::ProbeBakeQueue,
+    // Per-probe influence boxes + count, pushed to the fragment shader at
+    // buffer(6). `EMPTY` until a bake. See metal/probe.rs.
+    pub(super) probe_set: super::uniforms::ProbeSet,
+    // The probe currently rendering its six cube faces on the GPU (one at a time;
+    // owns the reserved-ring-slot buffers + capture targets). The render thread never
+    // blocks: the faces are submitted without `waitUntilCompleted` and a completion
+    // handler flags GPU completion. `None` when nothing is rendering. See metal/probe.rs.
+    pub(super) probe_rendering: Option<super::probe::RenderingBake>,
+    // The probe whose read-back faces are convolving on a worker thread (one at a time).
+    // Holds only the worker's payload slot (plain data), so it overlaps the next probe's
+    // render -- pipelining the convolution shortens the bake warm-up. `None` when idle.
+    pub(super) probe_converting: Option<super::probe::ConvertingBake>,
+    // Deferred-free pool for an in-flight bake's GPU resources when a re-placement
+    // (`set_reflection_probes`) interrupts it: the capture command buffers may
+    // still be reading those buffers/textures, so they are parked here and freed
+    // once the frames-in-flight fence guarantees the bake has retired.
+    pub(super) probe_retire_pool: super::transient::RetirePool<super::probe::BakeGpu>,
     // Linear-clamp sampler bound at sampler(2) for cubemap sampling.
     pub(super) cube_sampler: Retained<ProtocolObject<dyn MTLSamplerState>>,
     // Text rendering resources. text_pipeline_state is None when no Font assets
@@ -507,13 +539,73 @@ pub struct MtlContext {
     // declared ≥1 `WaterSurface`; the transparent pass executor short-
     // circuits otherwise.
     pub(super) water_pipeline: Option<Retained<ProtocolObject<dyn MTLRenderPipelineState>>>,
+    // Ray-traced water pipeline: traces a sharp reflection ray against the scene
+    // BVH instead of sampling the probe cube. `Some` only when the world has
+    // ≥1 `WaterSurface` AND the device supports ray tracing; selected per-frame
+    // only while `rt.accel` is live (RT on), the probe pipeline otherwise. This
+    // is the FLAT variant (per-object material tint as albedo); the non-bindless
+    // RT fallback.
+    pub(super) water_pipeline_rt: Option<Retained<ProtocolObject<dyn MTLRenderPipelineState>>>,
+    // Ray-traced water pipeline, TEXTURED variant: samples the reflected hit's
+    // albedo / normal / emissive maps from the bindless pool (bound at buffer 10
+    // for water, since the main pass's index 7 is the ProbeSet here). Built under
+    // the same RT gate; selected over the flat variant only in a bindless world
+    // (where the pool exists), while `rt.accel` is live.
+    pub(super) water_pipeline_rt_textured:
+        Option<Retained<ProtocolObject<dyn MTLRenderPipelineState>>>,
     // One GPU record per `WaterSurface` asset: tessellated VB+IB plus the
     // per-surface fragment / vertex uniforms (rebuilt at init from the
     // asset; `prefilter_mip_count` is patched per-frame).
     pub(super) water_surfaces: Vec<super::water::WaterSurfaceRecord>,
+    // Planar reflection targets, one set per distinct reflector plane (water
+    // surfaces + glass panes, grouped by `assign_planar_slots`). `Some` only when
+    // the world declared >=1 such reflector; the scene is re-rendered mirrored
+    // across each plane into these each frame (RT off) and the reflective shader
+    // samples the resolve of its slot. Rebuilt on resize alongside `hdr_targets`.
+    pub(super) planar_reflection: Option<super::planar::PlanarReflectionSet>,
     // Shared pipeline for the `GlassPanel` transparent producer. `Some` only
     // when the world declared ≥1 `GlassPanel`.
     pub(super) glass_pipeline: Option<Retained<ProtocolObject<dyn MTLRenderPipelineState>>>,
+    // Ray-traced glass pipeline: traces a sharp reflection ray against the scene
+    // BVH instead of sampling the probe cube. `Some` only when the world has
+    // ≥1 `GlassPanel` AND the device supports ray tracing; selected per-frame
+    // only while `rt.accel` is live (RT on), the probe pipeline otherwise. This
+    // is the FLAT variant (per-object material tint as albedo); the non-bindless
+    // RT fallback.
+    pub(super) glass_pipeline_rt: Option<Retained<ProtocolObject<dyn MTLRenderPipelineState>>>,
+    // Ray-traced glass pipeline, TEXTURED variant: samples the reflected hit's
+    // albedo / normal / emissive maps from the bindless pool (bound at buffer 10
+    // for glass, since the main pass's index 7 is the ProbeSet here). Built under
+    // the same RT gate; selected over the flat variant only in a bindless world
+    // (where the pool exists), while `rt.accel` is live.
+    pub(super) glass_pipeline_rt_textured:
+        Option<Retained<ProtocolObject<dyn MTLRenderPipelineState>>>,
+    // Ray-traced transparent glass MESH pipelines (`glass_mesh_rt.metal`): an
+    // imported `Material` with `transparent: true` routed through the transparent
+    // pass with a per-pixel RT trace off the interpolated mesh normal, instead of
+    // the Layer-1 opaque-reflective fallback. Built only on RT-capable devices
+    // (regardless of whether the world declares a transparent material -- a live
+    // RT toggle then has the pipeline ready). `glass_mesh_pipeline_rt.is_some()`
+    // gates the whole transparent-mesh path: when live (RT on) transparent meshes
+    // are skipped in the opaque pass + the RT BLAS and drawn here; otherwise they
+    // render opaque (Layer 1). The flat variant uses the reflected hit's material
+    // tint; the textured variant samples the bindless pool (selected in a bindless
+    // world).
+    pub(super) glass_mesh_pipeline_rt: Option<Retained<ProtocolObject<dyn MTLRenderPipelineState>>>,
+    pub(super) glass_mesh_pipeline_rt_textured:
+        Option<Retained<ProtocolObject<dyn MTLRenderPipelineState>>>,
+    // Indices into `draw_objects` of every see-through glass mesh (its material
+    // has both `transparent` and `see_through` set), precomputed at init so the
+    // per-frame Layer 2 producer does not rescan all objects. Empty on non-RT
+    // devices or when no material opts into see-through (those transparent
+    // meshes then render opaque, Layer 1). The objects stay IN `draw_objects` (a
+    // DrawObject's position is a key into the cull / prev-model / RT parallel
+    // arrays); this list only marks which to reroute. A non-empty list (plus a
+    // built mesh pipeline) is what enables the Layer 2 path -- see
+    // `seethrough_meshes_enabled`. See-through is opt-in per `Material` because
+    // it only looks right when the space behind the glass is modelled; without
+    // it, Layer 1's tinted reflective glass hides the interior.
+    pub(super) seethrough_mesh_indices: Vec<usize>,
     // One GPU record per `GlassPanel` asset: the static world-space quad VB+IB
     // plus the per-panel uniforms. Contributes to the transparent pass.
     pub(super) glass_panels: Vec<super::glass::GlassPanelRecord>,
@@ -567,6 +659,17 @@ impl MtlContext {
     // `draw_objects.len()` for static-only worlds, so those paths are untouched.
     pub(super) fn cull_count(&self) -> usize {
         self.draw_objects.len() + self.n_instances + self.n_skinned
+    }
+
+    // The prefiltered radiance cube for probe array slot `i`: the baked probe
+    // when present, else the sky `env_map` prefilter (a valid fallback for unused
+    // slots and for slots past the baked count). The skybox + diffuse always use
+    // `env_map` directly, so they keep the sky regardless.
+    pub(super) fn probe_cube_or_sky(&self, i: usize) -> &ProtocolObject<dyn MTLTexture> {
+        match self.probe_maps.get(i) {
+            Some(p) => p.prefilter.as_ref(),
+            None => self.env_map.prefilter.as_ref(),
+        }
     }
 
     // Index in the unified cull list where the folded skinned records begin
@@ -736,6 +839,71 @@ impl MtlContext {
         Ok(())
     }
 
+    // Ensure `slot_count` per-planar-slot mirror cull ICBs exist, each with a
+    // command slot for every one of `count` draw objects (static + folded
+    // instances + skinned, exactly like the main ICB). The slots' ICBs + argument
+    // buffers are rebuilt when the slot count changes or the draw list outgrows
+    // the capacity; the shared single-pass status scratch grows in lockstep. A
+    // no-op for non-bindless contexts (no main ICB argument encoder to reuse) and
+    // when `slot_count` is 0 (no planar set -> the slots are cleared). Called from
+    // `draw_frame` right after `ensure_icb_capacity`, so the planar pass only ever
+    // reads a sized mirror ICB.
+    pub(super) fn ensure_mirror_icb_capacity(
+        &mut self,
+        slot_count: usize,
+        count: usize,
+    ) -> Result<(), String> {
+        if slot_count == 0 {
+            self.cull.mirror_slots.clear();
+            self.cull.mirror_status = None;
+            self.cull.mirror_icb_capacity = 0;
+            return Ok(());
+        }
+        // Reuse the main phase-1 ICB argument encoder: a mirror ICB has the
+        // identical `ICBContainer` layout (one `[[id(0)]]` member). Absent on
+        // non-bindless contexts, where there is no GPU cull to mirror.
+        let arg_encoder = match &self.cull.icb_arg_encoder {
+            Some(e) => e.clone(),
+            None => return Ok(()),
+        };
+        if self.cull.mirror_slots.len() == slot_count && count <= self.cull.mirror_icb_capacity {
+            return Ok(());
+        }
+        let new_cap = count.next_power_of_two().max(64);
+        let mut slots = Vec::with_capacity(slot_count);
+        for _ in 0..slot_count {
+            let icb = self.build_cull_icb(new_cap)?;
+            let len = arg_encoder.encodedLength().max(16);
+            let arg_buffer = self
+                .device
+                .newBufferWithLength_options(len, MTLResourceOptions::StorageModeShared)
+                .ok_or("failed to create mirror ICB argument buffer")?;
+            // SAFETY: the argument buffer is sized to `encodedLength()` and the
+            // ICB is encoded at slot 0, exactly like the main + shadow ICBs. Each
+            // slot re-points the shared encoder at its own (arg buffer, ICB) pair;
+            // the encoding is fully written before the next slot re-points it.
+            unsafe {
+                arg_encoder.setArgumentBuffer_offset(Some(&arg_buffer), 0);
+                arg_encoder.setIndirectCommandBuffer_atIndex(Some(&icb), 0);
+            }
+            slots.push(super::cull::MirrorCullSlot { icb, arg_buffer });
+        }
+        // Shared single-pass status scratch: the mirror cull writes per-object
+        // status the same as phase 1, but nothing reads it (no phase-2 over the
+        // mirror), so one buffer serves every slot. One u32 per command slot.
+        let status = self
+            .device
+            .newBufferWithLength_options(
+                new_cap * std::mem::size_of::<u32>(),
+                MTLResourceOptions::StorageModePrivate,
+            )
+            .ok_or("failed to create mirror cull status buffer")?;
+        self.cull.mirror_status = Some(status);
+        self.cull.mirror_slots = slots;
+        self.cull.mirror_icb_capacity = new_cap;
+        Ok(())
+    }
+
     // Create one `DrawIndexed` indirect command buffer with `cap` command
     // slots. Both the phase-1 (`cull_icb`) and phase-2 (`cull_icb_2`) ICBs
     // share this shape: each command inherits the render encoder's buffer
@@ -769,6 +937,14 @@ impl MtlContext {
     pub fn logical_size(&self) -> (f32, f32) {
         let s = self.mtk_view.bounds().size;
         (s.width as f32, s.height as f32)
+    }
+
+    // Device capability flags for the settings menu. Ray tracing is queried
+    // from the live MTLDevice (cheap; the same check the RT pass gates on).
+    pub fn capabilities(&self) -> crate::gfx::backend::DeviceCapabilities {
+        crate::gfx::backend::DeviceCapabilities {
+            ray_tracing: super::raytrace::raytracing_supported(&self.device),
+        }
     }
 
     // Render statistics for the most recent `draw_frame`, for the profiler
@@ -867,6 +1043,10 @@ impl MtlContext {
         self.prev_draw_models.push(model);
         let idx = self.draw_objects.len() - 1;
         self.always_draw.push(idx as u32);
+        // The cloned prop joins the RT-relevant draw set; the next RT update
+        // folds it into the BVH (it reuses the source mesh's geometry slice, so
+        // only this clone's BLAS is built).
+        self.rt.topology_dirty = true;
         Ok(idx)
     }
 
@@ -884,6 +1064,11 @@ impl MtlContext {
             obj.material = material;
             obj.texture_slot = texture_slot;
             obj.normal_map_slot = normal_map_slot;
+            // A material edit can flip RT participation (`see_through`) and always
+            // changes the geometry-table entry; flag a topology refresh so the
+            // next RT update rebuilds the table (BLAS are reused -- geometry is
+            // unchanged -- so this is cheap).
+            self.rt.topology_dirty = true;
         }
     }
 

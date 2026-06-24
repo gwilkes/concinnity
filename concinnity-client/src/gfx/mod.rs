@@ -57,6 +57,16 @@ pub(crate) mod lights;
 // backend's texture upload builds and uploads the full chain.
 pub(crate) mod mipmap;
 pub mod particles;
+// Backend-agnostic planar-reflection math (mirror matrices, oblique near-plane
+// clip, plane-set assignment). Consumed by the Metal backend today;
+// compiled-but-unreferenced on the other backends until their planar ports land.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) mod planar_reflection;
+// Backend-agnostic reflection-probe bake queue, async state machine, and
+// auto-seed. Consumed by the Metal backend today; compiled-but-unreferenced on
+// the other backends until their probe ports land.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) mod reflection_probe;
 // Backend-agnostic render graph: types + builder + compile pass with
 // unit tests. Per-backend executors live alongside each backend.
 #[allow(dead_code)]

@@ -56,6 +56,11 @@ pub struct HitRegion {
     /// fire; when no view is active, only view-less regions fire.
     #[serde(default, deserialize_with = "de_opt_asset_ref")]
     pub view: Option<AssetId>,
+    /// Whether this region is inert. A disabled region never hovers or fires.
+    /// Set by the engine at runtime (e.g. a settings row whose feature the GPU
+    /// cannot provide is disabled and grayed out); you don't set this directly.
+    #[serde(default)]
+    pub disabled: bool,
 }
 
 impl Default for HitRegion {
@@ -71,6 +76,7 @@ impl Default for HitRegion {
             action: String::new(),
             drag_handle: None,
             view: None,
+            disabled: false,
         }
     }
 }

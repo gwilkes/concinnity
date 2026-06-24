@@ -55,9 +55,12 @@ pub(super) fn shader_source(hot_reload: bool, name: &str) -> std::borrow::Cow<'s
         "fog.metal" => include_str!("shaders/fog.metal"),
         "gbuffer_prepass.metal" => include_str!("shaders/gbuffer_prepass.metal"),
         "glass.metal" => include_str!("shaders/glass.metal"),
+        "glass_mesh_rt.metal" => include_str!("shaders/glass_mesh_rt.metal"),
+        "glass_rt.metal" => include_str!("shaders/glass_rt.metal"),
         "hiz_build.metal" => include_str!("shaders/hiz_build.metal"),
         "particle.metal" => include_str!("shaders/particle.metal"),
         "post.metal" => include_str!("shaders/post.metal"),
+        "reflection_composite.metal" => include_str!("shaders/reflection_composite.metal"),
         "rt_reflections.metal" => include_str!("shaders/rt_reflections.metal"),
         "rt_skin.metal" => include_str!("shaders/rt_skin.metal"),
         "shadow_map.metal" => include_str!("shaders/shadow_map.metal"),
@@ -67,26 +70,60 @@ pub(super) fn shader_source(hot_reload: bool, name: &str) -> std::borrow::Cow<'s
         "taa.metal" => include_str!("shaders/taa.metal"),
         "text.metal" => include_str!("shaders/text.metal"),
         "water.metal" => include_str!("shaders/water.metal"),
+        "water_rt.metal" => include_str!("shaders/water_rt.metal"),
         _ => panic!(
             "shader_source: '{name}' is not a registered Metal shader. Add an \
              `include_str!(\"shaders/{name}\")` arm to shader_source in \
              metal/pipeline.rs -- every shipped shader must be registered."
         ),
     };
-    if hot_reload {
+    let base: std::borrow::Cow<'static, str> = if hot_reload {
         let path = format!("{}/src/metal/shaders/{}", env!("CARGO_MANIFEST_DIR"), name);
         match std::fs::read_to_string(&path) {
-            Ok(s) => return std::borrow::Cow::Owned(s),
+            Ok(s) => std::borrow::Cow::Owned(s),
             Err(e) => {
                 tracing::debug!(
                     "hot-reload: falling back to embedded source for {} ({})",
                     name,
                     e
                 );
+                std::borrow::Cow::Borrowed(embedded)
             }
         }
+    } else {
+        std::borrow::Cow::Borrowed(embedded)
+    };
+    // Single-source the reflection roughness cut: the SSR resolve, the
+    // RT-reflection resolve, and the roughness-blur composite all gate on the
+    // same value, so it is injected here as one MSL `constant` from its Rust
+    // definition rather than declared as three drifting literals. Still
+    // compile-folded by the shader compiler, so zero runtime cost. See
+    // `concinnity_core::gfx::ssr::REFLECTION_ROUGHNESS_CUT`.
+    if shader_uses_reflection_cut(name) {
+        std::borrow::Cow::Owned(format!("{}{base}", reflection_constants_prelude()))
+    } else {
+        base
     }
-    std::borrow::Cow::Borrowed(embedded)
+}
+
+// The reflection-resolve shaders that reference the shared
+// `REFLECTION_ROUGHNESS_CUT` constant injected by `reflection_constants_prelude`.
+fn shader_uses_reflection_cut(name: &str) -> bool {
+    matches!(
+        name,
+        "ssr.metal" | "rt_reflections.metal" | "reflection_composite.metal"
+    )
+}
+
+// MSL prelude defining the shared reflection constants, generated from their
+// Rust source of truth so the GPU value can never drift from the CPU one. A
+// file-scope `constant` is header-independent, so it is valid prepended ahead of
+// the shader's own `#include`s.
+fn reflection_constants_prelude() -> String {
+    format!(
+        "constant float REFLECTION_ROUGHNESS_CUT = {:?};\n",
+        crate::gfx::ssr::REFLECTION_ROUGHNESS_CUT
+    )
 }
 
 // Load a MTLLibrary from raw .metallib bytes via a DispatchData.
@@ -203,6 +240,44 @@ mod shader_source_tests {
         let s = shader_source(false, "post.metal");
         assert!(matches!(s, std::borrow::Cow::Borrowed(_)));
         assert!(s.contains("post_fragment_main"));
+    }
+
+    #[test]
+    fn reflection_shaders_receive_shared_roughness_cut() {
+        // The SSR / RT / composite shaders single-source their roughness cut
+        // through the injected prelude. Verify the prelude carries the canonical
+        // value, that each shader references it, and that no stale local cut
+        // literal lingers (which would silently shadow the shared constant).
+        let expected = format!(
+            "constant float REFLECTION_ROUGHNESS_CUT = {:?};",
+            crate::gfx::ssr::REFLECTION_ROUGHNESS_CUT
+        );
+        for name in [
+            "ssr.metal",
+            "rt_reflections.metal",
+            "reflection_composite.metal",
+        ] {
+            let src = shader_source(false, name);
+            assert!(
+                src.contains(&expected),
+                "{name}: injected prelude missing the canonical REFLECTION_ROUGHNESS_CUT"
+            );
+            assert!(
+                src.contains("REFLECTION_ROUGHNESS_CUT"),
+                "{name}: does not reference the shared REFLECTION_ROUGHNESS_CUT"
+            );
+            // The old per-shader literals were `*_ROUGH_CUT = 0.<n>`; the shared
+            // name is `*_ROUGHNESS_CUT`, which does not contain that substring.
+            assert!(
+                !src.contains("ROUGH_CUT = 0."),
+                "{name}: still declares a local roughness-cut literal"
+            );
+        }
+        // A non-reflection shader must not receive the prelude.
+        assert!(
+            !shader_source(false, "bloom.metal").contains("REFLECTION_ROUGHNESS_CUT"),
+            "bloom.metal should not receive the reflection prelude"
+        );
     }
 
     #[test]

@@ -526,6 +526,9 @@ precedence over the older `texture` field.
 - `albedo_secondary`: A string. Optional second albedo [Texture](#texture) for the slope-based terrain blend. When present, the steep / cliff regions sample this texture and blend with the primary `albedo` over the flat regions, using the surface's up-facing component (softened by a per-pixel noise so the transition doesn't read as a clean line). Without it, a rocky-tint multiplier is applied to the primary texture instead. Only used when `terrain_blend > 0`.
 - `normal_secondary`: A string. Tangent-space normal map paired with `albedo_secondary`. Only used when both that field and `terrain_blend` are set. Optional.
 - `secondary_blend_sharpness`: A float. Sharpness of the slope-based blend in [0, 1]. 0 = wide soft gradient between the two layers; 1 = nearly hard cliff edge. Default `0.5` matches the "smooth but visible" transition AAA terrain materials typically tune to.
+- `opacity`: A float. Surface opacity in [0, 1]. 1 = fully opaque (the default). Only meaningful when `transparent` is set: it drives how much of the scene behind the surface shows through the glass.
+- `transparent`: A boolean. When true, the surface is a translucent dielectric (glass): it renders in the engine's transparent pass instead of the opaque pass, refracting and reflecting the scene rather than writing solid colour + depth. The importer sets this for materials it detects as glass; authored materials can opt in directly. Defaults to false (opaque).
+- `see_through`: A boolean. When true, the glass is rendered as genuinely see-through: the scene behind it shows through with a sharp per-pixel reflection (requires a ray-tracing-capable GPU). When false (the default), a `transparent` surface still renders as low-roughness reflective glass that hides whatever is behind it. See-through only looks right when the space behind the glass is actually modelled, so it is opt-in per material. Setting it implies `transparent`.
 
 ### MaterialPalette
 
@@ -689,6 +692,7 @@ sun, useful when no HDR file is available.
 - `prefilter_face_size`: An integer. Face size of the reflection/sky cubemap, in pixels. Higher is sharper but larger. Defaults to `512`.
 - `irradiance_face_size`: An integer. Face size of the diffuse ambient cubemap, in pixels. Defaults to `8`.
 - `prefilter_samples`: An integer. Number of samples used to filter each reflection texel. Higher reduces noise at the cost of build time. Defaults to `1024`.
+- `prefilter_clamp`: A float. Upper bound on how bright a single source texel may count while building the glossy reflection mips. A clear-sky HDR holds a few sun or sky texels thousands of times brighter than their surroundings; left unbounded they survive into the small (coarse) reflection mips as lone hot texels and smear across glossy floors as hard bright squares. This caps each sampled texel so that energy spreads smoothly across the reflection instead. It affects reflections only, never the on-screen sky. Set to `0` to disable (no cap); lower values clamp harder. Defaults to `12.0`.
 
 ## Camera
 
@@ -1596,6 +1600,7 @@ The cursor must be free (not captured for camera control) for events to fire.
 - `action`: A string. Action to fire on click. Recognised forms: `"scene:<name>"`, `"quit"`, `"view:show:<name>"`, `"view:hide"`, `"view:toggle:<name>"`.
 - `drag_handle`: A string. The [Sprite](#sprite) a [Slider](#slider) drag region moves along its track. `None` for ordinary regions. Set automatically when a `Slider` expands; you don't set this directly. Optional.
 - `view`: A string. [View](#view) this region belongs to. Resolved automatically from the naming convention (a region named `<view>_*` belongs to view `<view>`); you don't set this directly. While a view is active, only its regions fire; when no view is active, only view-less regions fire.
+- `disabled`: A boolean. Whether this region is inert. A disabled region never hovers or fires. Set by the engine at runtime (e.g. a settings row whose feature the GPU cannot provide is disabled and grayed out); you don't set this directly. Defaults to `false`.
 
 ### KeyBinding
 

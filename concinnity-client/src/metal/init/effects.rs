@@ -32,6 +32,7 @@ use crate::metal::particle::{
 use crate::metal::post::{
     BloomPipelines, BloomTargets, GBufferState, SsaoState, SsgiState, SsrState,
     build_bloom_pipelines, build_gbuffer_bindless_pipeline, build_gbuffer_prepass_pipeline,
+    build_reflection_blur_pipeline, build_reflection_composite_pipeline,
     build_rt_reflection_pipeline, build_ssao_pipeline, build_ssgi_composite_pipeline,
     build_ssgi_gather_pipeline, build_ssr_pipeline, build_taa_pipeline, create_bloom_targets,
     create_gbuffer_targets, create_ssao_targets, create_ssgi_targets, create_ssr_targets,
@@ -207,19 +208,34 @@ pub(crate) fn build_quality_effects(
     // fullscreen resolve pipeline is built only when SSR itself is on.
     let needs_ssr_prepass =
         ssr_settings.is_some() || ssgi_settings.is_some() || rt_reflection_settings.is_some();
-    let (ssr_targets, ssr_resolve_pipeline) = if needs_ssr_prepass {
-        let ssr_resolve = if ssr_settings.is_some() {
-            Some(build_ssr_pipeline(device, hot_reload)?)
+    let (ssr_targets, ssr_resolve_pipeline, ssr_composite_pipeline, ssr_blur_pipeline) =
+        if needs_ssr_prepass {
+            let ssr_resolve = if ssr_settings.is_some() {
+                Some(build_ssr_pipeline(device, hot_reload)?)
+            } else {
+                None
+            };
+            // The reflection composite (roughness blur + blend over the scene)
+            // runs for both SSR and RT reflections; both write the reflection
+            // target it reads. SSGI alone needs the G-buffer but no composite.
+            // The blur is its reduced-resolution first pass.
+            let (composite, blur) = if ssr_settings.is_some() || rt_reflection_settings.is_some() {
+                (
+                    Some(build_reflection_composite_pipeline(device, hot_reload)?),
+                    Some(build_reflection_blur_pipeline(device, hot_reload)?),
+                )
+            } else {
+                (None, None)
+            };
+            (
+                Some(create_ssr_targets(device, render_w, render_h)?),
+                ssr_resolve,
+                composite,
+                blur,
+            )
         } else {
-            None
+            (None, None, None, None)
         };
-        (
-            Some(create_ssr_targets(device, render_w, render_h)?),
-            ssr_resolve,
-        )
-    } else {
-        (None, None)
-    };
 
     // Unified G-buffer pre-pass (Metal): one pipeline per geometry kind + the
     // shared targets, built when any consumer (SSR / SSGI / RT / SSAO / velocity)
@@ -283,6 +299,8 @@ pub(crate) fn build_quality_effects(
         settings: *ssr_settings,
         targets: ssr_targets,
         resolve_pipeline: ssr_resolve_pipeline,
+        composite_pipeline: ssr_composite_pipeline,
+        blur_pipeline: ssr_blur_pipeline,
     };
     let gbuffer = GBufferState {
         targets: gbuffer_targets,

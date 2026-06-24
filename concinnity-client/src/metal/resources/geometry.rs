@@ -243,6 +243,28 @@ impl MtlContext {
 
         self.vertex_buffer = new_vertex_buffer;
         self.index_buffer = new_index_buffer;
+
+        // The RT acceleration structure (if any) was built against the OLD
+        // vertex/index buffers + draw-object offsets. After this swap its static
+        // BLAS hold the stale geometry and its geometry table carries stale
+        // offsets, so reflections would trace mismatched data -- and the RT shader
+        // reads the (possibly smaller) new vertex buffer at old offsets, risking
+        // an out-of-bounds fetch. Rebuild the BVH from the new geometry now. We
+        // are past `wait_idle` on the editor-only hot-reload path, so a synchronous
+        // full rebuild (the same path the init build + `Rebuild` diagnostic use) is
+        // appropriate. Rebuild regardless of `dynamic_mode` -- even a build-once
+        // (`Off`) BVH is invalid once its source buffers are replaced. A rebuild
+        // failure leaves the prior BVH in place (`rebuild_rt_accel` only swaps on
+        // success) and must NOT fail the geometry reload, which already succeeded.
+        if self.rt.accel.is_some() {
+            let albedo_count = self.textures.len();
+            let normal_count = self.normal_map_textures.len();
+            if let Err(e) = self.rebuild_rt_accel(albedo_count, normal_count) {
+                tracing::warn!(
+                    "rebuild_static_geometry: RT BVH rebuild failed, reflections may be stale: {e}"
+                );
+            }
+        }
         Ok(())
     }
 }

@@ -196,9 +196,15 @@ impl MtlContext {
         F: FnMut(&ProtocolObject<dyn objc2_metal::MTLRenderCommandEncoder>, &DrawObject, usize),
     {
         let mut draws = 0u32;
+        // See-through glass meshes (Layer 2) draw in the transparent pass when the
+        // RT path is live, so skip them here. A no-op on non-RT worlds and worlds
+        // with no see-through material. Bistro (bindless) renders through the ICB
+        // path, not this loop, so this only covers the legacy main pass + the
+        // CPU-driven capture path.
+        let skip_seethrough = self.mesh_glass_active();
         for &draw_idx in visible {
             let obj = &self.draw_objects[draw_idx as usize];
-            if !obj.visible || !obj.resident {
+            if !obj.visible || !obj.resident || (skip_seethrough && obj.material.see_through != 0) {
                 continue;
             }
             per_draw(enc, obj, draw_idx as usize);

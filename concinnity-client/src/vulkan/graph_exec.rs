@@ -533,6 +533,15 @@ impl VkContext {
                     pass_id.name()
                 ));
             }
+            PassId::ReflectionComposite => {
+                // Metal-only inline pass; never scheduled on Vulkan. Handled here
+                // only to keep the dispatch match exhaustive.
+                return Err(format!(
+                    "graph executor (vulkan): pass {} is a Metal-only inline \
+                     reflection composite and should not appear as a graph node",
+                    pass_id.name()
+                ));
+            }
             PassId::SsrPrepass => {
                 // Merged into GBufferPrepass on Vulkan: the builder emits the
                 // unified node (unified_gbuffer_prepass = true) and never this.
@@ -543,7 +552,13 @@ impl VkContext {
                 ));
             }
             PassId::SsrResolve => {
-                self.encode_ssr_resolve(cmd, params.frame_idx, params.fov_y_radians, params.aspect);
+                self.encode_ssr_resolve(
+                    cmd,
+                    params.frame_idx,
+                    params.fov_y_radians,
+                    params.aspect,
+                    params.cam_pos,
+                );
             }
             PassId::Ssgi => {
                 self.encode_ssgi(cmd, params.frame_idx, params.fov_y_radians, params.aspect);

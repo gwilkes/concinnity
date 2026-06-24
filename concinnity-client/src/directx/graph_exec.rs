@@ -579,6 +579,15 @@ impl DxContext {
                     pass_id.name()
                 ));
             }
+            PassId::ReflectionComposite => {
+                // Metal-only inline pass; never scheduled on DirectX. Handled
+                // here only to keep the dispatch match exhaustive.
+                return Err(format!(
+                    "graph executor (directx): pass {} is a Metal-only inline \
+                     reflection composite and should not appear as a graph node",
+                    pass_id.name()
+                ));
+            }
             PassId::SsrPrepass => {
                 // Merged into GBufferPrepass on DX: the builder emits the
                 // unified node (unified_gbuffer_prepass = true) and never this.
@@ -650,7 +659,13 @@ impl DxContext {
                 ));
             }
             PassId::SsrResolve => {
-                self.encode_ssr_resolve(cmd, params.frame_idx, params.fov_y_radians, params.aspect);
+                self.encode_ssr_resolve(
+                    cmd,
+                    params.frame_idx,
+                    params.fov_y_radians,
+                    params.aspect,
+                    params.cam_pos,
+                );
             }
             PassId::Velocity => {
                 // Merged into GBufferPrepass on DX: the builder emits the

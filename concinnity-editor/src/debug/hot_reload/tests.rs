@@ -94,6 +94,7 @@ fn state_with_only_environment_map_still_spawns_a_watcher() {
         prefilter_face_size: 64,
         irradiance_face_size: 16,
         prefilter_samples: 64,
+        prefilter_clamp: 12.0,
     };
     // Parent dir (temp dir) exists, so the watcher should subscribe.
     let state = AssetHotReloadState::new(

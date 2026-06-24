@@ -1681,6 +1681,14 @@ impl DxContext {
         (self.output_width as f32, self.output_height as f32)
     }
 
+    // Device capability flags for the settings menu. RT reflects the DXR-tier
+    // query made at init (`rt_capable`).
+    pub fn capabilities(&self) -> crate::gfx::backend::DeviceCapabilities {
+        crate::gfx::backend::DeviceCapabilities {
+            ray_tracing: self.rt_capable,
+        }
+    }
+
     // GPU descriptor handle for the per-object (albedo, normal) SRV pair.
     pub(super) fn object_srv_gpu(&self, obj_idx: usize) -> D3D12_GPU_DESCRIPTOR_HANDLE {
         let srv_gpu_base = unsafe {

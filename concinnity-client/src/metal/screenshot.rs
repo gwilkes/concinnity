@@ -198,8 +198,9 @@ fn decode_rgba16f(raw: &[u8], encoding: Option<HdrEncoding>) -> Vec<u8> {
 }
 
 // Decode an IEEE 754 half (binary16) to f32. Handles zero, subnormals,
-// normals, and inf/NaN.
-fn f16_to_f32(h: u16) -> f32 {
+// normals, and inf/NaN. `pub(in crate::metal)` so the reflection-probe readback
+// (metal/probe.rs) decodes its RGBA16Float cube faces through the same path.
+pub(in crate::metal) fn f16_to_f32(h: u16) -> f32 {
     let sign = if (h >> 15) & 1 == 1 { -1.0 } else { 1.0 };
     let exp = (h >> 10) & 0x1f;
     let mant = (h & 0x3ff) as f32;

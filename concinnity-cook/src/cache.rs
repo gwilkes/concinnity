@@ -62,7 +62,11 @@ fn file_content_hash(path: &str) -> Option<[u8; 32]> {
 // 4: font payload gained a supersample factor in its header (build::font).
 // 5: EnvironmentMap default irradiance_face_size changed 32 -> 8
 //    (build::environment_map), so worlds that omit it bake a different cube.
-const CACHE_FORMAT_VERSION: u32 = 1;
+//    (The counter was later reset to 1 with the postcard/blob migration.)
+// 2: EnvironmentMap glossy reflection mips gained a firefly clamp
+//    (prefilter_clamp, default 12); worlds that omit the arg still bake dimmer
+//    hot texels, so every cached envmap must rebake (build::environment_map).
+const CACHE_FORMAT_VERSION: u32 = 2;
 
 const CACHE_DIR: &str = ".concinnity/cache";
 
@@ -99,8 +103,9 @@ pub fn payload_key(
 
 // Bump when the SceneImport expansion output shape changes (a new generated
 // asset field, a renamed arg, a different naming scheme) so existing cached
-// entry lists are invalidated.
-const EXPAND_FORMAT_VERSION: u32 = 1;
+// entry lists are invalidated. v2: glass materials are detected (by FBX
+// transparency / name) and emitted smooth + translucent.
+const EXPAND_FORMAT_VERSION: u32 = 2;
 
 // Cache key for a SceneImport expansion. The generated asset-entry list is a
 // deterministic function of the source file's contents, the import options,

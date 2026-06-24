@@ -39,6 +39,9 @@ pub struct FbxMaterial {
     pub emissive: Option<String>,
     pub diffuse: [f32; 3],
     pub emissive_factor: [f32; 3],
+    // Surface opacity in [0, 1]; 1 = fully opaque. Read from the FBX Opacity /
+    // TransparencyFactor property (glass/windows export < 1). 1.0 when absent.
+    pub opacity: f32,
 }
 
 // One material group of a mesh: geometry-local vertices and triangle indices.
@@ -159,6 +162,17 @@ fn prop_vec3(p70: &NodeHandle, name: &str) -> Option<[f64; 3]> {
                 a.get(5).and_then(attr_f64)?,
                 a.get(6).and_then(attr_f64)?,
             ]);
+        }
+    }
+    None
+}
+
+// Read a `Properties70` P entry's single numeric value (at attribute index 4).
+fn prop_scalar(p70: &NodeHandle, name: &str) -> Option<f64> {
+    for p in p70.children_by_name("P") {
+        let a = p.attributes();
+        if a.first().and_then(attr_str) == Some(name) {
+            return a.get(4).and_then(attr_f64);
         }
     }
     None
@@ -354,6 +368,15 @@ pub fn parse_fbx(path: &str) -> Result<FbxScene, String> {
             .and_then(|p| prop_vec3(&p, "EmissiveColor").or_else(|| prop_vec3(&p, "Emissive")))
             .map(|v| [v[0] as f32, v[1] as f32, v[2] as f32])
             .unwrap_or([0.0, 0.0, 0.0]);
+        // Opacity: `Opacity` (1 = opaque) preferred; else `TransparencyFactor`
+        // (0 = opaque, so invert). Absent -> fully opaque.
+        let opacity = p70
+            .and_then(|p| {
+                prop_scalar(&p, "Opacity")
+                    .or_else(|| prop_scalar(&p, "TransparencyFactor").map(|t| 1.0 - t))
+            })
+            .map(|v| v.clamp(0.0, 1.0) as f32)
+            .unwrap_or(1.0);
 
         let mut mat = FbxMaterial {
             name: object_name(&c),
@@ -363,6 +386,7 @@ pub fn parse_fbx(path: &str) -> Result<FbxScene, String> {
             emissive: None,
             diffuse,
             emissive_factor,
+            opacity,
         };
         if let Some(texs) = mat_textures.get(&id) {
             for (tex_id, prop) in texs {

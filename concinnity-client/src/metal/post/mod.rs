@@ -35,6 +35,9 @@ pub(super) use ssao::{SsaoState, build_ssao_pipeline, create_ssao_targets};
 pub(super) use ssgi::{
     SsgiState, build_ssgi_composite_pipeline, build_ssgi_gather_pipeline, create_ssgi_targets,
 };
-pub(super) use ssr::{SsrState, build_ssr_pipeline, create_ssr_targets};
+pub(super) use ssr::{
+    SsrState, build_reflection_blur_pipeline, build_reflection_composite_pipeline,
+    build_ssr_pipeline, create_ssr_targets,
+};
 pub(super) use taa::{TaaState, build_taa_pipeline, create_taa_targets};
 pub(super) use upscale::{MetalFXUpscaler, UpscaleState, temporal_scaler_supported};

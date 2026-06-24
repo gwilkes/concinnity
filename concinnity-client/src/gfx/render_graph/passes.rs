@@ -47,13 +47,14 @@ pub const PASS_NAMES: [&str; PASS_COUNT] = [
     "ssgi",
     "rt_reflections",
     "gbuffer_prepass",
+    "reflection_composite",
 ];
 
 // Number of distinct passes the engine times. Sized to match
 // [`PASS_NAMES`]; the per-pass timing array in
 // [`crate::gfx::profile::RenderStats`] is sized to at least this many
 // slots.
-pub const PASS_COUNT: usize = 27;
+pub const PASS_COUNT: usize = 28;
 
 // One per-pass identity. Cast to `usize` to index [`PASS_NAMES`] or any
 // `[T; PASS_COUNT]` companion array.
@@ -172,6 +173,12 @@ pub enum PassId {
     // on `FrameGraphInputs::unified_gbuffer_prepass`; Metal only, so the other
     // backends keep the flag false and emit their separate prepasses instead.
     GBufferPrepass = 26,
+    // Roughness-aware reflection composite. Not a standalone graph node: it is
+    // encoded inline at the tail of the `SsrResolve` / `RtReflections` pass
+    // (both write a reflection target, then blur it by roughness and composite
+    // it over the scene). It carries its own timing slot so its cost is visible
+    // separately from the trace/march that precedes it. Metal only.
+    ReflectionComposite = 27,
 }
 
 impl PassId {
@@ -221,6 +228,7 @@ mod tests {
         PassId::Ssgi,
         PassId::RtReflections,
         PassId::GBufferPrepass,
+        PassId::ReflectionComposite,
     ];
 
     // Expected timing name per variant. The match has no wildcard arm, so
@@ -255,6 +263,7 @@ mod tests {
             PassId::Ssgi => "ssgi",
             PassId::RtReflections => "rt_reflections",
             PassId::GBufferPrepass => "gbuffer_prepass",
+            PassId::ReflectionComposite => "reflection_composite",
         }
     }
 

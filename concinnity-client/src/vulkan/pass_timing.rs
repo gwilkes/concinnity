@@ -105,6 +105,7 @@ mod tests {
             PassId::Ssgi,
             PassId::RtReflections,
             PassId::GBufferPrepass,
+            PassId::ReflectionComposite,
         ] {
             let (s, e) = pass_pair(0, variant);
             assert!(seen.insert(s), "duplicate start slot for {variant:?}");

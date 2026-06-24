@@ -690,6 +690,9 @@ impl GraphicsSystem {
                 normal_secondary_index: normal_secondary_slot,
                 emissive_map_index: emissive_map_slot,
                 orm_map_index: orm_map_slot,
+                opacity: mat.opacity,
+                transparent: u32::from(mat.transparent),
+                see_through: u32::from(mat.see_through),
             };
             material_map.insert(mat.asset_id, (albedo_slot, normal_map_slot, uniforms));
         }
@@ -922,6 +925,7 @@ impl GraphicsSystem {
                     prefilter_face_size: em.prefilter_face_size,
                     irradiance_face_size: em.irradiance_face_size,
                     prefilter_samples: em.prefilter_samples,
+                    prefilter_clamp: em.prefilter_clamp,
                 });
             }
             match &em.locator {
@@ -1524,6 +1528,37 @@ impl GraphicsSystem {
             0,
             crate::gfx::graphics_system::streaming::chunk_reserve_count,
         );
+
+        // Reflection-probe auto-seed geometry. Computed here, before `draw_objects`
+        // moves into the backend: when the world declares no `ReflectionProbe`, surface-
+        // voxelise the static geometry so a watertight single-mesh interior is detected
+        // (object AABBs alone would read it as a solid block). Budget-gated, so a heavy
+        // import keeps coarse AABB occupancy. `None` -> the backend's own AABB auto-seed.
+        let auto_seed_geometry_probes = if ctx
+            .query::<crate::assets::ReflectionProbe>()
+            .next()
+            .is_some()
+        {
+            None
+        } else {
+            gather_auto_seed_triangles(&draw_objects, &all_vertices, &all_indices).and_then(
+                |tris| {
+                    let occupancy: Vec<([f32; 3], [f32; 3])> = draw_objects
+                        .iter()
+                        .map(|o| (o.bb_min, o.bb_max))
+                        .filter(|(mn, mx)| mn.iter().chain(mx).all(|c| c.is_finite()))
+                        .collect();
+                    let (mn, mx) =
+                        crate::gfx::reflection_probe::fold_world_bounds(occupancy.iter().copied())?;
+                    Some(
+                        crate::gfx::reflection_probe::auto_seed_probes_with_geometry(
+                            mn, mx, &occupancy, &tris,
+                        ),
+                    )
+                },
+            )
+        };
+
         self.backend = init_backend(
             &self.window_args,
             validation,
@@ -1579,6 +1614,31 @@ impl GraphicsSystem {
         if self.backend.is_none() {
             self.failed = true;
             return;
+        }
+
+        // Reflection probes: hand the backend the declared `ReflectionProbe`
+        // placements (Metal bakes a cube per probe; an empty list auto-seeds from
+        // the scene bounds). Pushed once here, after construction; DX/VK no-op.
+        if let Some(backend) = self.backend.as_deref_mut() {
+            let declared: Vec<crate::gfx::reflection_probe::ProbePlacement> = ctx
+                .drain::<crate::assets::ReflectionProbe>()
+                .into_iter()
+                .map(|p| {
+                    crate::gfx::reflection_probe::ProbePlacement::from_center_extents(
+                        p.position,
+                        p.half_extents,
+                    )
+                })
+                .collect();
+            // Declared probes win; otherwise the geometry-aware auto-seed (when the scene
+            // was small enough to gather); otherwise an empty list, which lets the backend
+            // run its own coarse-AABB auto-seed (the unchanged path for heavy imports).
+            let placements = if !declared.is_empty() {
+                declared
+            } else {
+                auto_seed_geometry_probes.unwrap_or_default()
+            };
+            backend.set_reflection_probes(&placements);
         }
 
         // World.jsonl path for the Prop transform reload pass. Best-effort:
@@ -1727,7 +1787,10 @@ impl GraphicsSystem {
             || ctx.query::<crate::assets::KeyBinding>().next().is_some();
         let has_camera = ctx.query::<Camera3D>().next().is_some();
         self.menu_mode = has_camera && has_ui;
+        let mut device_caps = crate::gfx::backend::DeviceCapabilities::ALL;
         if let Some(backend) = self.backend.as_deref_mut() {
+            // Capability flags drive the settings-menu gating below.
+            device_caps = backend.capabilities();
             backend.set_menu_mode(self.menu_mode);
             // Push the effective ambient scale (world value or persisted
             // override). The backend already seeds the world value at its own
@@ -1742,6 +1805,13 @@ impl GraphicsSystem {
                 backend.capture_cursor();
             }
         }
+        self.caps = device_caps;
+        // Gray out + disable settings rows whose feature the device cannot
+        // provide (e.g. ray-traced reflections on a GPU without hardware ray
+        // tracing). Runs while the menu HitRegions / TextLabels / ScrollPanels
+        // are still present (GraphicsSystem.init runs before UiInputSystem drains
+        // them); the value-label sync above already set each row's live value.
+        self.apply_capability_gating(ctx);
 
         self.setup_scene_reel(ctx);
 

@@ -43,6 +43,19 @@ use crate::metal::scoped_encoder::ScopedEncoder;
 use crate::metal::uniforms::{ModelUniforms, ViewUniforms};
 
 impl MtlContext {
+    // 1.0 when a reflection-resolve pass (SSR resolve or RT reflections) will
+    // composite over this frame's HDR target, else 0.0. Mirrors the
+    // `scene_input` gate in draw/mod.rs (both resolves write `ssr.targets.output`
+    // and the graph picks RT over SSR). The forward shader reads it from
+    // `ViewUniforms.reflections_enabled` to hand glossy specular to that resolve.
+    fn reflection_resolve_active(&self) -> f32 {
+        if self.ssr.settings.is_some() || self.rt.accel.is_some() {
+            1.0
+        } else {
+            0.0
+        }
+    }
+
     // pub(in crate::metal) so the render-graph executor in
     // metal/graph_exec.rs can dispatch this pass from a CompiledGraph.
     #[allow(clippy::too_many_arguments)]
@@ -130,7 +143,7 @@ impl MtlContext {
             vp,
             view: self.view_matrix,
             elapsed,
-            _pad: 0.0,
+            reflections_enabled: self.reflection_resolve_active(),
             cam_pos,
             prefilter_mip_count: self.env_map.prefilter_mip_count as f32,
             _end_pad: [0.0; 2],
@@ -144,6 +157,100 @@ impl MtlContext {
             object_buffer,
             bindless_tex_args,
             deformed_skinned,
+            // Main pass: the main cull ICB (no override).
+            None,
+        );
+        let count_instanced =
+            self.encode_main_instanced_into(&encoder, &view_uniforms, prepared_instances);
+        let count_skinned =
+            self.encode_main_skinned_into(&encoder, &view_uniforms, cam_pos, skinned_joint_bufs);
+
+        Ok(count_static + count_instanced + count_skinned)
+    }
+
+    // Render the main pass into one reflection-probe cube face instead of the
+    // HDR targets. A thin sibling of `encode_main_pass`: same three geometry
+    // sub-paths and shared bindings, but the render-pass descriptor points at a
+    // square MSAA colour + depth (resolving colour into `face_resolve`), and the
+    // view + view-projection are the caller's face matrices (not `self.*`), so
+    // the capture never disturbs the frame's camera state. Depth is cleared and
+    // discarded -- the probe consumes only the resolved colour. Driven by
+    // `capture_reflection_probe` (metal/probe.rs), once at first frame.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::metal) fn encode_main_into_face(
+        &self,
+        cmd_buf: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
+        face_color_msaa: &ProtocolObject<dyn objc2_metal::MTLTexture>,
+        face_depth_msaa: &ProtocolObject<dyn objc2_metal::MTLTexture>,
+        face_resolve: &ProtocolObject<dyn objc2_metal::MTLTexture>,
+        view: [[f32; 4]; 4],
+        vp: [[f32; 4]; 4],
+        cam_pos: [f32; 3],
+        elapsed: f32,
+        visible: &[u32],
+        prepared_instances: &super::super::instanced::PreparedInstances,
+        skinned_joint_bufs: &[Retained<ProtocolObject<dyn MTLBuffer>>],
+        object_buffer: Option<&Retained<ProtocolObject<dyn MTLBuffer>>>,
+        bindless_tex_args: Option<&Retained<ProtocolObject<dyn MTLBuffer>>>,
+        deformed_skinned: Option<&Retained<ProtocolObject<dyn MTLBuffer>>>,
+        // Bindless ICB to execute instead of the main cull's. The planar mirror
+        // render passes its slot's mirror ICB (culled against the reflected
+        // frustum); the probe capture passes `None` (reuses the main cull ICB).
+        // Only consulted on the bindless static path; the legacy fallback uses
+        // `visible` regardless.
+        icb_override: Option<&ProtocolObject<dyn objc2_metal::MTLIndirectCommandBuffer>>,
+    ) -> Result<u32, String> {
+        let desc = MTLRenderPassDescriptor::new();
+        let [r, g, b, a] = self.clear_color;
+        unsafe {
+            let ca = desc.colorAttachments().objectAtIndexedSubscript(0);
+            ca.setTexture(Some(face_color_msaa));
+            ca.setResolveTexture(Some(face_resolve));
+            ca.setLoadAction(MTLLoadAction::Clear);
+            ca.setStoreAction(MTLStoreAction::MultisampleResolve);
+            ca.setClearColor(MTLClearColor {
+                red: r as f64,
+                green: g as f64,
+                blue: b as f64,
+                alpha: a as f64,
+            });
+
+            let da = desc.depthAttachment();
+            da.setTexture(Some(face_depth_msaa));
+            da.setLoadAction(MTLLoadAction::Clear);
+            da.setClearDepth(1.0);
+            da.setStoreAction(MTLStoreAction::DontCare);
+        }
+
+        let encoder = ScopedEncoder::new(
+            cmd_buf
+                .renderCommandEncoderWithDescriptor(&desc)
+                .ok_or("failed to get probe render encoder")?,
+            "probe face",
+        );
+
+        let view_uniforms = ViewUniforms {
+            vp,
+            view,
+            elapsed,
+            // Probe-face bake: no reflection resolve runs over the probe cube, so
+            // the forward probe specular is the only reflection source here. Keep
+            // it (0.0) so captured glossy surfaces are not flattened.
+            reflections_enabled: 0.0,
+            cam_pos,
+            prefilter_mip_count: self.env_map.prefilter_mip_count as f32,
+            _end_pad: [0.0; 2],
+        };
+
+        let count_static = self.encode_main_static_into(
+            &encoder,
+            &view_uniforms,
+            cam_pos,
+            visible,
+            object_buffer,
+            bindless_tex_args,
+            deformed_skinned,
+            icb_override,
         );
         let count_instanced =
             self.encode_main_instanced_into(&encoder, &view_uniforms, prepared_instances);
@@ -219,7 +326,7 @@ impl MtlContext {
             vp,
             view: self.view_matrix,
             elapsed,
-            _pad: 0.0,
+            reflections_enabled: self.reflection_resolve_active(),
             cam_pos,
             prefilter_mip_count: self.env_map.prefilter_mip_count as f32,
             _end_pad: [0.0; 2],
@@ -379,6 +486,23 @@ impl MtlContext {
             // pass instead reaches it through the BindlessTextures argument
             // buffer; see build_bindless_texture_args.)
             enc.setFragmentTexture_atIndex(Some(self.ao_output_texture()), 5);
+            // Reflection-probe cube array at texture(6 .. 6+MAX_PROBES): the legacy
+            // path now selects + blends per-surface from the same probe set as the
+            // bindless path (which reaches the cubes through the BindlessTextures arg
+            // buffer instead, ICB-incompatible discrete binds being the reason).
+            // probe_cube_or_sky returns the sky prefilter for unbaked slots, so all
+            // MAX_PROBES are always valid. Skybox + diffuse keep texture 3/4.
+            for i in 0..crate::metal::uniforms::MAX_PROBES {
+                enc.setFragmentTexture_atIndex(Some(self.probe_cube_or_sky(i)), 6 + i);
+            }
+            // Reflection-probe set (count + per-probe parallax boxes) at fragment
+            // buffer(6) (a buffer slot, distinct from the texture(6) array). `EMPTY`
+            // until a bake; the shader weights every box covering the surface.
+            enc.setFragmentBytes_length_atIndex(
+                std::ptr::NonNull::from(&self.probe_set).cast(),
+                std::mem::size_of::<crate::metal::uniforms::ProbeSet>(),
+                6,
+            );
         }
     }
 
@@ -395,6 +519,11 @@ impl MtlContext {
         object_buffer: Option<&Retained<ProtocolObject<dyn MTLBuffer>>>,
         bindless_tex_args: Option<&Retained<ProtocolObject<dyn MTLBuffer>>>,
         deformed_skinned: Option<&Retained<ProtocolObject<dyn MTLBuffer>>>,
+        // ICB to execute instead of the main cull's `self.cull.icb`: the planar
+        // mirror render passes its slot's mirror ICB (culled against the
+        // reflected frustum) here; the main + probe paths pass `None` to use the
+        // main ICB.
+        icb_override: Option<&ProtocolObject<dyn objc2_metal::MTLIndirectCommandBuffer>>,
     ) -> u32 {
         enc.pushDebugGroup(&objc2_foundation::NSString::from_str("main static"));
         self.bind_main_pass_shared(enc, view_uniforms);
@@ -403,19 +532,15 @@ impl MtlContext {
         let last_nm = self.normal_map_textures.len().saturating_sub(1);
         let mut draw_calls: u32 = 0;
 
+        let icb_ref = icb_override.or(self.cull.icb.as_deref());
         if let (Some(obj_buf), Some(tex_args), Some(icb)) =
-            (object_buffer, bindless_tex_args, &self.cull.icb)
+            (object_buffer, bindless_tex_args, icb_ref)
         {
             // Bindless static pass, GPU-driven. Shared with the phase-2 main
             // pass under two-pass occlusion: see `execute_bindless_static_icb`.
             // Returns 1 (static+instances) or 2 (+ skinned tail) draw calls.
-            draw_calls += self.execute_bindless_static_icb(
-                enc,
-                obj_buf,
-                tex_args,
-                icb.as_ref(),
-                deformed_skinned,
-            );
+            draw_calls +=
+                self.execute_bindless_static_icb(enc, obj_buf, tex_args, icb, deformed_skinned);
         } else {
             // Legacy static pass: rebind model/material/textures per draw.
             // Used by shaders without a `fragment_main_bindless` entry point

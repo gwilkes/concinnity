@@ -125,6 +125,22 @@ fn entries_from_fbx(path: &str, opts: &ImportOptions) -> std::io::Result<Vec<ser
     for (i, m) in scene.materials.iter().enumerate() {
         let name = format!("{prefix}_mat_{i}");
         let mut args = serde_json::Map::new();
+        // Glass detection: the FBX flags it transparent, or the material is named
+        // like glass. Glass renders smooth + translucent (transparent pass when
+        // ray tracing is available, else a smooth reflective opaque surface).
+        let lname = m.name.to_lowercase();
+        // Smooth, see-through glass: flagged transparent by the FBX, or named
+        // like glass/window. Frosted glass stays rough/diffuse and emissive
+        // "glass" (lamp lenses) stays an opaque glow, so both are excluded.
+        let is_glass = (m.opacity < 0.95 || lname.contains("glass") || lname.contains("window"))
+            && !lname.contains("frosted")
+            && !lname.contains("emissive");
+        if std::env::var_os("CN_IMPORT_DEBUG").is_some() {
+            eprintln!(
+                "[import] mat '{}' opacity={} glass={}",
+                m.name, m.opacity, is_glass
+            );
+        }
         if let Some(p) = &m.albedo {
             let t = intern_texture(
                 p,
@@ -145,7 +161,9 @@ fn entries_from_fbx(path: &str, opts: &ImportOptions) -> std::io::Result<Vec<ser
             );
             args.insert("normal_map".into(), serde_json::Value::String(t));
         }
-        if let Some(p) = &m.orm {
+        // Glass drops the packed ORM map: its per-texel roughness would override
+        // the low scalar roughness below and leave the surface non-reflective.
+        if let (false, Some(p)) = (is_glass, &m.orm) {
             let t = intern_texture(
                 p,
                 prefix,
@@ -181,9 +199,19 @@ fn entries_from_fbx(path: &str, opts: &ImportOptions) -> std::io::Result<Vec<ser
             serde_json::json!([emissive_factor[0], emissive_factor[1], emissive_factor[2]]),
         );
         // Scalar fallbacks; the orm_map overrides roughness/metalness per-texel
-        // when present.
-        args.insert("roughness".into(), serde_json::json!(0.7));
-        args.insert("metallic".into(), serde_json::json!(0.0));
+        // when present (never for glass, which dropped the orm map above).
+        if is_glass {
+            // Smooth dielectric so the reflection passes (SSR / RT) pick it up,
+            // plus the transparency that routes it through the transparent pass.
+            args.insert("roughness".into(), serde_json::json!(0.08));
+            args.insert("metallic".into(), serde_json::json!(0.0));
+            let opacity = if m.opacity < 0.95 { m.opacity } else { 0.25 };
+            args.insert("opacity".into(), serde_json::json!(opacity));
+            args.insert("transparent".into(), serde_json::json!(true));
+        } else {
+            args.insert("roughness".into(), serde_json::json!(0.7));
+            args.insert("metallic".into(), serde_json::json!(0.0));
+        }
 
         entries.push(serde_json::json!({
             "name": name,

@@ -89,6 +89,24 @@ pub struct Material {
     /// Default `0.5` matches the "smooth but visible" transition AAA
     /// terrain materials typically tune to.
     pub secondary_blend_sharpness: f32,
+    /// Surface opacity in [0, 1]. 1 = fully opaque (the default). Only
+    /// meaningful when `transparent` is set: it drives how much of the scene
+    /// behind the surface shows through the glass.
+    pub opacity: f32,
+    /// When true, the surface is a translucent dielectric (glass): it renders
+    /// in the engine's transparent pass instead of the opaque pass, refracting
+    /// and reflecting the scene rather than writing solid colour + depth. The
+    /// importer sets this for materials it detects as glass; authored materials
+    /// can opt in directly. Defaults to false (opaque).
+    pub transparent: bool,
+    /// When true, the glass is rendered as genuinely see-through: the scene
+    /// behind it shows through with a sharp per-pixel reflection (requires a
+    /// ray-tracing-capable GPU). When false (the default), a `transparent`
+    /// surface still renders as low-roughness reflective glass that hides
+    /// whatever is behind it. See-through only looks right when the space behind
+    /// the glass is actually modelled, so it is opt-in per material. Setting it
+    /// implies `transparent`.
+    pub see_through: bool,
 }
 
 impl Default for Material {
@@ -108,6 +126,9 @@ impl Default for Material {
             albedo_secondary: None,
             normal_secondary: None,
             secondary_blend_sharpness: 0.5,
+            opacity: 1.0,
+            transparent: false,
+            see_through: false,
         }
     }
 }
@@ -123,6 +144,12 @@ impl Component for Material {
         args.macro_variation = args.macro_variation.clamp(0.0, 1.0);
         args.terrain_blend = args.terrain_blend.clamp(0.0, 1.0);
         args.secondary_blend_sharpness = args.secondary_blend_sharpness.clamp(0.0, 1.0);
+        args.opacity = args.opacity.clamp(0.0, 1.0);
+        // See-through glass is by definition transparent; opting into it implies
+        // the transparent pass even if the author only set `see_through`.
+        if args.see_through {
+            args.transparent = true;
+        }
         args
     }
     fn to_args(&self) -> Self {
@@ -216,5 +243,43 @@ impl crate::check::cross_reference::CrossReferenced for Material {
         }
 
         refs
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ecs::Component;
+
+    #[test]
+    fn default_is_opaque_and_not_see_through() {
+        let m = Material::default();
+        assert!(!m.transparent);
+        assert!(!m.see_through);
+        assert_eq!(m.opacity, 1.0);
+    }
+
+    #[test]
+    fn see_through_implies_transparent() {
+        // A material that opts into see-through but leaves `transparent` at its
+        // default must still route through the transparent pass.
+        let m = Material::from_args(Material {
+            see_through: true,
+            ..Material::default()
+        });
+        assert!(m.see_through);
+        assert!(m.transparent);
+    }
+
+    #[test]
+    fn transparent_without_see_through_stays_opaque_layer() {
+        // The importer's glass detection sets `transparent` only; that material
+        // stays Layer 1 (opaque reflective) and does not flip see-through on.
+        let m = Material::from_args(Material {
+            transparent: true,
+            ..Material::default()
+        });
+        assert!(m.transparent);
+        assert!(!m.see_through);
     }
 }

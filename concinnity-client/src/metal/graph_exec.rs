@@ -386,7 +386,7 @@ impl MtlContext {
                 if let Some(deformed) = params.deformed_skinned {
                     self.encode_main_skin(cmd_buf, deformed, params.skinned_joint_bufs)?;
                 }
-                let count = self.encode_cull(
+                self.encode_cull(
                     cmd_buf,
                     object_buffer,
                     draw_args_buffer,
@@ -400,7 +400,7 @@ impl MtlContext {
                 // it -- the same ordering the main cull -> Main ICB relies on. A
                 // no-op when the shadow-bindless path is inactive.
                 self.encode_shadow_culls(cmd_buf, object_buffer, draw_args_buffer)?;
-                count
+                0
             }
             PassId::HizBuild => {
                 // Two-pass occlusion: rebuild the Hi-Z pyramid mid-frame
@@ -570,6 +570,17 @@ impl MtlContext {
                     pass_id.name()
                 ));
             }
+            PassId::ReflectionComposite => {
+                // Encoded inline at the tail of SsrResolve / RtReflections (it
+                // blurs + composites the reflection target they wrote). Keeps a
+                // timing slot via an inline `attach_render`, but is never a graph
+                // node of its own -- same pattern as the bundled SSAO sub-passes.
+                return Err(format!(
+                    "graph executor: pass {} is encoded inline by SsrResolve / \
+                         RtReflections; it should not appear as its own graph node",
+                    pass_id.name()
+                ));
+            }
             PassId::Decals => {
                 self.encode_decals(cmd_buf, params.vp, params.inv_vp, params.frustum)?
             }
@@ -655,12 +666,54 @@ impl MtlContext {
                     time: params.elapsed,
                     _pad: 0.0,
                 };
+                // Planar reflection: when RT is off and the world has flat
+                // reflectors (water surfaces / glass panes), re-render the scene
+                // mirrored across each distinct reflector plane into its planar
+                // target (reusing this frame's cull ICB + bindless buffers) so the
+                // surface samples a sharp scene reflection instead of the blurry
+                // probe cube. RT on uses the per-pixel trace instead, so the planar
+                // pass is skipped. Encoded before `encode_transparent` on the same
+                // command buffer, which samples the resolves.
+                let planar_live = self.rt.accel.is_none()
+                    && self
+                        .planar_reflection
+                        .as_ref()
+                        .is_some_and(|s| !s.targets.is_empty());
+                if planar_live {
+                    self.encode_planar_reflections(cmd_buf, params)?;
+                }
+
                 // Gather every translucent producer's draws, then let the
                 // shared encoder sort them back-to-front and issue them.
                 let mut draws = Vec::new();
-                self.collect_water_transparent_draws(&view, &mut draws);
-                self.collect_glass_transparent_draws(&view, &mut draws);
-                self.encode_transparent(cmd_buf, &view, scene_pre_taa, &draws)?
+                self.collect_water_transparent_draws(
+                    &view,
+                    params.bindless_tex_args.is_some(),
+                    planar_live,
+                    &mut draws,
+                );
+                self.collect_glass_transparent_draws(
+                    &view,
+                    params.bindless_tex_args.is_some(),
+                    planar_live,
+                    &mut draws,
+                );
+                // Transparent glass MESHES (Layer 2): imported `transparent`
+                // materials traced per-pixel when RT is live. Inert otherwise
+                // (those meshes render opaque in the main pass).
+                self.collect_mesh_transparent_draws(
+                    &view,
+                    params.bindless_tex_args.is_some(),
+                    &mut draws,
+                );
+                self.encode_transparent(
+                    cmd_buf,
+                    &view,
+                    scene_pre_taa,
+                    &draws,
+                    params.rt_reflection_params,
+                    params.bindless_tex_args,
+                )?
             }
             PassId::Raymarch => {
                 let view = self.build_raymarch_view(params);

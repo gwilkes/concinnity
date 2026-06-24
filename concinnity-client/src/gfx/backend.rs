@@ -109,6 +109,33 @@ pub struct QualitySettings {
     pub auto_exposure_bias_ev: f32,
 }
 
+// GPU/device capability flags, queried from the backend once it is built.
+// Surfaced so the settings menu can gray out (and make inert) toggles the
+// device cannot honor -- e.g. ray-traced reflections on a GPU without hardware
+// ray tracing. Mirrors an RHI-style capability set: a handful of bools held in
+// memory and re-queried each launch, never persisted, so it is always correct
+// for the current device + driver.
+#[derive(Clone, Copy, Debug)]
+pub struct DeviceCapabilities {
+    // Hardware ray tracing for the RT-reflections pass: DXR 1.1 on DirectX, the
+    // ray-query device extensions on Vulkan (and not under XeSS), and
+    // `MTLDevice::supportsRaytracing` on Metal.
+    pub ray_tracing: bool,
+}
+
+impl DeviceCapabilities {
+    // Every capability present. The trait default, so a backend that does not
+    // report capabilities never wrongly disables a toggle (it keeps the prior
+    // behavior: the feature no-ops with a warning on an incapable device).
+    pub const ALL: Self = Self { ray_tracing: true };
+}
+
+impl Default for DeviceCapabilities {
+    fn default() -> Self {
+        Self::ALL
+    }
+}
+
 // The set of operations GraphicsSystem performs on a graphics backend.
 // Implementations are thin forwarders to the inherent methods on
 // MtlContext / DxContext / VkContext.
@@ -218,6 +245,15 @@ pub trait RenderBackend: SceneControl + Send {
     fn remove_chunk_mesh(&mut self, draw_idx: usize, retire_frame: u64) -> Result<(), String>;
     fn set_chunk_model(&mut self, draw_idx: usize, model: [[f32; 4]; 4]) -> Result<(), String>;
 
+    // Device capability flags, queried from the GPU once the backend is built.
+    // Read by GraphicsSystem to gray out + disable settings rows the device
+    // cannot honor. Default: all capable, so a backend that does not report
+    // capabilities keeps every toggle live (the feature then no-ops with a
+    // warning on an incapable device, as before).
+    fn capabilities(&self) -> DeviceCapabilities {
+        DeviceCapabilities::ALL
+    }
+
     // Metal-only diagnostics; default no-op for parity.
     fn logical_size(&self) -> (f32, f32) {
         (0.0, 0.0)
@@ -250,6 +286,15 @@ pub trait RenderBackend: SceneControl + Send {
     // Default no-op (DX / Vulkan): they keep their startup capture decision.
     fn set_camera_capture(&mut self, capture: bool) {
         let _ = capture;
+    }
+
+    // Supply the reflection-probe placements (from declared `ReflectionProbe`
+    // assets, or empty to auto-seed from the scene bounds). The backend bakes a
+    // cube per placement and samples the nearest for the specular reflection.
+    // Pushed once after construction. Default no-op: backends without probe
+    // support (DX / Vulkan today) keep the sky reflection.
+    fn set_reflection_probes(&mut self, probes: &[crate::gfx::reflection_probe::ProbePlacement]) {
+        let _ = probes;
     }
 
     // Turn display sync (vsync) on or off at runtime, applied to presentation.

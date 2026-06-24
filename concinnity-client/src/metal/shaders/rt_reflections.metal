@@ -93,9 +93,110 @@ struct BindlessTextures {
     texture2d<float>     ssao       [[id(BINDLESS_TEXTURE_COUNT + 3)]];
 };
 
-constant float RT_ROUGH_CUT = 0.6;   // surfaces rougher than this get no reflection
+// Surfaces rougher than REFLECTION_ROUGHNESS_CUT get no reflection. Injected as
+// a shared `constant` (see pipeline.rs) so the SSR / RT / composite gates agree.
 constant float RT_F0        = 0.04;  // dielectric base reflectance for the Fresnel
 constant float VERTEX_FLOATS = 14.0; // floats per Vertex (stride 56 bytes)
+
+// Reflection-probe set, bound at buffer(8). Layout mirrors `ProbeSet` /
+// `ProbeUniforms` in default.metal (and metal::uniforms). A reflection ray that
+// misses the scene falls back to the local scene-captured probe (box-projected)
+// instead of the foreign sky cube, the same source the forward IBL specular term
+// uses. `count` is 0 in worlds with no baked probe, where the miss keeps the sky.
+constant constexpr uint  MAX_PROBES         = 8u;
+constant constexpr float PROBE_BLEND_MARGIN = 0.2;
+
+struct ProbeUniforms {
+    float4 box_min;   // xyz = influence-box min, w = enabled
+    float4 box_max;   // xyz = influence-box max
+    float4 probe_pos; // xyz = capture position
+};
+
+struct ProbeSet {
+    uint count;
+    // Three scalar uints, NOT a uint3: a uint3 is 16-byte aligned in MSL, which
+    // pushes `probes` to offset 32 (struct 416 bytes) and mismatches the CPU-side
+    // metal::uniforms::ProbeSet, whose [u32; 3] keeps `probes` at offset 16 (struct
+    // 400 bytes). The static_assert locks the 400-byte layout at shader-compile time.
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+    ProbeUniforms probes[MAX_PROBES];
+};
+static_assert(sizeof(ProbeSet) == 400,
+              "ProbeSet must be 400 bytes to match the CPU-side metal::uniforms::ProbeSet");
+
+// Box-parallax sample of one probe cube: intersect the world-space reflection ray
+// with the probe's influence box and re-anchor the sample at that hit relative to
+// the capture point, so a static cube tracks the camera. Mirrors default.metal's
+// `sample_probe_radiance`; the `dist > 0` guard keeps a blended secondary box the
+// surface has already left from sampling backward.
+static float3 sample_probe_radiance(
+    texturecube<float>      probe_cube,
+    constant ProbeUniforms &probe,
+    float3                  world_pos,
+    float3                  R,
+    float                   lod,
+    sampler                 cube_sampler
+) {
+    float3 sample_dir = R;
+    if (probe.box_min.w > 0.5) {
+        float3 inv_r = 1.0 / R;
+        float3 t_max = (probe.box_max.xyz - world_pos) * inv_r;
+        float3 t_min = (probe.box_min.xyz - world_pos) * inv_r;
+        float3 t_far = max(t_max, t_min);
+        float dist = min(min(t_far.x, t_far.y), t_far.z);
+        if (dist > 0.0) {
+            float3 hit = world_pos + R * dist;
+            sample_dir = hit - probe.probe_pos.xyz;
+        }
+    }
+    return probe_cube.sample(cube_sampler, sample_dir, bias(lod)).rgb;
+}
+
+// Reflection-probe radiance for `world_pos` along world-space ray `R`. Weights
+// every probe whose influence box covers `world_pos` and returns the
+// weight-normalised sum of their box-projected samples (partition of unity): each
+// probe's weight is `smoothstep(-margin, margin, sd)` of its signed box distance, so
+// overlapping boxes cross-fade smoothly (no pop at a 3-way overlap line) and a single
+// covering box reduces to one sample. Falls back to the nearest by capture distance
+// where no box covers. Matches default.metal's `probe_set_specular`.
+static float3 probe_set_specular(
+    constant ProbeSet                    &set,
+    array<texturecube<float>, MAX_PROBES> probes,
+    float3                                world_pos,
+    float3                                R,
+    float                                 lod,
+    sampler                               cube_sampler
+) {
+    float3 acc = float3(0.0);
+    float wsum = 0.0;
+    float near_d = 1e30;
+    uint near_i = 0u;
+    for (uint i = 0u; i < set.count; i++) {
+        float3 c = 0.5 * (set.probes[i].box_min.xyz + set.probes[i].box_max.xyz);
+        float3 he = 0.5 * (set.probes[i].box_max.xyz - set.probes[i].box_min.xyz);
+        float3 q = abs(world_pos - c) - he;
+        float sd = -(length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0));
+        float margin = max(PROBE_BLEND_MARGIN * min(he.x, min(he.y, he.z)), 1e-4);
+        float w = smoothstep(-margin, margin, sd);
+        if (w > 0.0) {
+            acc += w * sample_probe_radiance(
+                           probes[i], set.probes[i], world_pos, R, lod, cube_sampler);
+            wsum += w;
+        }
+        float d = distance(world_pos, set.probes[i].probe_pos.xyz);
+        if (d < near_d) {
+            near_d = d;
+            near_i = i;
+        }
+    }
+    if (wsum > 0.0) {
+        return acc / wsum;
+    }
+    return sample_probe_radiance(
+        probes[near_i], set.probes[near_i], world_pos, R, lod, cube_sampler);
+}
 
 // Rebuild a view-space position from a UV and its linear (view-space) depth.
 static float3 rt_view_pos(float2 uv, float depth, float tan_y, float aspect) {
@@ -130,6 +231,7 @@ static float2 rt_vertex_uv(const device float* v, uint vi) {
 struct RtSetup {
     bool   reflects;   // false -> sky / too rough, write base unchanged
     float3 base;
+    float3 world_pos;  // world-space surface point (probe box-projection anchor)
     float3 origin;     // ray origin (surface point nudged along the normal)
     float3 dir;        // world-space reflection direction
     float  weight;     // saturate(fresnel * gloss * intensity)
@@ -153,7 +255,7 @@ static RtSetup rt_setup(
     float depth = g.a;
     if (depth <= 0.0) return s;                 // background / sky
     s.roughness = rough_tex.sample(smp, in.uv).r;
-    float gloss = saturate((RT_ROUGH_CUT - s.roughness) / RT_ROUGH_CUT);
+    float gloss = saturate((REFLECTION_ROUGHNESS_CUT - s.roughness) / REFLECTION_ROUGHNESS_CUT);
     if (gloss <= 0.0) return s;
 
     float3 Nv = normalize(g.xyz);
@@ -162,6 +264,7 @@ static RtSetup rt_setup(
     float3 Nw = normalize((p.inv_view * float4(Nv, 0.0)).xyz);
     float3 V  = normalize(p.cam_pos.xyz - Pw);
 
+    s.world_pos = Pw;
     s.origin = Pw + Nw * 0.01;                  // nudge off the surface
     s.dir    = reflect(-V, Nw);
     s.ibl    = p.prefilter_mip_count > 0.5;
@@ -203,7 +306,7 @@ constant uint RT_SKINNED_FLAG = 0x80000000u;
 // fragment argument. `verts`/`indices` are the static buffers; `sverts`/`sidx`
 // the deformed-vertex / u16 skinned buffers, selected per hit by the skinned
 // flag so skinned geometry reflects with its current pose.
-#define RT_TRACE(out_trace, s, p, verts, sverts, indices, sidx, geom, accel, prefilter, cube_smp) \
+#define RT_TRACE(out_trace, s, p, verts, sverts, indices, sidx, geom, accel, prefilter, cube_smp, probe_set, probes) \
     do {                                                                            \
         RtTrace _t; _t.hit = false;                                                 \
         ray _r; _r.origin = (s).origin; _r.direction = (s).dir;                     \
@@ -262,7 +365,15 @@ constant uint RT_SKINNED_FLAG = 0x80000000u;
             _t.shadow = (_sh.type == intersection_type::triangle) ? 0.0 : 1.0;      \
         } else {                                                                    \
             float _lod = (s).roughness * (s).max_mip;                              \
-            _t.env = (s).ibl ? prefilter.sample(cube_smp, (s).dir, level(_lod)).rgb : (s).base; \
+            if (!(s).ibl) {                                                         \
+                _t.env = (s).base;                                                  \
+            } else if ((probe_set).count > 0u) {                                    \
+                /* Missed ray reflects the local box-projected probe, not the sky. */ \
+                _t.env = probe_set_specular((probe_set), (probes),                   \
+                                            (s).world_pos, (s).dir, _lod, cube_smp); \
+            } else {                                                                \
+                _t.env = prefilter.sample(cube_smp, (s).dir, level(_lod)).rgb;      \
+            }                                                                       \
         }                                                                           \
         out_trace = _t;                                                             \
     } while (0)
@@ -300,18 +411,20 @@ fragment float4 rt_reflections_fragment(
     instance_acceleration_structure accel          [[buffer(4)]],
     const device float* sverts                     [[buffer(5)]],
     const device ushort* sidx                      [[buffer(6)]],
+    constant ProbeSet& probe_set                   [[buffer(8)]],
     texture2d<float>   scene                       [[texture(0)]],
     texture2d<float>   gbuffer                     [[texture(1)]],
     texture2d<float>   rough_tex                   [[texture(2)]],
     texturecube<float> prefilter                   [[texture(3)]],
+    array<texturecube<float>, MAX_PROBES> probes   [[texture(4)]],
     sampler smp                                    [[sampler(0)]],
     sampler cube_smp                               [[sampler(1)]]
 ) {
     RtSetup s = rt_setup(in, p, scene, gbuffer, rough_tex, smp);
-    if (!s.reflects) return float4(s.base, 1.0);
+    if (!s.reflects) return float4(0.0);   // no reflection -> composite keeps the scene
 
     RtTrace t;
-    RT_TRACE(t, s, p, verts, sverts, indices, sidx, geom, accel, prefilter, cube_smp);
+    RT_TRACE(t, s, p, verts, sverts, indices, sidx, geom, accel, prefilter, cube_smp, probe_set, probes);
 
     float3 reflected;
     if (t.hit) {
@@ -320,7 +433,9 @@ fragment float4 rt_reflections_fragment(
     } else {
         reflected = t.env;
     }
-    return float4(mix(s.base, reflected, s.weight), 1.0);
+    // Reflected radiance (.rgb) + composite weight (.a). The reflection
+    // composite blurs this by surface roughness and blends it over the scene.
+    return float4(reflected, s.weight);
 }
 
 // Textured variant: samples the hit's albedo from the bindless pool × tint.
@@ -335,18 +450,20 @@ fragment float4 rt_reflections_fragment_textured(
     const device float* sverts                     [[buffer(5)]],
     const device ushort* sidx                      [[buffer(6)]],
     constant BindlessTextures& tex                 [[buffer(7)]],
+    constant ProbeSet& probe_set                   [[buffer(8)]],
     texture2d<float>   scene                       [[texture(0)]],
     texture2d<float>   gbuffer                     [[texture(1)]],
     texture2d<float>   rough_tex                   [[texture(2)]],
     texturecube<float> prefilter                   [[texture(3)]],
+    array<texturecube<float>, MAX_PROBES> probes   [[texture(4)]],
     sampler smp                                    [[sampler(0)]],
     sampler cube_smp                               [[sampler(1)]]
 ) {
     RtSetup s = rt_setup(in, p, scene, gbuffer, rough_tex, smp);
-    if (!s.reflects) return float4(s.base, 1.0);
+    if (!s.reflects) return float4(0.0);   // no reflection -> composite keeps the scene
 
     RtTrace t;
-    RT_TRACE(t, s, p, verts, sverts, indices, sidx, geom, accel, prefilter, cube_smp);
+    RT_TRACE(t, s, p, verts, sverts, indices, sidx, geom, accel, prefilter, cube_smp, probe_set, probes);
 
     float3 reflected;
     if (t.hit) {
@@ -379,5 +496,7 @@ fragment float4 rt_reflections_fragment_textured(
     } else {
         reflected = t.env;
     }
-    return float4(mix(s.base, reflected, s.weight), 1.0);
+    // Reflected radiance (.rgb) + composite weight (.a). The reflection
+    // composite blurs this by surface roughness and blends it over the scene.
+    return float4(reflected, s.weight);
 }

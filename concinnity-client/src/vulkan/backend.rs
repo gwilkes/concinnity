@@ -83,6 +83,7 @@ impl RenderBackend for VkContext {
         fn add_decal(&mut self, record: crate::gfx::decal::DecalRecord) -> Result<usize, String>;
         fn remove_decal(&mut self, decal_id: usize) -> Result<(), String>;
         fn render_stats(&self) -> RenderStats;
+        fn capabilities(&self) -> crate::gfx::backend::DeviceCapabilities;
         fn logical_size(&self) -> (f32, f32);
         fn update_color_lut(&mut self, size: u32, data: &[u8]) -> Result<(), String>;
         fn update_environment_map(&mut self, payload: &[u8]) -> Result<(), String>;

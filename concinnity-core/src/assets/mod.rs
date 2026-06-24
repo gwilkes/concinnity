@@ -46,6 +46,7 @@ mod prefab;
 pub mod procedural_mesh;
 mod prop;
 mod prop_body;
+mod reflection_probe;
 mod rigid_body;
 mod room;
 mod scene;
@@ -130,6 +131,7 @@ pub use prop::Prop;
 #[allow(unused_imports)]
 pub use prop::PropCollider;
 pub use prop_body::PropBody;
+pub use reflection_probe::ReflectionProbe;
 pub use rigid_body::RigidBody;
 pub use room::Room;
 pub use scene::Scene;

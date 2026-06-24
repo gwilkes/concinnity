@@ -192,6 +192,13 @@ impl System for UiInputSystem {
         // `view` field that the build pipeline writes from the name prefix.
         let hit_regions = ctx.drain::<HitRegion>();
         for region in hit_regions {
+            // A region disabled by the engine (e.g. a capability-gated settings
+            // row grayed out at init) is inert: dropping it here means it never
+            // hovers, fires, drags, or reflows. Its labels are styled + reflowed
+            // independently (by GraphicsSystem and the scroll panel).
+            if region.disabled {
+                continue;
+            }
             let (original_color, original_scale) = match region.label {
                 None => (None, None),
                 Some(label_id) => ctx
@@ -1081,6 +1088,7 @@ mod tests {
             action: String::new(),
             drag_handle: None,
             view: None,
+            disabled: false,
         });
         world.start().unwrap();
 
@@ -1142,6 +1150,7 @@ mod tests {
             action: String::new(),
             drag_handle: None,
             view: None,
+            disabled: false,
         });
         world.start().unwrap();
 
@@ -1172,6 +1181,7 @@ mod tests {
             action: "scene:3".to_string(),
             drag_handle: None,
             view: None,
+            disabled: false,
         });
         world.start().unwrap();
 
@@ -1197,6 +1207,7 @@ mod tests {
             action: "quit".to_string(),
             drag_handle: None,
             view: None,
+            disabled: false,
         });
         world.start().unwrap();
 
@@ -1298,6 +1309,7 @@ mod tests {
             action: "scene:7".to_string(),
             drag_handle: None,
             view: Some(view_id),
+            disabled: false,
         });
         world.start().unwrap();
         world
@@ -1349,6 +1361,7 @@ mod tests {
             action: "scene:7".to_string(),
             drag_handle: None,
             view: None,
+            disabled: false,
         });
         world.start().unwrap();
 
@@ -1379,6 +1392,7 @@ mod tests {
             action: "view:hide".to_string(),
             drag_handle: None,
             view: None,
+            disabled: false,
         });
         world.start().unwrap();
         world.add_component(make_frame_input(50.0, 50.0, true));
@@ -1401,6 +1415,7 @@ mod tests {
             action: "view:show:42".to_string(),
             drag_handle: None,
             view: None,
+            disabled: false,
         });
         world.start().unwrap();
         world.add_component(make_frame_input(50.0, 50.0, true));
@@ -1421,6 +1436,7 @@ mod tests {
             action: "view:toggle:43".to_string(),
             drag_handle: None,
             view: None,
+            disabled: false,
         });
         world.start().unwrap();
         world.add_component(make_frame_input(50.0, 50.0, true));
@@ -1446,6 +1462,7 @@ mod tests {
             action: "setting:vsync:next".to_string(),
             drag_handle: None,
             view: None,
+            disabled: false,
         });
         world.start().unwrap();
         world.add_component(make_frame_input(50.0, 50.0, true));
@@ -1469,6 +1486,34 @@ mod tests {
         assert_eq!(cmd.op, SettingOp::Prev);
     }
 
+    // A region the engine disabled (e.g. a capability-gated settings row grayed
+    // out at init) is inert: clicking where it sits fires nothing.
+    #[test]
+    fn disabled_region_does_not_fire() {
+        let mut world = World::new_empty();
+        world.add_component(HitRegion {
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 100.0,
+            label: None,
+            hover_color: None,
+            hover_scale: None,
+            action: "setting:ray_traced_reflections:next".to_string(),
+            drag_handle: None,
+            view: None,
+            disabled: true,
+        });
+        world.start().unwrap();
+
+        world.add_component(make_frame_input(50.0, 50.0, true));
+        world.step();
+        assert!(
+            world.query::<SettingCommand>().next().is_none(),
+            "a disabled region must not fire its action"
+        );
+    }
+
     #[test]
     fn slider_drag_pushes_set_fraction_then_persists_on_release() {
         let mut world = World::new_empty();
@@ -1484,6 +1529,7 @@ mod tests {
             action: "setting:exposure:drag".to_string(),
             drag_handle: Some(AssetId(8)),
             view: None,
+            disabled: false,
         });
         world.start().unwrap();
 
@@ -1547,6 +1593,7 @@ mod tests {
             action: "group:toggle:0".to_string(),
             drag_handle: None,
             view: Some(view),
+            disabled: false,
         });
         // Body click region (a settings action; a content region, so it is
         // bucketed into its row and gated by the collapse).
@@ -1561,6 +1608,7 @@ mod tests {
             action: "setting:vsync:next".to_string(),
             drag_handle: None,
             view: Some(view),
+            disabled: false,
         });
         world.add_component(ScrollPanel {
             view: Some(view),
@@ -1718,6 +1766,7 @@ mod tests {
             action: "setting:key_forward:rebind".to_string(),
             drag_handle: None,
             view: None,
+            disabled: false,
         });
         world.start().unwrap();
         (world, value)

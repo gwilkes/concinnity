@@ -62,6 +62,67 @@ pub(super) fn draw_object_position(obj: &crate::gfx::render_types::DrawObject) -
     }
 }
 
+// Above this triangle count the reflection-probe auto-seed skips the world-triangle
+// gather and keeps coarse object-AABB occupancy, so a heavy import (Bistro is ~2.8M
+// triangles) pays nothing extra at load. Small authored scenes stay well under it and
+// get the finer surface-voxel interior detection (a watertight single-mesh room is then
+// seen as hollow).
+pub(super) const AUTO_SEED_MAX_TRIANGLES: usize = 200_000;
+
+// Gather world-space triangles from the static draw list for reflection-probe auto-seed
+// interior detection (surface voxelisation needs real geometry, not AABBs). Returns
+// `None` when there is no cullable static geometry or the scene exceeds
+// `AUTO_SEED_MAX_TRIANGLES` -- the caller then falls back to coarse AABB occupancy. Each
+// cullable draw's indexed triangles are transformed to world space by its model matrix;
+// `base_vertex` is honoured so streamed (mesh-relative) chunks resolve too, and every
+// fetch is bounds-checked against the shared vertex buffer (build-time offsets should be
+// in range, but a bad offset is skipped rather than risking an out-of-bounds index).
+pub(super) fn gather_auto_seed_triangles(
+    draw_objects: &[crate::gfx::render_types::DrawObject],
+    all_vertices: &[Vertex],
+    all_indices: &[u32],
+) -> Option<Vec<[[f32; 3]; 3]>> {
+    let eligible = |o: &crate::gfx::render_types::DrawObject| o.cullable() && o.index_count >= 3;
+    let total_tris: usize = draw_objects
+        .iter()
+        .filter(|o| eligible(o))
+        .map(|o| o.index_count / 3)
+        .sum();
+    if total_tris == 0 || total_tris > AUTO_SEED_MAX_TRIANGLES {
+        return None;
+    }
+
+    // Column-major model-to-world transform of a model-space point.
+    let xf = |m: &[[f32; 4]; 4], p: [f32; 3]| {
+        [
+            m[0][0] * p[0] + m[1][0] * p[1] + m[2][0] * p[2] + m[3][0],
+            m[0][1] * p[0] + m[1][1] * p[1] + m[2][1] * p[2] + m[3][1],
+            m[0][2] * p[0] + m[1][2] * p[1] + m[2][2] * p[2] + m[3][2],
+        ]
+    };
+
+    let mut tris = Vec::with_capacity(total_tris);
+    for o in draw_objects.iter().filter(|o| eligible(o)) {
+        let iend = o.index_offset + o.index_count;
+        if iend > all_indices.len() {
+            continue;
+        }
+        for t in all_indices[o.index_offset..iend].chunks_exact(3) {
+            let vi = |k: usize| (t[k] as i64 + o.base_vertex as i64) as usize;
+            let (a, b, c) = (vi(0), vi(1), vi(2));
+            if a >= all_vertices.len() || b >= all_vertices.len() || c >= all_vertices.len() {
+                continue;
+            }
+            tris.push([
+                xf(&o.model, all_vertices[a].pos),
+                xf(&o.model, all_vertices[b].pos),
+                xf(&o.model, all_vertices[c].pos),
+            ]);
+        }
+    }
+    (!tris.is_empty()).then_some(tris)
+}
+
 // Build the payload source for a streamed texture pool (albedo or normal-map).
 //
 // When `disk_backed`, each locator's payload-section offset is turned into an

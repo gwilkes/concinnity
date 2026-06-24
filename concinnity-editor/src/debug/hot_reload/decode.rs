@@ -126,6 +126,7 @@ fn spawn_envmap_worker(state: &AssetHotReloadState) {
                     env_map_copy.prefilter_face_size,
                     env_map_copy.irradiance_face_size,
                     env_map_copy.prefilter_samples,
+                    env_map_copy.prefilter_clamp,
                 )
             });
             let _ = tx.send(result);

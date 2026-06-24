@@ -144,6 +144,19 @@ impl MtlContext {
         // drops and releases the slot synchronously, keeping the count balanced.
         let frame_slot = self.frame_pacing.acquire();
 
+        // Asynchronous reflection-probe bake. One probe at a time, advanced across
+        // frames, captures real geometry into `probe_maps` (the sky `env_map` is
+        // left untouched) so glossy surfaces reflect their surroundings instead of a
+        // foreign HDR; unbaked probes fall back to the sky until installed. The
+        // render thread never blocks on it: the six faces are submitted without
+        // `waitUntilCompleted` (into a reserved ring slot the frame never overwrites)
+        // and the prefilter convolution runs on a worker thread. Runs AFTER
+        // `acquire()` so its reserved-slot retire-pool collection sees a fence-
+        // consistent frame id. Non-fatal: a failure keeps the current state.
+        if let Err(e) = self.bake_pending_probes(elapsed, near, far) {
+            tracing::warn!("reflection probe bake failed, keeping current environment: {e}");
+        }
+
         // tell MTKView to prepare its drawable for this frame
         self.mtk_view.draw();
 
@@ -342,6 +355,15 @@ impl MtlContext {
                 // shadow ICB to NUM_SHADOW_CASCADES * cull_count. A no-op when
                 // the shadow-bindless path is inactive (no shadow cull encoder).
                 self.ensure_shadow_icb_capacity(self.cull_count())?;
+                // Per-planar-slot mirror cull ICBs: one per distinct reflection
+                // plane, each sized to cull_count. A no-op (clears the slots) when
+                // the world has no planar set (RT on, or no flat reflectors).
+                let mirror_slots = self
+                    .planar_reflection
+                    .as_ref()
+                    .map(|s| s.planes.len())
+                    .unwrap_or(0);
+                self.ensure_mirror_icb_capacity(mirror_slots, self.cull_count())?;
             }
             draw_args
         } else {
@@ -384,7 +406,13 @@ impl MtlContext {
                 [0.0, 0.0, 0.0, 1.0],
             ];
             let prefilter_mip_count = self.env_map.prefilter_mip_count as f32;
-            settings.params(fov_y_radians, aspect, inv_view_rot, prefilter_mip_count)
+            settings.params(
+                fov_y_radians,
+                aspect,
+                inv_view_rot,
+                cam_pos,
+                prefilter_mip_count,
+            )
         });
         let ssgi_params = self
             .ssgi
@@ -850,6 +878,13 @@ impl MtlContext {
         if !self.rt.dynamic_mode.is_dynamic() {
             return Ok(());
         }
+        // RT reflections are not enabled this run (no settings, or the GPU lacks
+        // ray tracing): there is no BVH to keep current, and a lingering topology
+        // flag must not trigger a build. Clear it and bail.
+        if self.rt.settings.is_none() {
+            self.rt.topology_dirty = false;
+            return Ok(());
+        }
         let albedo_count = self.textures.len();
         let normal_count = self.normal_map_textures.len();
 
@@ -859,6 +894,12 @@ impl MtlContext {
         if let Some(accel) = self.rt.accel.as_mut() {
             accel.retire_completed(frame_id, depth);
         }
+
+        // Did a streamed chunk, cloned prop, or participation-changing material
+        // edit alter the RT-relevant draw set since the last update? Consume the
+        // flag; the BLAS topology must be refreshed below rather than ignored (the
+        // `Auto` dirty check only watches the transforms of the prior set).
+        let topology_changed = std::mem::take(&mut self.rt.topology_dirty);
 
         // Skinned meshes deform every frame, so their BLAS (baked from the posed
         // vertices) must be rebuilt each frame: a TLAS-only rebuild can't
@@ -875,10 +916,42 @@ impl MtlContext {
             if self.rt.accel.is_none() || self.rt.dynamic_mode == RtDynamicMode::Rebuild {
                 return self.rebuild_rt_accel(albedo_count, normal_count);
             }
+            // Fold any added/removed draw geometry into the static head (BLAS only,
+            // async), then the skinned path rebuilds the TLAS + table over the
+            // refreshed head + the fresh skinned tail.
+            if topology_changed {
+                self.refresh_rt_topology(albedo_count, normal_count, false, frame_id)?;
+            }
             return self.update_rt_skinned(albedo_count, normal_count, frame_id);
         }
-        // No skinned geometry and no static BVH -> nothing to keep current.
+        // No skinned geometry.
         if self.rt.accel.is_none() {
+            // A topology change can introduce the first participating geometry
+            // (e.g. the first streamed chunk in a world that began empty): seed
+            // the BVH from scratch. Otherwise nothing to keep current.
+            if topology_changed {
+                return self.rebuild_rt_accel(albedo_count, normal_count);
+            }
+            return Ok(());
+        }
+        // The `Rebuild` diagnostic rebuilds every BLAS every frame, which already
+        // absorbs any topology change.
+        if self.rt.dynamic_mode == RtDynamicMode::Rebuild {
+            return self.rebuild_rt_accel(albedo_count, normal_count);
+        }
+        if topology_changed {
+            // Incrementally refresh the draw-object BLAS head AND rebuild the TLAS
+            // over the refreshed set, all async on one command buffer (the
+            // transform dirty check only sees the prior set, so the rebuild is
+            // forced). `build_tlas = true` does the TLAS inline -- no separate
+            // `rebuild_rt_tlas` follow-up.
+            self.refresh_rt_topology(albedo_count, normal_count, true, frame_id)?;
+            if self.rt.accel.as_ref().is_some_and(|a| a.is_empty()) {
+                // The refresh removed the last draw + cluster geometry; drop the
+                // BVH so a later add re-seeds it instead of building a degenerate
+                // zero-instance TLAS.
+                self.rt.accel = None;
+            }
             return Ok(());
         }
         match self.rt.dynamic_mode {
@@ -895,11 +968,53 @@ impl MtlContext {
                 }
             }
             RtDynamicMode::Tlas => self.rebuild_rt_tlas(albedo_count, normal_count)?,
-            RtDynamicMode::Rebuild => self.rebuild_rt_accel(albedo_count, normal_count)?,
-            // Filtered out by the `is_dynamic` guard above.
-            RtDynamicMode::Off => {}
+            // Handled above / filtered out by the `is_dynamic` guard.
+            RtDynamicMode::Rebuild | RtDynamicMode::Off => {}
         }
         Ok(())
+    }
+
+    // Incrementally refresh the RT draw-object BLAS head to match the current
+    // draw set (added/removed chunks, cloned props, participation-changing
+    // material edits), reusing every unchanged BLAS, async. `build_tlas` also
+    // rebuilds the TLAS + geometry table inline (the no-skinned path); when clear,
+    // the caller's `rebuild_skinned` rebuilds the TLAS over the refreshed head +
+    // skinned tail. Borrows the accel mutably while reading the device / queue /
+    // shared buffers / draw list, so the cheap handles are cloned and the draw
+    // list is lifted out (an O(1) `Vec` swap) to keep the borrows disjoint, then
+    // restored.
+    fn refresh_rt_topology(
+        &mut self,
+        albedo_count: usize,
+        normal_count: usize,
+        build_tlas: bool,
+        frame_id: u64,
+    ) -> Result<(), String> {
+        let device = self.device.clone();
+        let queue = self.command_queue.clone();
+        let vbuf = self.vertex_buffer.clone();
+        let ibuf = self.index_buffer.clone();
+        let exclude_seethrough = self.seethrough_meshes_enabled();
+        let draw_objects = std::mem::take(&mut self.draw_objects);
+        let res = self
+            .rt
+            .accel
+            .as_mut()
+            .expect("rt_accel is Some (checked by caller)")
+            .refresh_static_topology(
+                &device,
+                &queue,
+                &vbuf,
+                &ibuf,
+                &draw_objects,
+                albedo_count,
+                normal_count,
+                exclude_seethrough,
+                build_tlas,
+                frame_id,
+            );
+        self.draw_objects = draw_objects;
+        res
     }
 
     // Full BVH rebuild (fresh BLAS + TLAS + table) from the current draw list,
@@ -910,7 +1025,11 @@ impl MtlContext {
     // failure or an emptied scene leaves the previous BVH in place. The
     // immutable borrows of `self` all end when the build returns, before the
     // assignment, so there is no aliasing.
-    fn rebuild_rt_accel(&mut self, albedo_count: usize, normal_count: usize) -> Result<(), String> {
+    pub(in crate::metal) fn rebuild_rt_accel(
+        &mut self,
+        albedo_count: usize,
+        normal_count: usize,
+    ) -> Result<(), String> {
         use super::raytrace::SkinnedRtInputs;
         let skinned = match (
             &self.skinned.vertex_buffer,
@@ -940,6 +1059,7 @@ impl MtlContext {
             albedo_count,
             normal_count,
             skinned,
+            self.seethrough_meshes_enabled(),
         )?;
         if let Some(accel) = built {
             self.rt.accel = Some(accel);
@@ -1048,6 +1168,19 @@ impl MtlContext {
                 render_h,
                 super::context::HDR_SAMPLE_COUNT,
             )?;
+        }
+        // The planar reflection targets are render-resolution (they re-render the
+        // scene from the mirrored camera at the same resolution the reflectors
+        // sample). The plane set carries over; only the targets are reallocated.
+        if render_changed && let Some(set) = self.planar_reflection.as_ref() {
+            let planes = set.planes.clone();
+            self.planar_reflection = Some(super::planar::create_planar_set(
+                &self.device,
+                render_w,
+                render_h,
+                super::context::HDR_SAMPLE_COUNT,
+                &planes,
+            )?);
         }
         // The bloom chain reads `scene_color`: at drawable size when the
         // upscaler runs, otherwise at native (= render) resolution. Sized

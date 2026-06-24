@@ -630,6 +630,7 @@ impl VkContext {
         frame_idx: usize,
         fov_y_radians: f32,
         aspect: f32,
+        cam_pos: [f32; 3],
     ) {
         let Some(ssr) = &self.ssr else { return };
         encode_fullscreen(
@@ -639,6 +640,7 @@ impl VkContext {
                 frame_idx,
                 fov_y_radians,
                 aspect,
+                cam_pos,
             },
             &cmd,
         );
@@ -656,6 +658,7 @@ struct SsrResolvePass<'a> {
     frame_idx: usize,
     fov_y_radians: f32,
     aspect: f32,
+    cam_pos: [f32; 3],
 }
 
 impl FullscreenPass for SsrResolvePass<'_> {
@@ -685,6 +688,7 @@ impl FullscreenPass for SsrResolvePass<'_> {
             self.fov_y_radians,
             self.aspect,
             inv_view_rot,
+            self.cam_pos,
             self.ctx.prefilter_mip_count as f32,
         );
         unsafe {

@@ -1736,6 +1736,15 @@ impl VkContext {
             self.swapchain_extent.height as f32,
         )
     }
+
+    // Device capability flags for the settings menu. RT reflects whether the
+    // ray-query device extensions were enabled at device creation
+    // (`rt_capable`).
+    pub fn capabilities(&self) -> crate::gfx::backend::DeviceCapabilities {
+        crate::gfx::backend::DeviceCapabilities {
+            ray_tracing: self.rt_capable,
+        }
+    }
 }
 
 impl crate::gfx::scene_reel::SceneControl for VkContext {

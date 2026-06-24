@@ -39,6 +39,15 @@ pub struct EnvironmentMap {
     /// Number of samples used to filter each reflection texel. Higher reduces
     /// noise at the cost of build time.
     pub prefilter_samples: u32,
+    /// Upper bound on how bright a single source texel may count while building
+    /// the glossy reflection mips. A clear-sky HDR holds a few sun or sky
+    /// texels thousands of times brighter than their surroundings; left
+    /// unbounded they survive into the small (coarse) reflection mips as lone
+    /// hot texels and smear across glossy floors as hard bright squares. This
+    /// caps each sampled texel so that energy spreads smoothly across the
+    /// reflection instead. It affects reflections only, never the on-screen
+    /// sky. Set to `0` to disable (no cap); lower values clamp harder.
+    pub prefilter_clamp: f32,
     /// Injected at load time from the compiled blob payload.
     #[serde(skip)]
     pub locator: Option<PayloadLocator>,
@@ -54,6 +63,12 @@ pub struct EnvironmentMap {
 // has to be large enough that the displayed sky doesn't look blocky. 512 is the
 // balance point; 256 visibly pixelates a 4K HDR sky, 1024 quadruples the payload
 // for sharpness only the skybox (not the IBL math) actually uses.
+//
+// `prefilter_clamp` defaults to a moderate cap rather than off: an unbounded
+// clear-sky HDR aliases its sun and bright sky into hard squares on glossy
+// floors (the coarse reflection mips hold only a handful of texels, so one hot
+// texel paints a whole region). The cap spreads that energy without touching
+// the on-screen sky, and a uniform sky below the cap is unchanged.
 impl Default for EnvironmentMap {
     fn default() -> Self {
         Self {
@@ -63,6 +78,7 @@ impl Default for EnvironmentMap {
             prefilter_face_size: 512,
             irradiance_face_size: 8,
             prefilter_samples: 1024,
+            prefilter_clamp: 12.0,
             locator: None,
         }
     }

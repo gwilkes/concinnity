@@ -143,6 +143,7 @@ impl MtlContext {
                     self.textures.len(),
                     self.normal_map_textures.len(),
                     None,
+                    self.seethrough_meshes_enabled(),
                 ) {
                     Ok(Some(a)) => {
                         tracing::info!(

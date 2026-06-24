@@ -83,6 +83,12 @@ fn resolve_args(args: &serde_json::Value) -> Result<EnvironmentMap, String> {
             irradiance_face
         ));
     }
+    if !params.prefilter_clamp.is_finite() || params.prefilter_clamp < 0.0 {
+        return Err(format!(
+            "EnvironmentMap prefilter_clamp {} must be a finite value >= 0 (0 disables it)",
+            params.prefilter_clamp
+        ));
+    }
     Ok(params)
 }
 
@@ -123,6 +129,9 @@ pub fn compile_environment_map_payload(args: &serde_json::Value) -> Result<Vec<u
         prefilter_face,
         prefilter_mips,
         prefilter_samples,
+        params.prefilter_clamp,
+        // Imported environment map: mip 0 IS the on-screen skybox, keep it unclamped.
+        false,
     );
     Ok(serialise_payload(
         irradiance_face,

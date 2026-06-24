@@ -72,6 +72,7 @@ pub fn decode_source(
     prefilter_face: u32,
     irradiance_face: u32,
     prefilter_samples: u32,
+    prefilter_clamp: f32,
 ) -> Result<Vec<u8>, String> {
     let resolved = resolve_hdr_source(source);
     let hdr = load_hdr_file(&resolved)?;
@@ -89,6 +90,9 @@ pub fn decode_source(
         prefilter_face,
         prefilter_mips,
         prefilter_samples,
+        prefilter_clamp,
+        // Imported environment map: mip 0 IS the on-screen skybox, keep it unclamped.
+        false,
     );
     Ok(serialise_payload(
         irradiance_face,
@@ -340,18 +344,35 @@ pub fn compute_prefilter(
     source_face_size: u32,
     mip_count: u32,
     samples_per_texel: u32,
+    clamp: f32,
+    clamp_mip0: bool,
 ) -> Vec<[Vec<f32>; 6]> {
     let mut mips: Vec<[Vec<f32>; 6]> = Vec::with_capacity(mip_count as usize);
-    // Mip 0: identity (with alpha = 1.0 for RGBA32F storage).
+    // Mip 0: identity (with alpha = 1.0 for RGBA32F storage). `clamp_mip0` decides
+    // whether the same firefly cap applied to the rough mips also caps this mirror
+    // mip. An imported environment map leaves it OFF -- mip 0 is drawn directly as
+    // the on-screen skybox, which must keep its true HDR sun/sky. A reflection probe
+    // turns it ON -- the probe is never a skybox (it is sampled only by the specular
+    // term, as a low-res fallback when SSR/RT miss on a near-mirror surface), so a
+    // lone blown highlight in the capture would otherwise alias into a bright square
+    // there; capping it (at the same `clamp`) suppresses that without touching any sky.
     {
         let f = source_face_size as usize;
         let mut mip0: [Vec<f32>; 6] = std::array::from_fn(|_| vec![0.0; f * f * 4]);
         for face in 0..6 {
             for i in 0..f * f {
                 let off = i * 4;
-                mip0[face][off] = source[face][off];
-                mip0[face][off + 1] = source[face][off + 1];
-                mip0[face][off + 2] = source[face][off + 2];
+                let mut rgb = [
+                    source[face][off],
+                    source[face][off + 1],
+                    source[face][off + 2],
+                ];
+                if clamp_mip0 {
+                    rgb = clamp_radiance(rgb, clamp);
+                }
+                mip0[face][off] = rgb[0];
+                mip0[face][off + 1] = rgb[1];
+                mip0[face][off + 2] = rgb[2];
                 mip0[face][off + 3] = 1.0;
             }
         }
@@ -367,9 +388,29 @@ pub fn compute_prefilter(
             face_size,
             roughness,
             samples_per_texel,
+            clamp,
         ));
     }
     mips
+}
+
+// Cap a sampled radiance so a single very bright source texel (a sun disk, a
+// blown sky highlight) cannot dominate a glossy reflection mip. Scales RGB
+// uniformly to keep its hue when luminance exceeds `clamp`; `clamp <= 0`
+// disables the cap. This suppresses the lone-hot-texel "bright squares" a
+// clear-sky HDR otherwise smears across reflective floors. The rough mips always
+// pass through here; mip 0 only does for a reflection probe (`clamp_mip0`), never
+// for an imported environment map, so the on-screen skybox keeps its true HDR.
+fn clamp_radiance(rgb: [f32; 3], clamp: f32) -> [f32; 3] {
+    if clamp <= 0.0 {
+        return rgb;
+    }
+    let lum = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2];
+    if lum > clamp {
+        let s = clamp / lum;
+        return [rgb[0] * s, rgb[1] * s, rgb[2] * s];
+    }
+    rgb
 }
 
 fn convolve_ggx(
@@ -378,6 +419,7 @@ fn convolve_ggx(
     output_face_size: u32,
     roughness: f32,
     samples: u32,
+    clamp: f32,
 ) -> [Vec<f32>; 6] {
     let f = output_face_size as usize;
     let mut faces: [Vec<f32>; 6] = std::array::from_fn(|_| vec![0.0; f * f * 4]);
@@ -405,7 +447,7 @@ fn convolve_ggx(
                     ]);
                     let ndl = dot3(n, l).max(0.0);
                     if ndl > 0.0 {
-                        let env = sample_cube(source, source_face_size, l);
+                        let env = clamp_radiance(sample_cube(source, source_face_size, l), clamp);
                         accum[0] += env[0] * ndl;
                         accum[1] += env[1] * ndl;
                         accum[2] += env[2] * ndl;
@@ -634,7 +676,7 @@ mod tests {
     #[test]
     fn prefilter_mip_zero_matches_source_with_alpha_one() {
         let source = solid_cube(16, [0.7, 0.3, 0.1]);
-        let mips = compute_prefilter(&source, 16, 3, 16);
+        let mips = compute_prefilter(&source, 16, 3, 16, 0.0, false);
         for face in &mips[0] {
             for px in 0..16 * 16 {
                 let off = px * 4;
@@ -649,7 +691,7 @@ mod tests {
     #[test]
     fn prefilter_solid_color_stays_solid_at_high_roughness() {
         let source = solid_cube(16, [0.5, 0.5, 0.5]);
-        let mips = compute_prefilter(&source, 16, 4, 32);
+        let mips = compute_prefilter(&source, 16, 4, 32, 0.0, false);
         // Last mip should still be ~0.5 grey since input is uniform.
         let mean = face_mean(&mips[3][0]);
         for (c, m) in mean.iter().enumerate() {
@@ -673,7 +715,7 @@ mod tests {
             let off = (y * face + 8) * 4;
             source[4][off] = 20.0;
         }
-        let mips = compute_prefilter(&source, face as u32, 3, 256);
+        let mips = compute_prefilter(&source, face as u32, 3, 256, 0.0, false);
         // Compare variance of +Z face at mip 0 vs mip 2.
         let v0 = face_variance_red(&mips[0][4]);
         let v2 = face_variance_red(&mips[2][4]);
@@ -686,10 +728,115 @@ mod tests {
     }
 
     #[test]
+    fn clamp_radiance_caps_luminance_and_keeps_hue() {
+        // Below the cap: untouched.
+        let dim = [1.0, 0.5, 0.25];
+        assert_eq!(clamp_radiance(dim, 10.0), dim);
+        // Disabled (clamp <= 0): untouched even when very bright.
+        let hot = [100.0, 50.0, 25.0];
+        assert_eq!(clamp_radiance(hot, 0.0), hot);
+        // Above the cap: luminance is pulled to the cap, hue preserved.
+        let capped = clamp_radiance(hot, 10.0);
+        let lum = 0.2126 * capped[0] + 0.7152 * capped[1] + 0.0722 * capped[2];
+        assert!((lum - 10.0).abs() < 1e-3, "luminance {} != cap 10", lum);
+        assert!((capped[0] / capped[1] - hot[0] / hot[1]).abs() < 1e-4);
+        assert!((capped[1] / capped[2] - hot[1] / hot[2]).abs() < 1e-4);
+    }
+
+    #[test]
+    fn prefilter_clamp_suppresses_a_firefly() {
+        // A single blazing texel (a stand-in for the sun disk) on +Z over a
+        // uniform 1.0 background. Unclamped it survives the GGX convolution as a
+        // hot spot that smears into bright squares; the cap spreads its energy
+        // so the brightest reflection texel is far dimmer, while the background
+        // (below the cap) is preserved.
+        let face = 16usize;
+        let make_source = || -> [Vec<f32>; 6] {
+            let mut s: [Vec<f32>; 6] = std::array::from_fn(|_| vec![0.0; face * face * 4]);
+            for fd in s.iter_mut() {
+                for p in fd.chunks_exact_mut(4) {
+                    p[0] = 1.0;
+                    p[1] = 1.0;
+                    p[2] = 1.0;
+                    p[3] = 1.0;
+                }
+            }
+            let off = ((face / 2) * face + face / 2) * 4;
+            s[4][off] = 2000.0;
+            s[4][off + 1] = 2000.0;
+            s[4][off + 2] = 2000.0;
+            s
+        };
+        let peak = |fd: &Vec<f32>| {
+            fd.chunks_exact(4)
+                .map(|p| p[0].max(p[1]).max(p[2]))
+                .fold(0.0f32, f32::max)
+        };
+        let unclamped = compute_prefilter(&make_source(), face as u32, 3, 256, 0.0, false);
+        let clamped = compute_prefilter(&make_source(), face as u32, 3, 256, 8.0, false);
+        let p_unclamped = peak(&unclamped[1][4]);
+        let p_clamped = peak(&clamped[1][4]);
+        assert!(
+            p_clamped < p_unclamped * 0.5,
+            "clamp did not suppress the firefly: unclamped {}, clamped {}",
+            p_unclamped,
+            p_clamped
+        );
+        assert!(
+            p_clamped >= 0.9,
+            "clamp crushed the background: clamped peak {}",
+            p_clamped
+        );
+    }
+
+    #[test]
+    fn prefilter_mip0_clamp_caps_a_mirror_firefly_only_when_requested() {
+        // A single blazing texel over a uniform background, as a probe capture would
+        // hold a blown highlight. Mip 0 is the mirror (roughness 0) reflection a
+        // near-mirror surface samples on an SSR/RT miss.
+        let face = 16usize;
+        let make_source = || -> [Vec<f32>; 6] {
+            let mut s: [Vec<f32>; 6] = std::array::from_fn(|_| vec![0.0; face * face * 4]);
+            for fd in s.iter_mut() {
+                for p in fd.chunks_exact_mut(4) {
+                    p[0] = 1.0;
+                    p[1] = 1.0;
+                    p[2] = 1.0;
+                    p[3] = 1.0;
+                }
+            }
+            let off = ((face / 2) * face + face / 2) * 4;
+            s[4][off] = 2000.0;
+            s[4][off + 1] = 2000.0;
+            s[4][off + 2] = 2000.0;
+            s
+        };
+        let peak = |fd: &Vec<f32>| {
+            fd.chunks_exact(4)
+                .map(|p| p[0].max(p[1]).max(p[2]))
+                .fold(0.0f32, f32::max)
+        };
+        // clamp_mip0 = false (an imported env map / skybox): the blazing texel survives
+        // mip 0 untouched, so the on-screen sky would keep its true HDR sun.
+        let unclamped_mip0 = compute_prefilter(&make_source(), face as u32, 2, 16, 8.0, false);
+        assert!(
+            peak(&unclamped_mip0[0][4]) > 1000.0,
+            "mip 0 should be unclamped when clamp_mip0 is false: peak {}",
+            peak(&unclamped_mip0[0][4])
+        );
+        // clamp_mip0 = true (a reflection probe): the same firefly is capped at mip 0,
+        // while the uniform background (below the cap) is preserved.
+        let clamped_mip0 = compute_prefilter(&make_source(), face as u32, 2, 16, 8.0, true);
+        let p = peak(&clamped_mip0[0][4]);
+        assert!(p <= 8.0 + 1e-3, "mip 0 firefly not capped: peak {p}");
+        assert!(p >= 0.9, "mip 0 clamp crushed the background: peak {p}");
+    }
+
+    #[test]
     fn payload_round_trip() {
         let source = solid_cube(8, [0.6, 0.4, 0.2]);
         let irr = compute_irradiance(&source, 8, 4, 32, 8);
-        let prefilter = compute_prefilter(&source, 8, 2, 16);
+        let prefilter = compute_prefilter(&source, 8, 2, 16, 0.0, false);
         let blob = serialise_payload(4, 8, 2, &irr, &prefilter);
         let view = deserialise(&blob).expect("deserialise");
         assert_eq!(view.irradiance_face, 4);
@@ -755,8 +902,8 @@ mod tests {
 
     #[test]
     fn decode_source_missing_file_errors() {
-        let err =
-            decode_source("/definitely/does/not/exist.hdr", 16, 8, 16).expect_err("should fail");
+        let err = decode_source("/definitely/does/not/exist.hdr", 16, 8, 16, 0.0)
+            .expect_err("should fail");
         assert!(
             err.contains("failed to open") || err.contains("No such file"),
             "got: {}",
@@ -773,7 +920,7 @@ mod tests {
             std::process::id()
         ));
         std::fs::write(&tmp, raw_hdr_blob(16, 8, [0.6, 0.3, 0.15])).expect("write hdr");
-        let payload = decode_source(tmp.to_str().unwrap(), 16, 8, 16).expect("decode");
+        let payload = decode_source(tmp.to_str().unwrap(), 16, 8, 16, 0.0).expect("decode");
         let _ = std::fs::remove_file(&tmp);
         let view = deserialise(&payload).expect("deserialise");
         assert_eq!(view.irradiance_face, 8);

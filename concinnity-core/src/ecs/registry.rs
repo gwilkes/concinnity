@@ -86,6 +86,7 @@ crate::define_components! {
         ScrollPanel       => assets::ScrollPanel,       62,
         ControlsCommand   => assets::ControlsCommand,   63,
         AudioCommand      => assets::AudioCommand,      64,
+        ReflectionProbe   => assets::ReflectionProbe,   65,
 }
 
 #[cfg(test)]

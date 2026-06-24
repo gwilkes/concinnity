@@ -62,6 +62,24 @@ pub struct MaterialUniforms {
     // (R = occlusion, G = roughness, B = metalness). `0` means no map: the
     // shader keeps the scalar `roughness`/`metallic` and full occlusion.
     pub orm_map_index: u32,
+    // Base surface opacity in [0, 1]; 1 = fully opaque (the default). Only
+    // meaningful with `transparent`: it drives the glass alpha in the
+    // transparent pass. Carried on the material so it rides Material ->
+    // DrawObject.material to the backend; the opaque main-pass shader ignores it.
+    pub opacity: f32,
+    // 1 when this surface routes through the transparent pass instead of the
+    // opaque one (a glass MESH on an RT-capable device); 0 for opaque. A CPU
+    // routing flag: the backend reads it to skip the draw in the opaque pass +
+    // the RT BLAS and to feed the per-pixel-RT transparent producer. No GPU
+    // shader reads it (the opaque skip is decided CPU-side).
+    pub transparent: u32,
+    // 1 when a `transparent` glass MESH renders as genuinely see-through (Layer
+    // 2: the scene behind shows through plus a sharp per-pixel reflection); 0
+    // keeps it as opaque low-roughness reflective glass (Layer 1). Another CPU
+    // routing flag (no GPU shader reads it): the see-through producer, the
+    // opaque-pass skip, and the RT-BLAS exclude all key off it, so Layer 2 is
+    // opt-in per material. Always 0 unless `transparent` is also 1.
+    pub see_through: u32,
 }
 
 impl MaterialUniforms {
@@ -79,6 +97,9 @@ impl MaterialUniforms {
         normal_secondary_index: 0,
         emissive_map_index: 0,
         orm_map_index: 0,
+        opacity: 1.0,
+        transparent: 0,
+        see_through: 0,
     };
 }
 
@@ -330,10 +351,13 @@ pub struct SsrParams {
     // resolve then skips the cube fallback and keeps the base shading instead.
     pub prefilter_mip_count: f32,
     pub _pad: f32,
-    // View-space to world-space rotation (the transpose of the view matrix's
-    // orthonormal 3x3). The resolve turns a view-space reflection ray into the
-    // world-space direction it samples the prefilter cubemap with.
-    pub inv_view_rot: [[f32; 4]; 4],
+    // Camera-to-world transform (column-major, the rigid inverse of the view
+    // matrix): the orthonormal 3x3 turns a view-space reflection ray into the
+    // world-space direction the cubemap is sampled with, and the translation
+    // column (the world camera position) lets the resolve rebuild the world-space
+    // surface position a reflection probe box-projects against. Backends that only
+    // sample the cube use the 3x3 (the `r_world` direction) and ignore translation.
+    pub inv_view: [[f32; 4]; 4],
 }
 
 // Per-frame uniform for the screen-space global-illumination (SSGI) gather +
@@ -1324,7 +1348,7 @@ mod tests {
         // `tint` and `emissive` as packed_float3 (align 4), so the offsets line
         // up with this tightly-packed Rust struct. A plain float3 there would
         // 16-align `tint` and shift every following field.
-        assert_eq!(size_of::<MaterialUniforms>(), 64);
+        assert_eq!(size_of::<MaterialUniforms>(), 76);
         assert_eq!(offset_of!(MaterialUniforms, roughness), 0);
         assert_eq!(offset_of!(MaterialUniforms, metallic), 4);
         assert_eq!(offset_of!(MaterialUniforms, macro_variation), 8);
@@ -1337,6 +1361,9 @@ mod tests {
         assert_eq!(offset_of!(MaterialUniforms, normal_secondary_index), 52);
         assert_eq!(offset_of!(MaterialUniforms, emissive_map_index), 56);
         assert_eq!(offset_of!(MaterialUniforms, orm_map_index), 60);
+        assert_eq!(offset_of!(MaterialUniforms, opacity), 64);
+        assert_eq!(offset_of!(MaterialUniforms, transparent), 68);
+        assert_eq!(offset_of!(MaterialUniforms, see_through), 72);
     }
 
     #[test]
@@ -1457,7 +1484,7 @@ mod tests {
         assert_eq!(offset_of!(SsrParams, thickness), 20);
         assert_eq!(offset_of!(SsrParams, prefilter_mip_count), 24);
         assert_eq!(offset_of!(SsrParams, _pad), 28);
-        assert_eq!(offset_of!(SsrParams, inv_view_rot), 32);
+        assert_eq!(offset_of!(SsrParams, inv_view), 32);
     }
 
     #[test]
@@ -1526,6 +1553,9 @@ mod tests {
                 normal_secondary_index: 0,
                 emissive_map_index: 0,
                 orm_map_index: 0,
+                opacity: 1.0,
+                transparent: 0,
+                see_through: 0,
             },
             visible: true,
             resident: true,

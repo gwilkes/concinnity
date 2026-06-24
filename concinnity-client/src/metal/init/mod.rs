@@ -683,29 +683,160 @@ impl MtlContext {
         // Transparent water surfaces. Built only when the world declared
         // ≥1 `WaterSurface`; the transparent-pass executor stays a no-op
         // otherwise. Per-surface tessellated grids upload once at init.
-        let (water_pipeline, water_records) = if water_surfaces.is_empty() {
-            (None, Vec::new())
-        } else {
-            let ps = super::water::build_water_pipeline(&device, hot_reload)?;
-            let mut records = Vec::with_capacity(water_surfaces.len());
-            for s in &water_surfaces {
-                records.push(super::water::build_water_surface_record(&device, s)?);
-            }
-            (Some(ps), records)
-        };
+        let (water_pipeline, water_pipeline_rt, water_pipeline_rt_textured, mut water_records) =
+            if water_surfaces.is_empty() {
+                (None, None, None, Vec::new())
+            } else {
+                let ps = super::water::build_water_pipeline(&device, hot_reload)?;
+                // The ray-traced variants are built whenever the device can ray
+                // trace (regardless of whether RT is on at launch), so a live RT
+                // toggle can select them without a pipeline rebuild. The shader
+                // uses `metal_raytracing`, so it must not be compiled on a non-RT
+                // device. The textured variant additionally needs a bindless world
+                // at draw time; it is selected over the flat variant then.
+                let (ps_rt, ps_rt_tex) = if super::raytrace::raytracing_supported(&device) {
+                    (
+                        Some(super::water::build_water_pipeline_rt(&device, hot_reload)?),
+                        Some(super::water::build_water_pipeline_rt_textured(
+                            &device, hot_reload,
+                        )?),
+                    )
+                } else {
+                    (None, None)
+                };
+                let mut records = Vec::with_capacity(water_surfaces.len());
+                for s in &water_surfaces {
+                    records.push(super::water::build_water_surface_record(&device, s)?);
+                }
+                (Some(ps), ps_rt, ps_rt_tex, records)
+            };
 
         // Translucent glass panels. Built only when the world declared ≥1
         // `GlassPanel`; rides the same transparent pass as water. Per-panel
         // world-space quads upload once at init.
-        let (glass_pipeline, glass_records) = if glass_panels.is_empty() {
-            (None, Vec::new())
-        } else {
-            let ps = super::glass::build_glass_pipeline(&device, hot_reload)?;
-            let mut records = Vec::with_capacity(glass_panels.len());
-            for g in &glass_panels {
-                records.push(super::glass::build_glass_panel_record(&device, g)?);
+        let (glass_pipeline, glass_pipeline_rt, glass_pipeline_rt_textured, mut glass_records) =
+            if glass_panels.is_empty() {
+                (None, None, None, Vec::new())
+            } else {
+                let ps = super::glass::build_glass_pipeline(&device, hot_reload)?;
+                // The ray-traced variants are built whenever the device can ray
+                // trace (regardless of whether RT is on at launch), so a live RT
+                // toggle can select them without a pipeline rebuild. The shader
+                // uses `metal_raytracing`, so it must not be compiled on a non-RT
+                // device. The textured variant additionally needs a bindless world
+                // at draw time; it is selected over the flat variant then.
+                let (ps_rt, ps_rt_tex) = if super::raytrace::raytracing_supported(&device) {
+                    (
+                        Some(super::glass::build_glass_pipeline_rt(&device, hot_reload)?),
+                        Some(super::glass::build_glass_pipeline_rt_textured(
+                            &device, hot_reload,
+                        )?),
+                    )
+                } else {
+                    (None, None)
+                };
+                let mut records = Vec::with_capacity(glass_panels.len());
+                for g in &glass_panels {
+                    records.push(super::glass::build_glass_panel_record(&device, g)?);
+                }
+                (Some(ps), ps_rt, ps_rt_tex, records)
+            };
+
+        // Transparent glass MESH pipelines (Layer 2): built whenever the device can
+        // ray trace, INDEPENDENT of any `GlassPanel` -- the transparent material
+        // lives on imported meshes, not panels, and a live RT toggle then has them
+        // ready. `glass_mesh_pipeline_rt.is_some()` gates the whole transparent-mesh
+        // reroute; `seethrough_mesh_indices` marks which `draw_objects` carry it.
+        let (glass_mesh_pipeline_rt, glass_mesh_pipeline_rt_textured) =
+            if super::raytrace::raytracing_supported(&device) {
+                (
+                    Some(super::glass::build_glass_mesh_pipeline_rt(
+                        &device, hot_reload,
+                    )?),
+                    Some(super::glass::build_glass_mesh_pipeline_rt_textured(
+                        &device, hot_reload,
+                    )?),
+                )
+            } else {
+                (None, None)
+            };
+        // Layer 2 see-through glass is opt-in per `Material` (the `see_through`
+        // arg, which implies `transparent`): see-through only looks right when the
+        // space behind the glass is modelled. A material that is `transparent` but
+        // NOT `see_through` renders as Layer 1 (opaque, low roughness, scene
+        // reflections) = tinted reflective glass that hides the interior. This list
+        // drives the producer + the opaque-pass skip (`mesh_glass_active`) + the
+        // RT-BLAS exclude together.
+        let seethrough_mesh_indices: Vec<usize> = draw_objects
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| o.material.transparent != 0 && o.material.see_through != 0)
+            .map(|(i, _)| i)
+            .collect();
+        // The Layer 2 path is enabled when at least one material opts into
+        // see-through AND the mesh pipeline built (RT-capable device). Mirrors
+        // `MtlContext::seethrough_meshes_enabled`; used here for the init-time BVH
+        // build, which must exclude the see-through meshes it will reroute.
+        let seethrough_enabled =
+            !seethrough_mesh_indices.is_empty() && glass_mesh_pipeline_rt.is_some();
+
+        // Planar reflection set: group every flat reflector (water surfaces +
+        // glass panes) into a bounded number of distinct planes, one mirror render
+        // each. Water planes are listed first so they take slots before glass when
+        // the budget is tight. Each reflector records the slot it samples; planes
+        // past the budget get no slot and keep the box-projected probe cube
+        // (warned here, not silently dropped). The set is built only when the
+        // world has >=1 reflector; the per-frame pass is additionally gated on RT
+        // being off.
+        let planar_reflection = {
+            let mut planes: Vec<[f32; 4]> = Vec::new();
+            for s in &water_surfaces {
+                // Horizontal plane at the surface base height, normal +y.
+                planes.push([0.0, 1.0, 0.0, -s.centre[1]]);
             }
-            (Some(ps), records)
+            for g in &glass_panels {
+                // The pane plane: normal (unit from `from_args`) through centre,
+                // so `n . p + d = 0` on the pane.
+                let n = g.normal;
+                let d = -(n[0] * g.centre[0] + n[1] * g.centre[1] + n[2] * g.centre[2]);
+                planes.push([n[0], n[1], n[2], d]);
+            }
+            let assignment = crate::gfx::planar_reflection::assign_planar_slots(
+                &planes,
+                super::planar::MAX_PLANAR_PLANES,
+            );
+            // Record each reflector's slot (water first, then glass, matching the
+            // push order above).
+            for (rec, slot) in water_records.iter_mut().zip(assignment.slots.iter()) {
+                rec.planar_slot = *slot;
+            }
+            let glass_offset = water_records.len();
+            for (rec, slot) in glass_records
+                .iter_mut()
+                .zip(assignment.slots[glass_offset..].iter())
+            {
+                rec.planar_slot = *slot;
+            }
+            let overflow = assignment.slots.iter().filter(|s| s.is_none()).count();
+            if overflow > 0 {
+                tracing::warn!(
+                    "planar reflection: {} reflector plane(s) exceed the budget of {} \
+                     and fall back to the box-projected probe cube",
+                    overflow,
+                    super::planar::MAX_PLANAR_PLANES
+                );
+            }
+            if assignment.representatives.is_empty() {
+                None
+            } else {
+                Some(super::planar::create_planar_set(
+                    &device,
+                    render_w,
+                    render_h,
+                    HDR_SAMPLE_COUNT,
+                    &assignment.representatives,
+                )?)
+            }
         };
 
         // Raymarched SDF volumes. Each volume builds its own pipeline
@@ -795,6 +926,7 @@ impl MtlContext {
                 // static + instanced; the first frame's update seeds the
                 // skinned geometry once `upload_skinned` has run.
                 None,
+                seethrough_enabled,
             )? {
                 Some(a) => {
                     tracing::info!(
@@ -891,6 +1023,9 @@ impl MtlContext {
                 shadow_icb_arg_encoder,
                 shadow_icb_arg_buffer: None,
                 shadow_icb_capacity: 0,
+                mirror_slots: Vec::new(),
+                mirror_status: None,
+                mirror_icb_capacity: 0,
             },
             bindless_tex_arg_encoder,
             depth_state,
@@ -926,6 +1061,14 @@ impl MtlContext {
             shadow_uniforms: shadow_uniforms_init,
             shadow_light_dir,
             env_map,
+            probe_placements: Vec::new(),
+            probe_maps: Vec::new(),
+            // Empty until `set_reflection_probes` supplies placements.
+            probe_bake_queue: crate::gfx::reflection_probe::ProbeBakeQueue::new(0),
+            probe_set: crate::metal::uniforms::ProbeSet::EMPTY,
+            probe_rendering: None,
+            probe_converting: None,
+            probe_retire_pool: super::transient::RetirePool::new(),
             cube_sampler,
             text_pipeline_state,
             text_atlas_textures: gpu_text_atlases,
@@ -962,6 +1105,7 @@ impl MtlContext {
                 accel: rt_accel,
                 dynamic_mode: rt_dynamic_mode,
                 update_failed: false,
+                topology_dirty: false,
                 pipeline: rt_pipeline,
                 pipeline_textured: rt_pipeline_textured,
                 skin_pipeline: rt_skin_pipeline,
@@ -1043,19 +1187,35 @@ impl MtlContext {
             frame_pacing: super::frame_pacing::FrameInFlight::new(frames_in_flight),
             frames_in_flight: frames_in_flight.max(1),
             frame_ring_index: 0,
-            object_ring: super::transient::TransientRing::new(frames_in_flight),
-            draw_args_ring: super::transient::TransientRing::new(frames_in_flight),
+            // The bindless buffers an async reflection-probe bake reads (object,
+            // draw-args, bindless-texture-args, and the skinned joint palettes) get
+            // one EXTRA ring slot. The frame only ever uses slots
+            // `frame_ring_index % frames_in_flight` -- i.e. `[0, frames_in_flight)`
+            // -- so slot `frames_in_flight` is reserved for the bake: a slot the
+            // frame never overwrites, keeping the bake's CPU-written buffers valid
+            // across its asynchronous (no `waitUntilCompleted`) GPU capture. See
+            // metal/probe.rs `bake_ring_slot`.
+            object_ring: super::transient::TransientRing::new(frames_in_flight.max(1) + 1),
+            draw_args_ring: super::transient::TransientRing::new(frames_in_flight.max(1) + 1),
             prev_model_ring: super::transient::TransientRing::new(frames_in_flight),
-            bindless_tex_ring: super::transient::TransientRing::new(frames_in_flight),
-            joint_ring: super::transient::JointRing::new(frames_in_flight),
+            bindless_tex_ring: super::transient::TransientRing::new(frames_in_flight.max(1) + 1),
+            joint_ring: super::transient::JointRing::new(frames_in_flight.max(1) + 1),
             prev_joint_ring: super::transient::JointRing::new(frames_in_flight),
             instance_ring: super::transient::InstanceRing::new(frames_in_flight),
             object_scratch: Vec::new(),
             draw_args_scratch: Vec::new(),
             prev_model_scratch: Vec::new(),
             water_pipeline,
+            water_pipeline_rt,
+            water_pipeline_rt_textured,
             water_surfaces: water_records,
+            planar_reflection,
             glass_pipeline,
+            glass_pipeline_rt,
+            glass_pipeline_rt_textured,
+            glass_mesh_pipeline_rt,
+            glass_mesh_pipeline_rt_textured,
+            seethrough_mesh_indices,
             glass_panels: glass_records,
             raymarch_volumes: raymarch_records,
             raymarch_cube_vertex_buffer,

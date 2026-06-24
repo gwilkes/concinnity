@@ -18,8 +18,7 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLCommandBuffer as _, MTLLoadAction, MTLPixelFormat, MTLPrimitiveType,
-    MTLRenderCommandEncoder as _, MTLRenderPassDescriptor, MTLRenderPipelineState, MTLRenderStages,
-    MTLResourceUsage, MTLStoreAction,
+    MTLRenderCommandEncoder as _, MTLRenderPassDescriptor, MTLRenderPipelineState, MTLStoreAction,
 };
 
 use crate::metal::context::MtlContext;
@@ -54,12 +53,14 @@ pub(crate) fn build_rt_reflection_pipeline(
 
 impl MtlContext {
     // Encode the RT-reflection resolve: a fullscreen pass that traces each
-    // glossy pixel's reflection ray against the scene BVH and composites the
-    // reflected colour into `ssr_targets.output`. Runs after the main pass in
-    // the SSR-resolve slot; only called when RT reflections are on and the
-    // acceleration structure + pipeline are live. Returns `Ok(0)` (a no-op)
-    // when any required resource is missing: the engine then leaves the base
-    // scene untouched, the same defensive pattern `encode_ssgi` uses.
+    // glossy pixel's reflection ray against the scene BVH and writes the
+    // reflected radiance + composite weight into the reflection target, then
+    // runs the shared roughness-aware blur + composite into `ssr_targets.output`.
+    // Runs after the main pass in the SSR-resolve slot; only called when RT
+    // reflections are on and the acceleration structure + pipeline are live.
+    // Returns `Ok(0)` (a no-op) when any required resource is missing: the engine
+    // then leaves the base scene untouched, the same defensive pattern
+    // `encode_ssgi` uses.
     pub(in crate::metal) fn encode_rt_reflections(
         &self,
         cmd_buf: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
@@ -94,7 +95,7 @@ impl MtlContext {
         let desc = MTLRenderPassDescriptor::new();
         unsafe {
             let ca = desc.colorAttachments().objectAtIndexedSubscript(0);
-            ca.setTexture(Some(targets.output.as_ref()));
+            ca.setTexture(Some(targets.reflection.as_ref()));
             ca.setLoadAction(MTLLoadAction::DontCare);
             ca.setStoreAction(MTLStoreAction::Store);
         }
@@ -114,6 +115,14 @@ impl MtlContext {
             enc.setFragmentTexture_atIndex(Some(gbuf.normal_depth.as_ref()), 1);
             enc.setFragmentTexture_atIndex(Some(gbuf.roughness.as_ref()), 2);
             enc.setFragmentTexture_atIndex(Some(self.env_map.prefilter.as_ref()), 3);
+            // Local reflection-probe cubes at texture(4..4+MAX_PROBES): a missed
+            // reflection ray reflects the box-projected scene capture instead of
+            // the foreign sky HDR (the source the forward IBL specular term uses).
+            // probe_cube_or_sky returns the sky for unbaked slots, so binding all
+            // MAX_PROBES is always valid; the ProbeSet's count gates use.
+            for i in 0..crate::metal::uniforms::MAX_PROBES {
+                enc.setFragmentTexture_atIndex(Some(self.probe_cube_or_sky(i)), 4 + i);
+            }
             enc.setFragmentSamplerState_atIndex(Some(&self.post_sampler), 0);
             enc.setFragmentSamplerState_atIndex(Some(self.cube_sampler.as_ref()), 1);
             // buffer(0) params; buffers 1..3 the shared geometry the kernel
@@ -134,6 +143,14 @@ impl MtlContext {
             // taken then. Direct buffer bindings, so Metal makes them resident.
             enc.setFragmentBuffer_offset_atIndex(Some(accel.deformed_verts.as_ref()), 0, 5);
             enc.setFragmentBuffer_offset_atIndex(Some(accel.skinned_indices.as_ref()), 0, 6);
+            // Reflection-probe set (count + per-probe parallax boxes) at buffer(8);
+            // count == 0 keeps the sky miss fallback. (buffer(7) is the bindless
+            // texture pool, bound only on the textured path below.)
+            enc.setFragmentBytes_length_atIndex(
+                std::ptr::NonNull::from(&self.probe_set).cast(),
+                std::mem::size_of::<crate::metal::uniforms::ProbeSet>(),
+                8,
+            );
             // Textured path: bind the bindless albedo pool at buffer(7) (the
             // same index the main pass uses) and declare its textures resident.
             if textured && let Some(tex_args) = bindless_tex_args {
@@ -146,15 +163,13 @@ impl MtlContext {
             }
             // The TLAS references each BLAS indirectly, so the BLASes are not
             // auto-tracked: declare them resident or the trace reads garbage.
-            for blas in &accel.blas {
-                enc.useResource_usage_stages(
-                    ProtocolObject::from_ref(&**blas),
-                    MTLResourceUsage::Read,
-                    MTLRenderStages::Fragment,
-                );
-            }
+            crate::metal::raytrace::use_blas_resident_fragment(&enc, &accel.blas);
             enc.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3);
         }
+        // End the trace encoder before opening the composite render pass: only
+        // one command encoder may be live on a command buffer at a time.
+        drop(enc);
+        self.encode_reflection_composite(cmd_buf)?;
         Ok(0)
     }
 }

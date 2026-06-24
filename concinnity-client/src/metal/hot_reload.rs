@@ -34,6 +34,7 @@ use super::init::pipelines::{
 use super::pipeline::{build_post_pipeline, build_text_pipeline};
 use super::post::{
     build_bloom_pipelines, build_gbuffer_bindless_pipeline, build_gbuffer_prepass_pipeline,
+    build_reflection_blur_pipeline, build_reflection_composite_pipeline,
     build_rt_reflection_pipeline, build_ssao_pipeline, build_ssgi_composite_pipeline,
     build_ssgi_gather_pipeline, build_ssr_pipeline, build_taa_pipeline,
 };
@@ -290,6 +291,14 @@ impl MtlContext {
             self.ssr.resolve_pipeline.is_some(),
             build_ssr_pipeline(device, hr)
         );
+        let reflection_composite = rebuild_if_live!(
+            self.ssr.composite_pipeline.is_some(),
+            build_reflection_composite_pipeline(device, hr)
+        );
+        let reflection_blur = rebuild_if_live!(
+            self.ssr.blur_pipeline.is_some(),
+            build_reflection_blur_pipeline(device, hr)
+        );
         let ssgi_gather = rebuild_if_live!(
             self.ssgi.gather_pipeline.is_some(),
             build_ssgi_gather_pipeline(device, hr)
@@ -420,6 +429,12 @@ impl MtlContext {
         }
         if let Some(p) = ssr_resolve {
             self.ssr.resolve_pipeline = Some(p);
+        }
+        if let Some(p) = reflection_composite {
+            self.ssr.composite_pipeline = Some(p);
+        }
+        if let Some(p) = reflection_blur {
+            self.ssr.blur_pipeline = Some(p);
         }
         if let Some(p) = ssgi_gather {
             self.ssgi.gather_pipeline = Some(p);

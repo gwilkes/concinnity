@@ -32,6 +32,19 @@ pub(crate) fn is_quality_toggle(key: &str) -> bool {
     QUALITY_TOGGLE_KEYS.contains(&key)
 }
 
+// Whether setting `key` can be changed on a device with the given capabilities.
+// A capability-gated setting (e.g. `ray_traced_reflections`, which needs
+// hardware ray tracing) is unavailable when the device lacks that capability;
+// every other setting is always available. The settings menu grays out and
+// disables an unavailable row. This is the one place to gate a future
+// capability-dependent toggle.
+pub(crate) fn setting_available(key: &str, caps: &crate::gfx::backend::DeviceCapabilities) -> bool {
+    match key {
+        "ray_traced_reflections" => caps.ray_tracing,
+        _ => true,
+    }
+}
+
 // Key-rebind settings (Controls tab) are a third setting category alongside
 // cycle rows (`options`) and sliders (`slider_range`): a rebind key's value is a
 // physical `Key`, not an option index or a fraction. Their classification +
@@ -313,6 +326,29 @@ mod tests {
             assert!(options(key).is_none(), "{key} should not be a cycle row");
             assert!(slider_range(key).is_none(), "{key} should not be a slider");
         }
+    }
+
+    #[test]
+    fn rt_toggle_gated_on_ray_tracing_capability() {
+        use crate::gfx::backend::DeviceCapabilities;
+        let capable = DeviceCapabilities { ray_tracing: true };
+        let incapable = DeviceCapabilities { ray_tracing: false };
+        // RT reflections follow the device's ray-tracing capability.
+        assert!(setting_available("ray_traced_reflections", &capable));
+        assert!(!setting_available("ray_traced_reflections", &incapable));
+        // Every other setting is always available, regardless of capability.
+        for key in ["vsync", "taa", "ssao", "ssr", "ssgi", "auto_exposure"] {
+            assert!(
+                setting_available(key, &incapable),
+                "{key} should be available"
+            );
+        }
+        // The default reports all capabilities present (an unwired backend keeps
+        // every toggle live).
+        assert!(setting_available(
+            "ray_traced_reflections",
+            &DeviceCapabilities::default()
+        ));
     }
 
     #[test]

@@ -19,9 +19,11 @@ layout(push_constant) uniform SsrParamsBlock {
     // the cube fallback is skipped (missed rays keep the base shading).
     float prefilter_mip_count;
     float _pad;
-    // View-space → world-space rotation; turns the view-space reflection ray
-    // into the world-space direction the prefilter cubemap is sampled with.
-    mat4 inv_view_rot;
+    // Camera-to-world transform; its 3x3 turns the view-space reflection ray into
+    // the world-space direction the prefilter cubemap is sampled with. (The
+    // translation column carries the camera position for the Metal reflection-probe
+    // miss fallback; this backend uses only the 3x3.)
+    mat4 inv_view;
 } params;
 
 layout(set = 0, binding = 0) uniform sampler2D   scene;
@@ -109,7 +111,7 @@ void main() {
     bool ibl = params.prefilter_mip_count > 0.5;
     vec3 env = base;
     if (ibl) {
-        vec3 r_world = mat3(params.inv_view_rot) * R;
+        vec3 r_world = mat3(params.inv_view) * R;
         float lod    = roughness * (params.prefilter_mip_count - 1.0);
         env = textureLod(prefilter, r_world, lod).rgb;
     }

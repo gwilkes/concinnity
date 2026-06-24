@@ -15,6 +15,28 @@ use crate::gfx::{
 use super::helpers::*;
 use super::*;
 
+// Muted gray applied to the labels of a capability-disabled settings row, so it
+// reads as unavailable next to the live rows.
+const DISABLED_ROW_COLOR: [f32; 3] = [0.42, 0.42, 0.47];
+
+// The full set of label ids to gray for a set of capability-gated rows: the
+// gated value labels themselves (the fallback when a row is not in a scroll
+// panel), plus every element of any scroll row that contains one of them, so a
+// row dims as a whole (its name + value + stepper glyphs) rather than only its
+// value. `rows` is each scroll row's element id list.
+fn expand_dim_set(
+    gated: &std::collections::HashSet<AssetId>,
+    rows: &[Vec<AssetId>],
+) -> std::collections::HashSet<AssetId> {
+    let mut dim = gated.clone();
+    for row in rows {
+        if row.iter().any(|id| gated.contains(id)) {
+            dim.extend(row.iter().copied());
+        }
+    }
+    dim
+}
+
 // Reposition the labels owned by every visible `LayoutContainer`. This runs in
 // the frame step because measuring a label needs the loaded font metrics,
 // which live on the GraphicsSystem; the resolved origin is written back into
@@ -894,6 +916,53 @@ impl GraphicsSystem {
         self.clip_rects = clips;
     }
 
+    // Gray out and disable every settings row whose feature the device cannot
+    // provide (e.g. ray-traced reflections on a GPU without hardware ray
+    // tracing). Runs once at init after the backend reports `self.caps`, while
+    // the HitRegions / TextLabels / ScrollPanels are still present (before
+    // UiInputSystem drains them). A disabled HitRegion is dropped by
+    // UiInputSystem so it never hovers or fires; the row's labels are recolored
+    // to a muted gray so it reads as unavailable.
+    pub(super) fn apply_capability_gating(&mut self, ctx: &mut PipelineContext) {
+        let caps = self.caps;
+        // Mark each unavailable setting's region(s) disabled and collect their
+        // value-label ids (both stepper regions of a row reference its value
+        // label, so this is the row's anchor into the scroll element list).
+        let mut gated_value_labels: std::collections::HashSet<AssetId> =
+            std::collections::HashSet::new();
+        for r in ctx.query_mut::<HitRegion>() {
+            let Some(rest) = r.action.strip_prefix("setting:") else {
+                continue;
+            };
+            let Some(key) = rest.split(':').next() else {
+                continue;
+            };
+            if settings::setting_available(key, &caps) {
+                continue;
+            }
+            r.disabled = true;
+            if let Some(label) = r.label {
+                gated_value_labels.insert(label);
+            }
+        }
+        if gated_value_labels.is_empty() {
+            return;
+        }
+        // Snapshot each scroll row's element id list (owned, so the ScrollPanel
+        // borrow ends before the TextLabel write below), then expand the gated
+        // value labels to every element of the rows that contain them.
+        let rows: Vec<Vec<AssetId>> = ctx
+            .query::<crate::assets::ScrollPanel>()
+            .flat_map(|p| p.rows.iter().map(|r| r.elements.clone()))
+            .collect();
+        let dim = expand_dim_set(&gated_value_labels, &rows);
+        for l in ctx.query_mut::<TextLabel>() {
+            if dim.contains(&l.asset_id) {
+                l.color = DISABLED_ROW_COLOR;
+            }
+        }
+    }
+
     // The current user-facing value of a slider setting, derived from the live
     // post-process params. `None` for a key this system does not own.
     fn slider_current_value(&self, key: &str) -> Option<f32> {
@@ -915,5 +984,40 @@ impl GraphicsSystem {
         // Invert `slider_apply_value` to the user-facing value (exposure: 2^ev ->
         // EV; mouse sensitivity: radians/pixel -> 1..100).
         Some(settings::slider_recover_value(key, stored))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    // A gated value label pulls in every element of the scroll row that holds
+    // it (the row's background, name, value, and stepper glyphs), so the whole
+    // row grays out; unrelated rows are untouched.
+    #[test]
+    fn dim_set_expands_a_gated_value_label_to_its_whole_row() {
+        let value = AssetId(3);
+        let gated: HashSet<AssetId> = [value].into_iter().collect();
+        let rows = vec![
+            // Row A: bg, name, prev_glyph, value, next_glyph (value is gated).
+            vec![AssetId(1), AssetId(2), value, AssetId(4), AssetId(5)],
+            // Row B: an unrelated row.
+            vec![AssetId(10), AssetId(11)],
+        ];
+        let dim = expand_dim_set(&gated, &rows);
+        for id in [1, 2, 3, 4, 5] {
+            assert!(dim.contains(&AssetId(id)), "row A element {id} should dim");
+        }
+        assert!(!dim.contains(&AssetId(10)), "an unrelated row stays lit");
+        assert!(!dim.contains(&AssetId(11)), "an unrelated row stays lit");
+    }
+
+    // With no scroll rows (a hand-authored menu outside a panel), only the gated
+    // value label itself dims -- a graceful fallback, not a panic.
+    #[test]
+    fn dim_set_without_rows_falls_back_to_the_value_label() {
+        let gated: HashSet<AssetId> = [AssetId(7)].into_iter().collect();
+        assert_eq!(expand_dim_set(&gated, &[]), gated);
     }
 }

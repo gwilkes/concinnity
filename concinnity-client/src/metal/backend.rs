@@ -62,6 +62,7 @@ impl RenderBackend for MtlContext {
         fn set_ui_cursor_hidden(&mut self, hidden: bool);
         fn set_menu_mode(&mut self, on: bool);
         fn set_camera_capture(&mut self, capture: bool);
+        fn set_reflection_probes(&mut self, probes: &[crate::gfx::reflection_probe::ProbePlacement]);
         fn set_vsync(&mut self, on: bool);
         fn set_window_mode(&mut self, mode: crate::assets::WindowMode);
         fn set_window_size(&mut self, width: u32, height: u32);
@@ -85,6 +86,7 @@ impl RenderBackend for MtlContext {
         fn add_chunk_mesh(&mut self, verts: &[Vertex], idxs: &[u16], model: [[f32; 4]; 4], texture_slot: usize, normal_map_slot: usize, material: MaterialUniforms, frame: u64) -> Result<usize, String>;
         fn remove_chunk_mesh(&mut self, draw_idx: usize, retire_frame: u64) -> Result<(), String>;
         fn set_chunk_model(&mut self, draw_idx: usize, model: [[f32; 4]; 4]) -> Result<(), String>;
+        fn capabilities(&self) -> crate::gfx::backend::DeviceCapabilities;
         fn logical_size(&self) -> (f32, f32);
         fn render_stats(&self) -> RenderStats;
         fn update_color_lut(&mut self, size: u32, data: &[u8]) -> Result<(), String>;

@@ -183,6 +183,11 @@ pub struct GraphicsSystem {
     // HitRegions. Maps each rebindable action to its value `TextLabel`, so a
     // rebind (and the swap it may trigger) can refresh both affected row labels.
     rebind_rows: Vec<RebindViz>,
+    // Device capability flags, queried from the backend once it is built. Drives
+    // the capability gating at init: a settings row whose feature the device
+    // cannot provide (e.g. ray-traced reflections without hardware ray tracing)
+    // is grayed out and made inert. Held in memory only, never persisted.
+    caps: crate::gfx::backend::DeviceCapabilities,
 }
 
 // One key-rebind row's runtime bookkeeping: the action it rebinds and the value
@@ -351,6 +356,8 @@ impl GraphicsSystem {
             clip_rects: std::collections::HashMap::new(),
             keymap: crate::gfx::keymap::KeyMap::default(),
             rebind_rows: Vec::new(),
+            // All-capable until the backend reports otherwise at init.
+            caps: crate::gfx::backend::DeviceCapabilities::ALL,
         }
     }
 }

@@ -89,6 +89,28 @@ pub(crate) struct CullState {
     pub shadow_icb_arg_buffer: Option<Retained<ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
     // Command capacity of `shadow_icb` (across all cascades); 0 until first built.
     pub shadow_icb_capacity: usize,
+    // Per-planar-slot mirror cull ICBs. The planar reflection pass re-runs the
+    // phase-1 cull kernel with each plane's reflected-camera frustum into its own
+    // ICB, so geometry visible only in the reflection (outside the main frustum)
+    // is captured. One slot per distinct planar plane (<= MAX_PLANAR_PLANES); each
+    // holds an ICB + its argument buffer, grown in lockstep with the main ICB by
+    // `ensure_mirror_icb_capacity`. Empty when the world has no planar set or is
+    // not bindless (the legacy path keeps reusing the main visible set). The
+    // status buffer is shared scratch: the mirror cull is single-pass, so its
+    // per-object status is written but never read.
+    pub mirror_slots: Vec<MirrorCullSlot>,
+    pub mirror_status: Option<Retained<ProtocolObject<dyn objc2_metal::MTLBuffer>>>,
+    // Command capacity of every `mirror_slots` ICB; 0 until first built.
+    pub mirror_icb_capacity: usize,
+}
+
+// One planar slot's mirror cull output: an ICB the cull kernel writes the
+// reflected-frustum draws into, plus the argument buffer wiring that ICB into
+// the kernel. Built by `ensure_mirror_icb_capacity`, consumed by
+// `encode_mirror_cull` (writes) + the planar face render (executes).
+pub(crate) struct MirrorCullSlot {
+    pub icb: Retained<ProtocolObject<dyn objc2_metal::MTLIndirectCommandBuffer>>,
+    pub arg_buffer: Retained<ProtocolObject<dyn objc2_metal::MTLBuffer>>,
 }
 
 // Kernel buffer index the cull kernel expects its `ICBContainer` argument
@@ -349,6 +371,13 @@ impl MtlContext {
         if self.draw_objects.is_empty() {
             return Ok(None);
         }
+        // A transparent glass mesh (Layer 2) is disabled in the opaque pass when
+        // the RT path is live: it draws in the transparent pass instead. Clearing
+        // ENABLED makes the cull kernel reset its ICB slot to a no-op (the same
+        // path invisible / non-resident objects take), so it neither draws opaque
+        // nor occludes the refraction snapshot. The object keeps its slot, so every
+        // parallel cull / object-buffer / prev-model index stays intact.
+        let mesh_glass_active = self.mesh_glass_active();
         let mut args = std::mem::take(&mut self.draw_args_scratch);
         args.clear();
         for obj in &self.draw_objects {
@@ -357,11 +386,13 @@ impl MtlContext {
             // change. Objects with no alternates fall straight through to LOD0.
             let d = lod_camera_distance(obj, cam_pos);
             let (index_offset, index_count) = obj.active_lod(d);
+            let opaque_visible =
+                obj.visible && !(mesh_glass_active && obj.material.see_through != 0);
             args.push(GpuDrawArgs {
                 index_count: index_count as u32,
                 index_offset: index_offset as u32,
                 base_vertex: obj.base_vertex as u32,
-                flags: draw_args_flags(obj.visible, obj.resident, obj.cullable()),
+                flags: draw_args_flags(opaque_visible, obj.resident, obj.cullable()),
             });
         }
         // Append the instances' draw args in the SAME cluster-then-instance
@@ -413,22 +444,100 @@ impl MtlContext {
         draw_args_buffer: &ProtocolObject<dyn objc2_metal::MTLBuffer>,
         frustum: &crate::gfx::frustum::Frustum,
         cam_pos: [f32; 3],
-    ) -> Result<u32, String> {
+    ) -> Result<(), String> {
+        let (Some(icb), Some(arg_buf), Some(status)) = (
+            &self.cull.icb,
+            &self.cull.icb_arg_buffer,
+            &self.cull.status_buffer,
+        ) else {
+            return Ok(());
+        };
+        self.encode_cull_into(
+            cmd_buf,
+            object_buffer,
+            draw_args_buffer,
+            frustum,
+            cam_pos,
+            icb,
+            arg_buf,
+            status,
+            true,
+            Some(super::pass_timing::PassId::Cull),
+            "cull phase1",
+        )?;
+        Ok(())
+    }
+
+    // Encode a phase-1 cull for one planar reflection slot: the same kernel as
+    // the main cull, but tested against the reflected-camera `frustum` (so
+    // geometry visible only in the mirror, outside the main frustum, is captured)
+    // and written into that slot's dedicated mirror ICB. Hi-Z occlusion is forced
+    // off because the pyramid lives in the main camera's screen space, not the
+    // mirror's. A no-op when the slot or the shared mirror status is absent
+    // (non-bindless, or `ensure_mirror_icb_capacity` has not run). The planar face
+    // render then executes the slot's ICB.
+    pub(in crate::metal) fn encode_mirror_cull(
+        &self,
+        cmd_buf: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
+        object_buffer: &ProtocolObject<dyn objc2_metal::MTLBuffer>,
+        draw_args_buffer: &ProtocolObject<dyn objc2_metal::MTLBuffer>,
+        frustum: &crate::gfx::frustum::Frustum,
+        cam_pos: [f32; 3],
+        slot: usize,
+    ) -> Result<(), String> {
+        let (Some(mirror), Some(status)) =
+            (self.cull.mirror_slots.get(slot), &self.cull.mirror_status)
+        else {
+            return Ok(());
+        };
+        self.encode_cull_into(
+            cmd_buf,
+            object_buffer,
+            draw_args_buffer,
+            frustum,
+            cam_pos,
+            &mirror.icb,
+            &mirror.arg_buffer,
+            status,
+            false,
+            None,
+            "mirror cull",
+        )
+    }
+
+    // Shared body of every phase-1 cull dispatch (main + per-planar mirror): one
+    // thread per `DrawObject` frustum/distance(/Hi-Z)-tests the record and either
+    // encodes an indexed draw into `icb` or resets that slot to a no-op. The caller
+    // supplies the target ICB + its argument buffer + a per-object status scratch,
+    // whether to consult the Hi-Z pyramid (`use_hiz`), an optional pass-timing id,
+    // and an encoder label. A no-op when the cull pipeline is absent (non-bindless)
+    // or there is no geometry.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_cull_into(
+        &self,
+        cmd_buf: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
+        object_buffer: &ProtocolObject<dyn objc2_metal::MTLBuffer>,
+        draw_args_buffer: &ProtocolObject<dyn objc2_metal::MTLBuffer>,
+        frustum: &crate::gfx::frustum::Frustum,
+        cam_pos: [f32; 3],
+        icb: &Retained<ProtocolObject<dyn objc2_metal::MTLIndirectCommandBuffer>>,
+        arg_buf: &Retained<ProtocolObject<dyn objc2_metal::MTLBuffer>>,
+        status: &Retained<ProtocolObject<dyn objc2_metal::MTLBuffer>>,
+        use_hiz: bool,
+        timing: Option<super::pass_timing::PassId>,
+        label: &str,
+    ) -> Result<(), String> {
         use objc2_metal::{
             MTLComputeCommandEncoder as _, MTLComputePipelineState as _, MTLResourceUsage, MTLSize,
         };
-        let (Some(pipeline), Some(icb), Some(arg_buf)) = (
-            &self.cull.pipeline,
-            &self.cull.icb,
-            &self.cull.icb_arg_buffer,
-        ) else {
-            return Ok(0);
+        let Some(pipeline) = &self.cull.pipeline else {
+            return Ok(());
         };
         // Static objects + folded instances: the kernel tests one thread per
         // record and encodes survivors into the ICB.
         let object_count = self.cull_count();
         if object_count == 0 {
-            return Ok(0);
+            return Ok(());
         }
 
         // Pack the six already-normalised frustum planes for the kernel.
@@ -436,19 +545,22 @@ impl MtlContext {
         for (i, p) in frustum.planes.iter().enumerate() {
             planes[i] = [p.normal[0], p.normal[1], p.normal[2], p.d];
         }
-        // Hi-Z occlusion metadata + binding. `hiz_enabled` is gated on the
-        // per-context `hiz_valid` flag (false on the first frame and right
-        // after a resize, before a valid pyramid has been built) and on whether
-        // a `HiZResources` exists (built at init exactly when the cull pipeline
-        // is). The texture is bound unconditionally when present so the kernel's
-        // `texture(0)` always resolves; the `hiz_enabled` flag is what actually
-        // gates the sample.
+        // Hi-Z occlusion metadata + binding. `hiz_enabled` is gated on `use_hiz`
+        // (off for the mirror cull, whose pyramid would be the wrong screen
+        // space), the per-context `hiz_valid` flag (false on the first frame and
+        // right after a resize), and on whether a `HiZResources` exists. The
+        // texture is bound unconditionally when present so the kernel's
+        // `texture(0)` always resolves; the `hiz_enabled` flag gates the sample.
         let (hiz_tex, hiz_size, hiz_mip_count, hiz_enabled) = match self.cull.hiz.as_ref() {
             Some(h) => (
                 Some(h.texture.as_ref()),
                 [h.width as f32, h.height as f32],
                 h.mip_count,
-                if self.cull.hiz_valid { 1u32 } else { 0u32 },
+                if use_hiz && self.cull.hiz_valid {
+                    1u32
+                } else {
+                    0u32
+                },
             ),
             None => (None, [1.0, 1.0], 1, 0u32),
         };
@@ -461,21 +573,21 @@ impl MtlContext {
             hiz_mip_count,
             hiz_enabled,
             skinned_base: self.skinned_record_base() as u32,
-            // Main cull writes at `tid` (cascade_base 0); the shadow cull is the
-            // only path that offsets by cascade.
+            // Main + mirror cull write at `tid` (cascade_base 0); the shadow cull
+            // is the only path that offsets by cascade.
             cascade_base: 0,
             _pad_skin: [0; 2],
         };
 
         let cull_pass_desc = MTLComputePassDescriptor::new();
-        if let Some(t) = &self.pass_timing {
-            t.attach_compute(&cull_pass_desc, super::pass_timing::PassId::Cull);
+        if let (Some(t), Some(id)) = (&self.pass_timing, timing) {
+            t.attach_compute(&cull_pass_desc, id);
         }
         let enc = ScopedEncoder::new(
             cmd_buf
                 .computeCommandEncoderWithDescriptor(&cull_pass_desc)
                 .ok_or("failed to get compute encoder")?,
-            "cull phase1",
+            label,
         );
         enc.setComputePipelineState(pipeline);
         unsafe {
@@ -488,16 +600,9 @@ impl MtlContext {
             );
             enc.setBuffer_offset_atIndex(Some(&self.index_buffer), 0, 3);
             enc.setBuffer_offset_atIndex(Some(arg_buf), 0, CULL_ICB_BUFFER_INDEX);
-            // Per-object cull status at buffer(5). Always allocated alongside
-            // the ICB, so always bound; the kernel writes it unconditionally
-            // and phase 2 reads it under two-pass occlusion (ignored under
-            // single-pass). A missing buffer would be UB, so require it. The
-            // ScopedEncoder ensures this `?` can't leak an open encoder.
-            let status = self
-                .cull
-                .status_buffer
-                .as_ref()
-                .ok_or("cull status buffer missing")?;
+            // Per-object cull status at buffer(5). The kernel writes it
+            // unconditionally; the main cull's status is read by phase 2 under
+            // two-pass occlusion, the mirror cull's shared scratch is never read.
             enc.setBuffer_offset_atIndex(Some(status), 0, 5);
             // Skinned u16 index buffer at buffer(6): the kernel bakes it into the
             // indirect command for records at/after `skinned_base`. Bound
@@ -532,7 +637,7 @@ impl MtlContext {
                 depth: 1,
             },
         );
-        Ok(0)
+        Ok(())
     }
 
     // Encode the phase-2 GPU cull for two-pass occlusion. Runs after the Hi-Z
@@ -815,6 +920,12 @@ impl MtlContext {
             enc.setTexture_atIndex(Some(self.env_map.prefilter.as_ref()), count + 2);
             // SSAO occlusion: the blurred AO when SSAO is on, else 1×1 white.
             enc.setTexture_atIndex(Some(self.ao_output_texture()), count + 3);
+            // Local reflection probe cube array (specular only): one slice per
+            // baked probe, the sky prefilter for unused slots. Occupies argument
+            // ids `count + 4 ..= count + 4 + MAX_PROBES`.
+            for i in 0..crate::metal::uniforms::MAX_PROBES {
+                enc.setTexture_atIndex(Some(self.probe_cube_or_sky(i)), count + 4 + i);
+            }
         }
         Ok(Some(buf))
     }
@@ -851,6 +962,15 @@ impl MtlContext {
             MTLResourceUsage::Read,
             MTLRenderStages::Fragment,
         );
+        // The reflection probe cube array (each slice, or its sky fallback) rides
+        // the argument buffer, so every bound slice must be resident.
+        for i in 0..crate::metal::uniforms::MAX_PROBES {
+            encoder.useResource_usage_stages(
+                ProtocolObject::from_ref(self.probe_cube_or_sky(i)),
+                MTLResourceUsage::Read,
+                MTLRenderStages::Fragment,
+            );
+        }
     }
 }
 

@@ -18,7 +18,12 @@ pub(super) struct ViewUniforms {
     pub(super) view: [[f32; 4]; 4],
     // Elapsed seconds, available to shaders for animation.
     pub(super) elapsed: f32,
-    pub(super) _pad: f32,
+    // 1.0 when a screen-space / ray-traced reflection resolve composites this
+    // frame, else 0.0. The forward fragment shader uses it to yield the sharp
+    // specular for glossy surfaces to that resolve (whose miss-fallback samples
+    // the same probe set), so a glossy surface does not show both the
+    // parallax-approximate forward probe reflection and the exact resolved one.
+    pub(super) reflections_enabled: f32,
     // World-space camera position (packed_float3 in shader, alignment 4).
     pub(super) cam_pos: [f32; 3],
     // Number of mip levels in the bound IBL prefilter cubemap. 0 means
@@ -28,6 +33,67 @@ pub(super) struct ViewUniforms {
     // End-padding: MSL rounds struct size up to a multiple of float4x4's 16-byte
     // alignment, so we round explicitly to satisfy Metal validation.
     pub(super) _end_pad: [f32; 2],
+}
+
+// Reflection-probe parallax box, pushed to the fragment shader at buffer(6).
+// The specular IBL term box-projects the reflection vector against
+// [box_min, box_max] (the probe's influence volume) and re-anchors the cube
+// sample at the box hit relative to `probe_pos` (the capture point), so a static
+// captured cube tracks a moving first-person camera. Three float4s keep every
+// field 16-byte aligned, matching MSL's `float4` layout. `box_min.w` is the
+// enabled flag: 0 disables parallax (and signals no baked probe), so the shader
+// samples the raw reflection vector.
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub(super) struct ProbeUniforms {
+    // xyz = influence-box min; w = enabled (1.0 = parallax on, 0.0 = off).
+    pub(super) box_min: [f32; 4],
+    // xyz = influence-box max; w unused.
+    pub(super) box_max: [f32; 4],
+    // xyz = probe capture position; w unused.
+    pub(super) probe_pos: [f32; 4],
+}
+
+impl ProbeUniforms {
+    // The "no probe" value: parallax disabled, so the shader samples the raw
+    // reflection vector (which, with `probe_cube` aliasing the sky until a bake,
+    // reproduces the pre-probe reflection exactly).
+    pub(super) const DISABLED: ProbeUniforms = ProbeUniforms {
+        box_min: [0.0; 4],
+        box_max: [0.0; 4],
+        probe_pos: [0.0; 4],
+    };
+}
+
+// Maximum reflection probes a frame can bind. The shader's `MAX_PROBES` constant
+// (default.metal) and the `BindlessTextures.probes` cube array must match this.
+pub(super) const MAX_PROBES: usize = 8;
+
+// Auto-seed must never request more probes than a frame can bind, or
+// `set_reflection_probes` would truncate and silently drop placements. Checked at
+// compile time.
+const _: () = assert!(crate::gfx::reflection_probe::AUTO_SEED_BUDGET <= MAX_PROBES);
+
+// The full set of reflection probes, pushed to the fragment shader at buffer(6).
+// `count` is how many of `probes` are live; the fragment shader blends every
+// probe whose influence box covers the surface (a partition-of-unity weight by
+// signed box distance), falling back to the nearest when the surface is outside
+// all boxes, and samples those slices of the `BindlessTextures.probes` cube
+// array. Slices beyond `count` hold the sky fallback cube + a `DISABLED` box.
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub(super) struct ProbeSet {
+    pub(super) count: u32,
+    pub(super) _pad: [u32; 3],
+    pub(super) probes: [ProbeUniforms; MAX_PROBES],
+}
+
+impl ProbeSet {
+    pub(super) const EMPTY: ProbeSet = ProbeSet {
+        count: 0,
+        _pad: [0; 3],
+        probes: [ProbeUniforms::DISABLED; MAX_PROBES],
+    };
 }
 
 // Per-draw-call model matrix pushed at buffer(2) before each draw.
@@ -262,6 +328,13 @@ pub(super) struct WaterParams {
     // cube-sample path and the shader falls back to a hand-tuned sky tint.
     pub(super) prefilter_mip_count: f32,
     pub(super) waves: [WaterWaveGpu; WATER_MAX_WAVES],
+    // Planar reflection control: `[strength, distortion, _, _]`. `strength > 0.5`
+    // selects the sharp planar reflection (the scene re-rendered mirrored across
+    // the water plane, sampled projectively at screen UV) over the probe / sky
+    // cube; `distortion` scales the wave-normal screen-space ripple offset. A
+    // float4 so the trailing struct stays 16-byte aligned. 0 when planar is off
+    // (RT on, no water plane, or unsupported), keeping the probe/sky path.
+    pub(super) planar: [f32; 4],
 }
 
 // Per-panel tunables for a `GlassPanel`, uploaded once per panel per frame at
@@ -283,7 +356,41 @@ pub(super) struct GlassParams {
     pub(super) refraction_strength: f32,
     // Schlick-Fresnel exponent for the grazing-angle rim.
     pub(super) fresnel_power: f32,
-    pub(super) _pad: f32,
+    // Mip count of the bound IBL prefilter cube; 0 signals "no environment map"
+    // so the shader falls back to a white rim. Patched per-frame in
+    // `collect_glass_transparent_draws` (the asset carries no env state).
+    pub(super) prefilter_mip_count: f32,
+    // Planar reflection control: `[strength, _, _, _]`. `strength > 0.5` selects
+    // the sharp planar reflection (the scene re-rendered mirrored across this
+    // pane's plane, sampled projectively at screen UV) over the probe / sky cube.
+    // A float4 so the trailing struct stays 16-byte aligned. 0 when planar is off
+    // (RT on, no planar slot, or the plane overflowed the budget), keeping the
+    // probe/sky path. Patched per-frame in `collect_glass_transparent_draws`.
+    pub(super) planar: [f32; 4],
+}
+
+// Per-draw tunables for a transparent glass MESH (an imported `Material` with
+// `transparent: true` on an RT-capable device), uploaded at vertex + fragment
+// buffer(6). Unlike `GlassParams` (a pre-baked world-space pane), a mesh is
+// LOCAL-space, so this carries the model matrix the vertex shader applies; the
+// fragment uses the interpolated per-vertex world normal. Matches
+// `GlassMeshParams` in `shaders/glass_mesh_rt.metal`. 96 bytes (model is the
+// first field, so its 16-byte GPU alignment is satisfied at offset 0).
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub(super) struct GlassMeshParams {
+    // Column-major local-to-world model matrix.
+    pub(super) model: [[f32; 4]; 4],
+    // `[r, g, b, _]`: colour multiplied into the refracted scene (material tint).
+    pub(super) tint: [f32; 4],
+    // Base alpha at normal incidence (from `Material.opacity`).
+    pub(super) opacity: f32,
+    // Screen-space refraction offset strength.
+    pub(super) refraction_strength: f32,
+    // Schlick-Fresnel exponent for the grazing-angle rim.
+    pub(super) fresnel_power: f32,
+    // Mip count of the bound IBL prefilter cube (ray-miss fallback); 0 = none.
+    pub(super) prefilter_mip_count: f32,
 }
 
 #[cfg(test)]
@@ -293,18 +400,42 @@ mod tests {
 
     #[test]
     fn view_uniforms_layout_matches_msl() {
-        // MSL `ViewUniforms` in default.metal: two float4x4,
-        // two scalars, packed_float3 cam_pos + prefilter_mip_count. MSL rounds
-        // the struct up to a float4x4 multiple (160): `_end_pad` matches that.
+        // MSL `ViewUniforms` in default.metal: two float4x4, elapsed +
+        // reflections_enabled scalars, packed_float3 cam_pos + prefilter_mip_count.
+        // MSL rounds the struct up to a float4x4 multiple (160): `_end_pad` matches.
         assert_eq!(size_of::<ViewUniforms>(), 160);
         assert_eq!(offset_of!(ViewUniforms, vp), 0);
         assert_eq!(offset_of!(ViewUniforms, view), 64);
         assert_eq!(offset_of!(ViewUniforms, elapsed), 128);
-        assert_eq!(offset_of!(ViewUniforms, _pad), 132);
+        assert_eq!(offset_of!(ViewUniforms, reflections_enabled), 132);
         assert_eq!(offset_of!(ViewUniforms, cam_pos), 136);
         assert_eq!(offset_of!(ViewUniforms, prefilter_mip_count), 148);
         assert_eq!(offset_of!(ViewUniforms, _end_pad), 152);
         assert_eq!(size_of::<ViewUniforms>() % 16, 0);
+    }
+
+    #[test]
+    fn probe_uniforms_layout_matches_msl() {
+        // MSL `ProbeUniforms` in default.metal: three float4 (16-aligned each).
+        assert_eq!(size_of::<ProbeUniforms>(), 48);
+        assert_eq!(offset_of!(ProbeUniforms, box_min), 0);
+        assert_eq!(offset_of!(ProbeUniforms, box_max), 16);
+        assert_eq!(offset_of!(ProbeUniforms, probe_pos), 32);
+        assert_eq!(size_of::<ProbeUniforms>() % 16, 0);
+    }
+
+    #[test]
+    fn probe_set_layout_matches_msl() {
+        // MSL `ProbeSet { uint count; uint _pad0; uint _pad1; uint _pad2;
+        // ProbeUniforms probes[MAX_PROBES]; }` -- three SCALAR uints, so the header
+        // is 16 bytes and `probes` lands at offset 16 (struct 400). A `uint3 _pad`
+        // would be 16-byte aligned and push `probes` to offset 32 (struct 416),
+        // silently shifting every probe by one float4; the shaders carry a
+        // `static_assert(sizeof(ProbeSet) == 400)` so that can't recur.
+        assert_eq!(size_of::<ProbeSet>(), 16 + 48 * MAX_PROBES);
+        assert_eq!(offset_of!(ProbeSet, count), 0);
+        assert_eq!(offset_of!(ProbeSet, probes), 16);
+        assert_eq!(size_of::<ProbeSet>() % 16, 0);
     }
 
     #[test]
@@ -451,9 +582,10 @@ mod tests {
 
     #[test]
     fn water_params_layout_matches_msl() {
-        // MSL `WaterParams` in water.metal: three float4, eight scalars, then
-        // the WaterWave array at the 16-aligned offset 80.
-        assert_eq!(size_of::<WaterParams>(), 208);
+        // MSL `WaterParams` in water.metal: three float4, eight scalars, the
+        // WaterWave array at the 16-aligned offset 80, then a trailing float4
+        // `planar` at 208.
+        assert_eq!(size_of::<WaterParams>(), 224);
         assert_eq!(offset_of!(WaterParams, centre), 0);
         assert_eq!(offset_of!(WaterParams, deep_colour), 16);
         assert_eq!(offset_of!(WaterParams, shallow_colour), 32);
@@ -466,19 +598,39 @@ mod tests {
         assert_eq!(offset_of!(WaterParams, wave_count), 72);
         assert_eq!(offset_of!(WaterParams, prefilter_mip_count), 76);
         assert_eq!(offset_of!(WaterParams, waves), 80);
+        assert_eq!(offset_of!(WaterParams, planar), 208);
         assert_eq!(size_of::<WaterParams>() % 16, 0);
     }
 
     #[test]
     fn glass_params_layout_matches_msl() {
-        // MSL `GlassParams` in glass.metal: three float4, then four scalars.
-        assert_eq!(size_of::<GlassParams>(), 64);
+        // MSL `GlassParams` in glass.metal: three float4, then four scalars
+        // (opacity, refraction_strength, fresnel_power, prefilter_mip_count), then
+        // a trailing float4 planar control.
+        assert_eq!(size_of::<GlassParams>(), 80);
         assert_eq!(offset_of!(GlassParams, centre), 0);
         assert_eq!(offset_of!(GlassParams, normal), 16);
         assert_eq!(offset_of!(GlassParams, tint), 32);
         assert_eq!(offset_of!(GlassParams, opacity), 48);
         assert_eq!(offset_of!(GlassParams, refraction_strength), 52);
         assert_eq!(offset_of!(GlassParams, fresnel_power), 56);
-        assert_eq!(offset_of!(GlassParams, _pad), 60);
+        assert_eq!(offset_of!(GlassParams, prefilter_mip_count), 60);
+        assert_eq!(offset_of!(GlassParams, planar), 64);
+        assert_eq!(size_of::<GlassParams>() % 16, 0);
+    }
+
+    #[test]
+    fn glass_mesh_params_layout_matches_msl() {
+        // MSL `GlassMeshParams` in glass_mesh_rt.metal: a float4x4 model, a float4
+        // tint, then four scalars. model is first, so its 16-byte GPU alignment is
+        // satisfied at offset 0 and the Rust [[f32; 4]; 4] matches byte-for-byte.
+        assert_eq!(size_of::<GlassMeshParams>(), 96);
+        assert_eq!(offset_of!(GlassMeshParams, model), 0);
+        assert_eq!(offset_of!(GlassMeshParams, tint), 64);
+        assert_eq!(offset_of!(GlassMeshParams, opacity), 80);
+        assert_eq!(offset_of!(GlassMeshParams, refraction_strength), 84);
+        assert_eq!(offset_of!(GlassMeshParams, fresnel_power), 88);
+        assert_eq!(offset_of!(GlassMeshParams, prefilter_mip_count), 92);
+        assert_eq!(size_of::<GlassMeshParams>() % 16, 0);
     }
 }

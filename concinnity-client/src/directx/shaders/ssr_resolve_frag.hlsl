@@ -16,9 +16,11 @@ cbuffer SsrParams : register(b0)
     // the cube fallback is skipped (missed rays keep the base shading).
     float    prefilter_mip_count;
     float    _pad;
-    // View-space to world-space rotation; turns the view-space reflection ray
-    // into the world-space direction the prefilter cubemap is sampled with.
-    float4x4 inv_view_rot;
+    // Camera-to-world transform; its 3x3 turns the view-space reflection ray into
+    // the world-space direction the prefilter cubemap is sampled with. (The
+    // translation column carries the camera position for the Metal reflection-probe
+    // miss fallback; this backend uses only the 3x3.)
+    float4x4 inv_view;
 }
 
 Texture2D    scene     : register(t0);
@@ -116,7 +118,7 @@ float4 main(VsOut p) : SV_TARGET
     float3 env = base;
     if (ibl)
     {
-        float3 r_world = mul((float3x3)inv_view_rot, R);
+        float3 r_world = mul((float3x3)inv_view, R);
         float  lod     = roughness * (prefilter_mip_count - 1.0);
         env = prefilter.SampleLevel(cube_smp, r_world, lod).rgb;
     }

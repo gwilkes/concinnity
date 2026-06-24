@@ -319,6 +319,8 @@ pub struct EnvironmentMapSource {
     pub irradiance_face_size: u32,
     // Hammersley sample count for the GGX prefilter convolution.
     pub prefilter_samples: u32,
+    // Per-texel brightness cap for the glossy reflection mips (firefly clamp).
+    pub prefilter_clamp: f32,
 }
 
 // Catalogue of every file-backed `Texture` slot the renderer can hot-reload.

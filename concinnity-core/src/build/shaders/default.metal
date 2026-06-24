@@ -99,13 +99,60 @@ struct ViewUniforms {
     float4x4 vp;
     float4x4 view;
     float elapsed;
-    float _pad;
+    // 1.0 when a screen-space / ray-traced reflection resolve composites this
+    // frame. Below the reflection roughness cut the forward specular yields to
+    // that resolve (whose miss-fallback samples this same probe set), so a
+    // glossy surface does not show both the parallax-approximate forward probe
+    // reflection and the exact resolved one. 0.0 keeps the full forward probe
+    // specular (no resolve: non-RT backends, reflections off, probe-face bake).
+    float reflections_enabled;
     packed_float3 cam_pos;
     // Number of mip levels in the bound prefilter cubemap. Set to 0 by the
     // runtime when no EnvironmentMap is bound; the fragment shader uses this
     // as the IBL "enabled" flag and falls back to a flat ambient placeholder.
     float prefilter_mip_count;
 };
+
+// Reflection-probe parallax box (buffer(6)). Matches metal::uniforms::ProbeUniforms.
+// box_min.w is the enabled flag (0 = no baked probe / parallax off). When on, the
+// specular term box-projects the reflection ray against [box_min, box_max] and
+// re-anchors the probe cube sample relative to probe_pos (the capture point), so
+// a static captured cube tracks a moving camera.
+struct ProbeUniforms {
+    float4 box_min;   // xyz = influence-box min, w = enabled
+    float4 box_max;   // xyz = influence-box max
+    float4 probe_pos; // xyz = capture position
+};
+
+// Maximum reflection probes bound per frame. Must match metal::uniforms::MAX_PROBES
+// and the `BindlessTextures.probes` cube-array length.
+constant constexpr uint MAX_PROBES = 8u;
+
+// Probe blend falloff, as a fraction of a box's smallest half-extent. Each probe's
+// influence weight ramps across a shell of this half-width centred on the box
+// surface (1 deep inside, 0.5 at the surface, 0 a margin outside), so adjacent
+// boxes cross-fade through their shared face instead of hard-switching. Larger =
+// wider, softer transitions.
+constant constexpr float PROBE_BLEND_MARGIN = 0.2;
+
+// The full reflection-probe set (buffer(6)). Matches metal::uniforms::ProbeSet.
+// The fragment shader weights every probe by how deep the surface sits inside its
+// box and blends the two highest-weighted, falling back to the nearest by
+// capture distance where no box covers.
+struct ProbeSet {
+    uint count;
+    // Three scalar uints, NOT a uint3: a uint3 is 16-byte aligned in MSL, which
+    // pushes `probes` to offset 32 (struct 416 bytes) and mismatches the CPU-side
+    // metal::uniforms::ProbeSet, whose [u32; 3] keeps `probes` at offset 16 (struct
+    // 400 bytes). A mismatch reads every probe shifted by one float4. The
+    // static_assert locks the 400-byte layout at shader-compile time.
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+    ProbeUniforms probes[MAX_PROBES];
+};
+static_assert(sizeof(ProbeSet) == 400,
+              "ProbeSet must be 400 bytes to match the CPU-side metal::uniforms::ProbeSet");
 
 struct ModelUniforms {
     float4x4 model;
@@ -150,6 +197,13 @@ struct MaterialUniforms {
     uint   normal_secondary_index;
     uint   emissive_map_index;
     uint   orm_map_index;
+    // CPU-side routing fields (opacity + transparent + see-through flags).
+    // Present so the struct size matches the Rust MaterialUniforms; the opaque
+    // main pass never reads them (transparent meshes are skipped CPU-side before
+    // this shader).
+    float  opacity;
+    uint   transparent;
+    uint   see_through;
 };
 
 // packed_float3 has size=12 align=4 -- matches Rust [f32; 3] so struct offsets
@@ -399,6 +453,16 @@ static float shadow_factor_cascaded(
 
 constant float PI = 3.14159265359;
 
+// Surfaces rougher than this get no screen-space / ray-traced reflection (the
+// resolve and reflection_composite gate at the same value). Below it the
+// forward probe specular yields to the resolve to avoid double-counting; at or
+// above it the resolve is silent, so the forward probe specular is kept.
+// This shader is compiled offline and baked, so unlike the runtime-compiled
+// resolve shaders it keeps its own declaration; the value is locked to
+// `concinnity_core::gfx::ssr::REFLECTION_ROUGHNESS_CUT` by a unit test
+// (`default_metal_reflection_cut_matches_canonical`).
+constant float REFL_RESOLVE_CUT = 0.6;
+
 // Trowbridge-Reitz GGX normal distribution.
 static float distribution_ggx(float3 N, float3 H, float rough) {
     float a  = rough * rough;
@@ -544,6 +608,90 @@ static float4 triplanar_sample(
     return sx * weights.x + sy * weights.y + sz * weights.z;
 }
 
+// Box-parallax sample of one reflection-probe cube. Intersects the reflection ray
+// R with the probe's influence box and re-anchors the sample direction at that hit
+// relative to the capture point, so a static cube tracks a moving camera; falls
+// back to the raw ray when the probe has no baked box (`box_min.w <= 0.5`) or the
+// box does not lie ahead of the ray (so a blended secondary box that the surface
+// has already left can't sample backward).
+static float3 sample_probe_radiance(
+    texturecube<float>      probe_cube,
+    constant ProbeUniforms &probe,
+    float3                  world_pos,
+    float3                  R,
+    float                   lod,
+    sampler                 cube_sampler
+) {
+    float3 sample_dir = R;
+    if (probe.box_min.w > 0.5) {
+        float3 inv_r = 1.0 / R;
+        float3 t_max = (probe.box_max.xyz - world_pos) * inv_r;
+        float3 t_min = (probe.box_min.xyz - world_pos) * inv_r;
+        float3 t_far = max(t_max, t_min);
+        float dist = min(min(t_far.x, t_far.y), t_far.z);
+        // dist > 0 always holds for a point inside the box. A blended secondary
+        // probe is sampled from points just outside its box, where the box can lie
+        // behind the ray (dist <= 0); re-anchoring then would point the sample
+        // backward, so keep the raw ray in that case.
+        if (dist > 0.0) {
+            float3 hit = world_pos + R * dist;
+            sample_dir = hit - probe.probe_pos.xyz;
+        }
+    }
+    // bias() (not level()) so the reflection vector's screen-space footprint widens
+    // the mip at grazing or distant angles; a fixed level aliases into sparkle on
+    // near mirrors, while flat close-up pixels keep the plain roughness mip.
+    return probe_cube.sample(cube_sampler, sample_dir, bias(lod)).rgb;
+}
+
+// Reflection-probe radiance for `world_pos` along world-space ray `R`, blended
+// across every probe that covers the point (partition of unity). Each probe gets
+// `w = smoothstep(-margin, margin, sd)` from the signed box distance (1 deep inside,
+// 0.5 on the box surface, 0 a margin outside); the result is the weight-normalised
+// sum of each probe's box-projected sample, so a surface inside N overlapping boxes
+// cross-fades smoothly across all N (no pop at a 3-way overlap line) and reduces to
+// a single sample where only one box covers. Where no box covers (all weights 0),
+// falls back to the nearest probe by capture distance.
+static float3 probe_set_specular(
+    constant ProbeSet                    &set,
+    array<texturecube<float>, MAX_PROBES> probe_cubes,
+    float3                                world_pos,
+    float3                                R,
+    float                                 lod,
+    sampler                               cube_sampler
+) {
+    float3 acc = float3(0.0);
+    float wsum = 0.0;
+    float near_d = 1e30;
+    uint near_i = 0u;
+    for (uint i = 0u; i < set.count; i++) {
+        float3 c = 0.5 * (set.probes[i].box_min.xyz + set.probes[i].box_max.xyz);
+        float3 he = 0.5 * (set.probes[i].box_max.xyz - set.probes[i].box_min.xyz);
+        // Signed distance to the box surface: positive inside, negative outside.
+        float3 q = abs(world_pos - c) - he;
+        float sd = -(length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0));
+        // Floor the margin so a zero-extent box axis can't collapse the smoothstep.
+        float margin = max(PROBE_BLEND_MARGIN * min(he.x, min(he.y, he.z)), 1e-4);
+        float w = smoothstep(-margin, margin, sd);
+        if (w > 0.0) {
+            acc += w * sample_probe_radiance(
+                           probe_cubes[i], set.probes[i], world_pos, R, lod, cube_sampler);
+            wsum += w;
+        }
+        float d = distance(world_pos, set.probes[i].probe_pos.xyz);
+        if (d < near_d) {
+            near_d = d;
+            near_i = i;
+        }
+    }
+    if (wsum > 0.0) {
+        return acc / wsum;
+    }
+    // No box covers the surface within its margin: use the nearest probe.
+    return sample_probe_radiance(
+        probe_cubes[near_i], set.probes[near_i], world_pos, R, lod, cube_sampler);
+}
+
 // Shared Cook-Torrance GGX shading body. Both fragment entry points resolve
 // their inputs differently (`fragment_main` from per-draw bindings,
 // `fragment_main_bindless` from the GpuObjectData buffer + texture pool), then
@@ -552,6 +700,7 @@ static float4 triplanar_sample(
 static float4 shade_surface(
     VertexOut                in,
     constant ViewUniforms   &view,
+    constant ProbeSet       &probes,
     float                    roughness,
     float                    metallic,
     float                    macro_variation,
@@ -572,6 +721,7 @@ static float4 shade_surface(
     depth2d_array<float>     shadow_map,
     texturecube<float>       irradiance_cube,
     texturecube<float>       prefilter_cube,
+    array<texturecube<float>, MAX_PROBES> probe_cubes,
     texture2d<float>         ssao_tex,
     sampler                  tex_sampler,
     sampler                  shadow_sampler,
@@ -786,15 +936,35 @@ static float4 shade_surface(
         float3 diffuse_ibl = kd_ibl * albedo * irradiance / PI;
 
         float3 R = reflect(-V, N);
-        // Sample with bias() rather than level() so the reflection vector's
-        // screen-space footprint widens the mip at grazing or distant angles.
-        // Forcing a fixed level defeats minification filtering and aliases the
-        // environment into sparkle on near mirrors; flat close-up pixels have a
-        // near-zero footprint, so they keep the plain roughness mip.
         float  lod = roughness * (view.prefilter_mip_count - 1.0);
-        float3 prefiltered = prefilter_cube.sample(cube_sampler, R, bias(lod)).rgb;
+        // Specular reflection samples the local reflection probes (the scene
+        // captured into cubes) rather than the sky cube, so glossy surfaces reflect
+        // real geometry. Unbaked slots alias the sky `prefilter_cube`, so this
+        // matches the sky reflection until a probe is baked. The helper box-parallax
+        // corrects each probe (the static cube tracks the moving camera) and blends
+        // every box that covers the surface (partition of unity), so reflections
+        // cross-fade smoothly where boxes overlap and reduce to one sample where a
+        // single box covers.
+        float3 prefiltered =
+            probe_set_specular(probes, probe_cubes, in.world_pos, R, lod, cube_sampler);
         // Karis split-sum: F0 * scale + bias from env_brdf_approx (already in `ab`).
         float3 specular_ibl = prefiltered * (F0 * ab.x + ab.y);
+
+        // When a reflection-resolve pass is compositing this frame, it owns the
+        // sharp specular for glossy DIELECTRICS (its miss-fallback samples this
+        // same probe set), so leaving the forward probe specular in place
+        // double-counts the reflection: a parallax-approximate probe copy under
+        // the exact resolved one. Fade the forward specular out below the
+        // resolve's roughness cut (rough surfaces, which the resolve skips, keep
+        // it). Gate on dielectrics: the resolve weights its reflection by a
+        // dielectric Fresnel (F0 ~ 0.04), so a metal's albedo-tinted probe
+        // reflection is NOT something the resolve can stand in for; metals keep
+        // their full forward probe specular and the resolve only adds a faint
+        // dielectric-strength term on top (no visible double).
+        if (view.reflections_enabled > 0.5) {
+            float fade = smoothstep(REFL_RESOLVE_CUT * 0.7, REFL_RESOLVE_CUT, roughness);
+            specular_ibl *= mix(1.0, fade, 1.0 - metallic);
+        }
 
         ambient = diffuse_ibl + specular_ibl;
     } else {
@@ -833,12 +1003,18 @@ fragment float4 fragment_main(
     constant MaterialUniforms &mat     [[buffer(3)]],
     constant LightUniforms   &lights   [[buffer(4)]],
     constant ShadowUniforms  &shadow   [[buffer(5)]],
+    constant ProbeSet        &probes   [[buffer(6)]],
     texture2d<float>     tex            [[texture(0)]],
     texture2d<float>     normal_tex     [[texture(1)]],
     depth2d_array<float> shadow_map     [[texture(2)]],
     texturecube<float>   irradiance_cube[[texture(3)]],
     texturecube<float>   prefilter_cube [[texture(4)]],
     texture2d<float>     ssao_tex       [[texture(5)]],
+    // Reflection-probe cube array at texture(6 .. 6+MAX_PROBES). The renderer binds
+    // `probe_cube_or_sky(i)` into each slot (the sky prefilter for unbaked slots), so
+    // the legacy path selects + blends per-surface from the same set as the bindless
+    // path -- no longer limited to probe 0.
+    array<texturecube<float>, MAX_PROBES> probe_cubes [[texture(6)]],
     sampler tex_sampler                 [[sampler(0)]],
     sampler shadow_sampler              [[sampler(1)]],
     sampler cube_sampler                [[sampler(2)]]
@@ -850,8 +1026,11 @@ fragment float4 fragment_main(
     // valid data; the secondary blend weight is gated on `tex_secondary`
     // resolving to a real layer via the bindless path, which it
     // doesn't here.
+    // The specular reflection blends every probe whose box covers the surface
+    // (partition of unity), selected + sampled inside `shade_surface`.
     return shade_surface(
-        in, view, mat.roughness, mat.metallic, mat.macro_variation,
+        in, view, probes,
+        mat.roughness, mat.metallic, mat.macro_variation,
         mat.terrain_blend, mat.secondary_blend_sharpness,
         mat.tint, mat.emissive,
         lights, shadow, tex, normal_tex, tex, normal_tex,
@@ -859,7 +1038,8 @@ fragment float4 fragment_main(
         // as a dummy and gate both off so neither is sampled.
         tex, tex, false, false,
         shadow_map, irradiance_cube,
-        prefilter_cube, ssao_tex, tex_sampler, shadow_sampler, cube_sampler);
+        prefilter_cube, probe_cubes, ssao_tex, tex_sampler, shadow_sampler,
+        cube_sampler);
 }
 
 // Every texture the bindless static pass samples, packed into one argument
@@ -876,6 +1056,11 @@ struct BindlessTextures {
     texturecube<float>   prefilter  [[id(BINDLESS_TEXTURE_COUNT + 2)]];
     // Blurred SSAO occlusion (1x1 white when SSAO is disabled).
     texture2d<float>     ssao       [[id(BINDLESS_TEXTURE_COUNT + 3)]];
+    // Local reflection-probe prefiltered radiance: one scene-captured cube per
+    // probe. Sampled for the specular reflection term only (the skybox + diffuse
+    // keep the sky `prefilter`). Unused slices + the pre-bake state alias the sky
+    // `prefilter`, so reflections are unchanged until a probe is baked.
+    array<texturecube<float>, MAX_PROBES> probes [[id(BINDLESS_TEXTURE_COUNT + 4)]];
 };
 
 // Fragment entry point for the bindless static main pass. Material scalars and
@@ -890,6 +1075,7 @@ fragment float4 fragment_main_bindless(
     constant ViewUniforms     &view     [[buffer(0)]],
     constant LightUniforms    &lights   [[buffer(4)]],
     constant ShadowUniforms   &shadow   [[buffer(5)]],
+    constant ProbeSet         &probes   [[buffer(6)]],
     constant GpuObjectData    *objects  [[buffer(9)]],
     constant BindlessTextures &tex      [[buffer(7)]]
 ) {
@@ -902,8 +1088,13 @@ fragment float4 fragment_main_bindless(
     constexpr sampler cube_sampler(filter::linear, mip_filter::linear,
                                    address::clamp_to_edge);
     GpuObjectData obj = objects[in.obj_id];
+    // The specular reflection blends every probe whose influence box covers this
+    // surface (partition of unity), selected + sampled inside `shade_surface` via
+    // `probe_set_specular`. The whole set + cube array are passed through; an unbaked
+    // or absent probe (count == 0) leaves the sky fallback in those slots.
     return shade_surface(
-        in, view, obj.roughness, obj.metallic, obj.macro_variation,
+        in, view, probes,
+        obj.roughness, obj.metallic, obj.macro_variation,
         obj.terrain_blend, obj.secondary_blend_sharpness,
         obj.tint, obj.emissive,
         lights, shadow,
@@ -915,6 +1106,7 @@ fragment float4 fragment_main_bindless(
         tex.tex_pool[obj.orm_map_index],
         obj.emissive_map_index != 0,
         obj.orm_map_index != 0,
-        tex.shadow_map, tex.irradiance, tex.prefilter, tex.ssao,
+        tex.shadow_map, tex.irradiance, tex.prefilter,
+        tex.probes, tex.ssao,
         tex_sampler, shadow_sampler, cube_sampler);
 }

@@ -33,6 +33,20 @@ const THICKNESS_SCALE: f32 = 2.5;
 // Floor on the aspect ratio so a degenerate viewport cannot divide by zero.
 const MIN_ASPECT: f32 = 1.0e-3;
 
+// Canonical roughness cut for sharp reflections: surfaces rougher than this get
+// no screen-space / ray-traced reflection. One value drives four shaders that
+// must agree for the reflection pipeline to be self-consistent:
+//   - the SSR resolve gate          (SSR_ROUGH_CUT in ssr.metal)
+//   - the RT-reflection resolve gate (RT_ROUGH_CUT in rt_reflections.metal)
+//   - the roughness blur ramp        (REFL_ROUGH_CUT in reflection_composite.metal)
+//   - the forward double-count fade  (REFL_RESOLVE_CUT in default.metal)
+// The first three (client, runtime-compiled) reference this value through a
+// generated MSL prelude, so they are literally single-sourced. The forward
+// shader is compiled offline and baked, so it keeps its own declaration locked
+// to this value by a unit test. As an MSL `constant` it folds at compile time:
+// sharing it costs nothing at runtime.
+pub const REFLECTION_ROUGHNESS_CUT: f32 = 0.6;
+
 // Clamped SSR tunables resolved from the authored asset fields. Held by the
 // backend and turned into a per-frame [`SsrParams`] once the camera is known.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -56,17 +70,27 @@ impl SsrSettings {
     // camera. `fov_y_radians` is the vertical field of view and `aspect` the
     // viewport width / height ratio: together they give the view-ray scale
     // the resolve pass needs to project a view-space ray point to a UV.
-    // `inv_view_rot` is the view-space to world-space rotation and
-    // `prefilter_mip_count` the IBL prefilter cubemap mip count (0 = no IBL);
-    // the resolve uses both to sample the cubemap as a reflection fallback.
+    // `inv_view_rot` is the view-space to world-space rotation and `cam_pos` the
+    // world camera position (together the rigid camera-to-world transform), and
+    // `prefilter_mip_count` the IBL prefilter cubemap mip count (0 = no IBL); the
+    // resolve uses these to sample the cubemap (or a reflection probe) as a
+    // reflection fallback.
     pub fn params(
         &self,
         fov_y_radians: f32,
         aspect: f32,
         inv_view_rot: [[f32; 4]; 4],
+        cam_pos: [f32; 3],
         prefilter_mip_count: f32,
     ) -> SsrParams {
         let stride = self.max_distance / MARCH_STEPS;
+        // Camera-to-world: the rotation already lives in `inv_view_rot`'s 3x3 (its
+        // translation column is identity); set the translation column to the world
+        // camera position to complete the rigid inverse of the view, so the resolve
+        // can rebuild the world-space surface position the reflection probe
+        // box-projects against. Mirrors `RtReflectionSettings::params`.
+        let mut inv_view = inv_view_rot;
+        inv_view[3] = [cam_pos[0], cam_pos[1], cam_pos[2], 1.0];
         SsrParams {
             intensity: self.intensity,
             max_distance: self.max_distance,
@@ -76,7 +100,7 @@ impl SsrSettings {
             thickness: stride * THICKNESS_SCALE,
             prefilter_mip_count,
             _pad: 0.0,
-            inv_view_rot,
+            inv_view,
         }
     }
 }
@@ -113,7 +137,7 @@ mod tests {
     #[test]
     fn params_derive_stride_and_thickness_from_distance() {
         let s = SsrSettings::resolve(0.7, 48.0);
-        let p = s.params(std::f32::consts::FRAC_PI_2, 1.6, IDENTITY, 6.0);
+        let p = s.params(std::f32::consts::FRAC_PI_2, 1.6, IDENTITY, [0.0; 3], 6.0);
         // 48 units over 48 steps -> a 1-unit stride.
         assert!((p.stride - 1.0).abs() < 1.0e-5);
         assert!((p.thickness - THICKNESS_SCALE).abs() < 1.0e-5);
@@ -125,15 +149,34 @@ mod tests {
     #[test]
     fn params_floor_a_degenerate_aspect() {
         let s = SsrSettings::resolve(0.7, 40.0);
-        let p = s.params(std::f32::consts::FRAC_PI_2, 0.0, IDENTITY, 0.0);
+        let p = s.params(std::f32::consts::FRAC_PI_2, 0.0, IDENTITY, [0.0; 3], 0.0);
         assert!(p.aspect >= MIN_ASPECT);
     }
 
     #[test]
     fn params_pass_through_ibl_fallback_inputs() {
         let s = SsrSettings::resolve(0.7, 40.0);
-        let p = s.params(std::f32::consts::FRAC_PI_2, 1.6, IDENTITY, 7.0);
+        let p = s.params(std::f32::consts::FRAC_PI_2, 1.6, IDENTITY, [0.0; 3], 7.0);
         assert_eq!(p.prefilter_mip_count, 7.0);
-        assert_eq!(p.inv_view_rot, IDENTITY);
+        // Identity rotation + a zero camera position leaves the matrix identity.
+        assert_eq!(p.inv_view, IDENTITY);
+    }
+
+    #[test]
+    fn params_assemble_camera_to_world_translation_column() {
+        // inv_view's translation column must be the world camera position so the
+        // resolve can lift a reconstructed view-space surface point to the right
+        // world point for reflection-probe box projection.
+        let s = SsrSettings::resolve(0.7, 40.0);
+        let p = s.params(
+            std::f32::consts::FRAC_PI_2,
+            1.6,
+            IDENTITY,
+            [3.0, 4.0, 5.0],
+            6.0,
+        );
+        assert_eq!(p.inv_view[3], [3.0, 4.0, 5.0, 1.0]);
+        // The rotation columns are untouched.
+        assert_eq!(p.inv_view[0], [1.0, 0.0, 0.0, 0.0]);
     }
 }

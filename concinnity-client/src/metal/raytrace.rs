@@ -51,8 +51,8 @@ use objc2_metal::{
     MTLCommandBuffer as _, MTLCommandBufferStatus, MTLCommandEncoder as _, MTLCommandQueue as _,
     MTLComputeCommandEncoder as _, MTLComputePipelineState, MTLDevice as _, MTLIndexType,
     MTLInstanceAccelerationStructureDescriptor, MTLPackedFloat3, MTLPackedFloat4x3,
-    MTLPrimitiveAccelerationStructureDescriptor, MTLRenderPipelineState, MTLResource as _,
-    MTLResourceOptions, MTLResourceUsage, MTLSize,
+    MTLPrimitiveAccelerationStructureDescriptor, MTLRenderCommandEncoder, MTLRenderPipelineState,
+    MTLRenderStages, MTLResource, MTLResourceOptions, MTLResourceUsage, MTLSize,
 };
 
 use super::transient::RetirePool;
@@ -140,6 +140,13 @@ pub(crate) struct RtState {
     // transient rebuild failure is non-fatal (keep last frame's BVH) and
     // logged once per streak rather than every frame.
     pub update_failed: bool,
+    // Set when an operation changes the RT-relevant draw set (a streamed chunk
+    // added/removed, a prop cloned, a material edit that flips RT participation)
+    // since the last update. The per-frame update consumes it to refresh the
+    // BLAS topology -- reusing every unchanged BLAS and building only the new
+    // ones -- instead of either ignoring the change (the default `Auto` path
+    // only watches transforms of the prior set) or rebuilding every BLAS.
+    pub topology_dirty: bool,
     // Resolve pipeline, flat-tint hit shading. Used for non-bindless worlds
     // (no albedo pool).
     pub pipeline: Option<Retained<ProtocolObject<dyn MTLRenderPipelineState>>>,
@@ -151,6 +158,83 @@ pub(crate) struct RtState {
     // BVH can trace. Consumed each frame by `rebuild_rt_accel` to pose skinned
     // geometry before the skinned BLAS build.
     pub skin_pipeline: Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
+}
+
+// Identifies the geometry slice a draw-object BLAS traces, on the shared
+// vertex/index buffers. Two draw objects with the same signature trace identical
+// geometry, so a topology refresh can reuse the existing BLAS instead of
+// building a new one. Sound because: the shared buffer *objects* are stable once
+// streaming is set up (`add_chunk_mesh` / `remove_chunk_mesh` write regions in
+// place; a buffer swap goes through a full rebuild, not this path), and a slot's
+// bytes cannot be overwritten while its BLAS is live (the deferred free holds the
+// region until the frames-in-flight fence retires it). `base_vertex` +
+// `index_offset` + `index_count` are exactly the inputs `prim_desc_for` uses;
+// `vertex_offset` is carried too so a static draw (whose `base_vertex` is 0)
+// still distinguishes distinct vertex regions.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GeomSig {
+    base_vertex: i32,
+    vertex_offset: usize,
+    index_offset: usize,
+    index_count: usize,
+}
+
+impl GeomSig {
+    fn of(obj: &DrawObject) -> Self {
+        Self {
+            base_vertex: obj.base_vertex,
+            vertex_offset: obj.vertex_offset,
+            index_offset: obj.index_offset,
+            index_count: obj.index_count,
+        }
+    }
+}
+
+// Per-new-slot decision for a topology refresh of the draw-object BLAS head.
+struct TopologyPlan {
+    // `reuse[j] == Some(k)`: new draw slot `j` reuses the old draw BLAS at index
+    // `k` (its geometry is unchanged). `None`: build a fresh BLAS for slot `j`.
+    reuse: Vec<Option<usize>>,
+    // Old draw BLAS indices no longer referenced by any new slot -- retire them.
+    retire: Vec<usize>,
+}
+
+// Decide, for the draw-object BLAS head only, which BLAS to reuse, which to
+// build, and which to retire when the participating draw set changes. Matches
+// old and new slots by `draw_objects` index AND geometry signature: a slot whose
+// geometry moved (a chunk slot recycled for a different chunk) does not match, so
+// it rebuilds. Pure so it is unit-testable without Metal.
+fn plan_topology_refresh(
+    old_indices: &[usize],
+    old_sigs: &[GeomSig],
+    new_indices: &[usize],
+    new_sigs: &[GeomSig],
+) -> TopologyPlan {
+    use std::collections::HashMap;
+    // draw_objects index -> (position in the old draw BLAS head, its signature).
+    // `object_indices` entries are unique (one per draw slot), so this is 1:1.
+    let mut by_idx: HashMap<usize, (usize, GeomSig)> = HashMap::with_capacity(old_indices.len());
+    for (k, (&idx, &sig)) in old_indices.iter().zip(old_sigs).enumerate() {
+        by_idx.insert(idx, (k, sig));
+    }
+    let mut used = vec![false; old_indices.len()];
+    let mut reuse = Vec::with_capacity(new_indices.len());
+    for (&idx, &sig) in new_indices.iter().zip(new_sigs) {
+        match by_idx.get(&idx) {
+            Some(&(k, old_sig)) if old_sig == sig && !used[k] => {
+                used[k] = true;
+                reuse.push(Some(k));
+            }
+            _ => reuse.push(None),
+        }
+    }
+    let retire = used
+        .iter()
+        .enumerate()
+        .filter(|&(_, &u)| !u)
+        .map(|(k, _)| k)
+        .collect();
+    TopologyPlan { reuse, retire }
 }
 
 // The acceleration structures + geometry table for hardware ray tracing. Held
@@ -188,6 +272,11 @@ pub(crate) struct RtAccelData {
     // in BLAS / instance order. Lets an update re-read current transforms in
     // the exact order the BLAS were built, and detect a changed draw list.
     object_indices: Vec<usize>,
+    // The geometry signature each draw-object BLAS (`blas[..object_indices.len()]`)
+    // was built from, parallel to `object_indices`. A topology refresh compares
+    // these against the current draw set to reuse every unchanged BLAS and build
+    // only the new / changed ones.
+    draw_blas_sigs: Vec<GeomSig>,
     // Each participating object's model matrix as baked into the current TLAS,
     // in `object_indices` order. The `Auto` dirty check compares the live draw
     // list against these to decide whether a rebuild is needed.
@@ -224,18 +313,18 @@ pub(crate) struct RtAccelData {
     // can bind it (buffer 6) for skinned hits. A 1-element dummy when there is
     // no skinned geometry.
     pub skinned_indices: Retained<ProtocolObject<dyn MTLBuffer>>,
-    // Outgoing structures / Shared buffers from prior skinned rebuilds, held
-    // alive until the frames-in-flight fence retires the frames whose
-    // still-in-flight trace could read them. Drained once per frame in
-    // `rt_dynamic_update`. A skinned rebuild allocates fresh and parks the old
-    // here rather than freeing in place.
+    // Outgoing structures / Shared buffers from prior rebuilds, held alive until
+    // the frames-in-flight fence retires the frames whose still-in-flight trace
+    // could read them. Drained once per frame in `rt_dynamic_update`. A skinned
+    // rebuild or an incremental topology refresh allocates fresh and parks the
+    // old here rather than freeing in place.
     retire_pool: RetirePool<RetiredRt>,
 }
 
-// Outgoing RT resources parked by a skinned rebuild for deferred free. Never
-// read again: they exist only to keep the Metal handles (and thus the GPU
-// allocations) valid until `RetirePool` drops them, once the fence guarantees no
-// in-flight trace can still reference them.
+// Outgoing RT resources parked by a skinned rebuild or an incremental topology
+// refresh for deferred free. Never read again: they exist only to keep the Metal
+// handles (and thus the GPU allocations) valid until `RetirePool` drops them,
+// once the fence guarantees no in-flight trace can still reference them.
 struct RetiredRt {
     #[allow(dead_code)]
     structures: Vec<Retained<ProtocolObject<dyn MTLAccelerationStructure>>>,
@@ -497,6 +586,37 @@ fn declare_blas_resident<'a>(
     }
 }
 
+// Declare every BLAS resident for a fragment-stage trace in ONE batched
+// `useResources` call rather than N per-BLAS ones. A trace render pass (the
+// transparent glass/water pass, the RT-reflection resolve) reaches each BLAS
+// indirectly through the TLAS, which does NOT make them resident, so the pass
+// must declare them itself. Batching collapses the per-frame Obj-C message-send
+// count on BLAS-heavy worlds (the driver records the same residency set either
+// way, just in one call). A no-op when there are no BLAS.
+pub(in crate::metal) fn use_blas_resident_fragment(
+    enc: &ProtocolObject<dyn MTLRenderCommandEncoder>,
+    blas: &[Retained<ProtocolObject<dyn MTLAccelerationStructure>>],
+) {
+    if blas.is_empty() {
+        return;
+    }
+    let res: Vec<NonNull<ProtocolObject<dyn MTLResource>>> = blas
+        .iter()
+        .map(|b| NonNull::from(ProtocolObject::from_ref(&**b)))
+        .collect();
+    // SAFETY: `res` is a non-empty, contiguous array of `res.len()` live resource
+    // pointers; the encoder reads it for the duration of the call only.
+    unsafe {
+        enc.useResources_count_usage_stages(
+            NonNull::new(res.as_ptr() as *mut NonNull<ProtocolObject<dyn MTLResource>>)
+                .expect("non-empty blas slice has a non-null pointer"),
+            res.len(),
+            MTLResourceUsage::Read,
+            MTLRenderStages::Fragment,
+        );
+    }
+}
+
 // Attach a completion handler that logs the first GPU fault on an async RT
 // command buffer (`what` names the stage: skin compute or BLAS/TLAS build). The
 // per-frame skinned rebuild commits these without `waitUntilCompleted`, so a
@@ -742,14 +862,27 @@ pub(crate) fn build_rt_accel(
     albedo_count: usize,
     normal_count: usize,
     skinned: Option<SkinnedRtInputs>,
+    // Layer 2 see-through: when set, see-through glass meshes are left out of the
+    // BLAS (they trace their own per-pixel reflection in the transparent pass, and
+    // excluding them means glass does not reflect glass). Off keeps every
+    // transparent mesh IN the BVH so Layer 1 opaque glass reflects + is reflected
+    // like any other surface. Driven by `seethrough_meshes_enabled` (opt-in per
+    // `Material::see_through`), not a global flag.
+    exclude_seethrough: bool,
 ) -> Result<Option<RtAccelData>, String> {
-    // Only resident draw objects with real triangles take part. Track their
-    // indices into `draw_objects` so a per-frame update can re-read current
-    // transforms in the same order the BLAS were built.
+    // Only resident draw objects with real triangles take part. When the Layer 2
+    // see-through path is enabled, see-through glass meshes are excluded (they
+    // route through the transparent pass with their own per-pixel trace, so glass
+    // does not reflect glass and the trace never self-hits); otherwise (Layer 1)
+    // they stay in so opaque glass reflects + is reflected normally. Track the
+    // participating indices into `draw_objects` so a per-frame update re-reads
+    // transforms in BLAS-build order.
     let object_indices: Vec<usize> = draw_objects
         .iter()
         .enumerate()
-        .filter(|(_, o)| o.resident && o.index_count >= 3)
+        .filter(|(_, o)| {
+            o.resident && o.index_count >= 3 && !(exclude_seethrough && o.material.see_through != 0)
+        })
         .map(|(i, _)| i)
         .collect();
     // Instanced clusters that carry real geometry and at least one instance.
@@ -968,6 +1101,7 @@ pub(crate) fn build_rt_accel(
     check_build_status(&cmd, "acceleration-structure build")?;
 
     let cached_models = objects.iter().map(|o| o.model).collect();
+    let draw_blas_sigs = objects.iter().map(|o| GeomSig::of(o)).collect();
 
     Ok(Some(RtAccelData {
         blas,
@@ -975,6 +1109,7 @@ pub(crate) fn build_rt_accel(
         tlas,
         geom_table,
         object_indices,
+        draw_blas_sigs,
         cached_models,
         cluster_instances,
         cluster_geom,
@@ -1043,9 +1178,20 @@ impl RtAccelData {
         let tlas = device
             .newAccelerationStructureWithSize(sizes.accelerationStructureSize)
             .ok_or("failed to allocate TLAS")?;
-        // The instance count is unchanged across rebuilds, so the scratch sized
-        // at init already covers this build; reuse it (the prior frame's build
-        // completed before we got here, so it is free).
+        // Reuse the scratch sized at init (the prior frame's build completed
+        // before we got here, so it is free) -- but a topology refresh can change
+        // the instance count, and a larger TLAS needs more build scratch than the
+        // init sizing. Grow it when so. Replacing the handle is safe: this path
+        // is synchronous (commit + wait), and an in-flight command buffer that
+        // still references the old scratch retains it independently of this Vec.
+        if (sizes.buildScratchBufferSize as u64) > self.scratch.length() as u64 {
+            self.scratch = device
+                .newBufferWithLength_options(
+                    sizes.buildScratchBufferSize.max(1),
+                    MTLResourceOptions::StorageModePrivate,
+                )
+                .ok_or("failed to grow RT scratch buffer")?;
+        }
 
         let cmd = command_queue
             .commandBuffer()
@@ -1072,6 +1218,249 @@ impl RtAccelData {
         // Snapshot the transforms now baked into the TLAS so the next frame's
         // dirty check compares against what was actually built.
         self.cached_models = objects.iter().map(|o| o.model).collect();
+        Ok(())
+    }
+
+    // Whether the BVH has no draw-object and no cluster geometry left. After a
+    // topology refresh removes the last of both (every chunk streamed out, with
+    // no clusters), the caller drops the structure so a later add re-seeds it
+    // rather than building a degenerate zero-instance TLAS. (Skinned geometry is
+    // handled on its own per-frame path and never reaches the refresh, so it is
+    // not consulted here.)
+    pub(crate) fn is_empty(&self) -> bool {
+        self.object_indices.is_empty() && self.cluster_instances.is_empty()
+    }
+
+    // Incrementally bring the draw-object BLAS head in line with the current
+    // participating draw set: reuse every BLAS whose geometry is unchanged, build
+    // only the new / changed ones, retire the orphans. The cluster + skinned tails
+    // of `blas` are preserved verbatim. When `build_tlas` is set (the no-skinned
+    // path), also rebuilds the TLAS + geometry table over [refreshed draw head +
+    // clusters] in the same command buffer; when clear (the skinned path) only the
+    // head is refreshed and the caller's `rebuild_skinned` rebuilds the TLAS over
+    // the head + the fresh skinned tail. Used when streamed chunks are
+    // added/removed, props are cloned, or a material edit changes RT
+    // participation; a full rebuild of every BLAS would be too costly when most
+    // are unchanged.
+    //
+    // Fully asynchronous, mirroring `rebuild_skinned`: NO `waitUntilCompleted`.
+    // The new BLAS (and, when `build_tlas`, the TLAS) build on one command buffer
+    // committed on the shared queue ahead of this frame's reflection-trace command
+    // buffer, ordered by same-queue FIFO commit -- the same mechanism the skinned
+    // rebuild and the whole render graph rely on -- so the trace reads
+    // fully-built structures with no CPU stall. All outgoing / transient resources
+    // (orphan BLAS, the old TLAS + geometry table + instance buffer when
+    // `build_tlas`, and the build scratch) are parked in `retire_pool` rather than
+    // freed in place: `useResource` declares residency not lifetime, and the build
+    // keeps reading the scratch / instance buffer after this returns, so they must
+    // outlive the frames whose still-in-flight trace could reach them.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn refresh_static_topology(
+        &mut self,
+        device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+        command_queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
+        vertex_buffer: &ProtocolObject<dyn MTLBuffer>,
+        index_buffer: &ProtocolObject<dyn MTLBuffer>,
+        draw_objects: &[DrawObject],
+        albedo_count: usize,
+        normal_count: usize,
+        exclude_seethrough: bool,
+        build_tlas: bool,
+        frame_id: u64,
+    ) -> Result<(), String> {
+        // The current participating draw set, by the same predicate as the full
+        // build. (Clusters + skinned never change here, so they are not re-filtered.)
+        let new_indices: Vec<usize> = draw_objects
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| {
+                o.resident
+                    && o.index_count >= 3
+                    && !(exclude_seethrough && o.material.see_through != 0)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        let new_sigs: Vec<GeomSig> = new_indices
+            .iter()
+            .map(|&i| GeomSig::of(&draw_objects[i]))
+            .collect();
+
+        let plan = plan_topology_refresh(
+            &self.object_indices,
+            &self.draw_blas_sigs,
+            &new_indices,
+            &new_sigs,
+        );
+
+        let old_draw_count = self.object_indices.len();
+        // Clusters occupy `blas[old_draw_count..static_blas_count]`; skinned the
+        // tail past `static_blas_count`. Both are preserved across the refresh.
+        let cluster_count = self.static_blas_count - old_draw_count;
+
+        // Allocate (but do not yet build) a fresh BLAS for every slot the plan did
+        // not match to an existing one. Each is parked at its new-slot position so
+        // the assembly below can interleave reused and built BLAS in `new_indices`
+        // order.
+        let mut fresh: Vec<Option<Retained<ProtocolObject<dyn MTLAccelerationStructure>>>> =
+            (0..new_indices.len()).map(|_| None).collect();
+        let mut build_jobs: Vec<(usize, Retained<MTLPrimitiveAccelerationStructureDescriptor>)> =
+            Vec::new();
+        let mut max_scratch: usize = 0;
+        for (j, reuse) in plan.reuse.iter().enumerate() {
+            if reuse.is_some() {
+                continue;
+            }
+            let obj = &draw_objects[new_indices[j]];
+            let prim = prim_desc_for(
+                vertex_buffer,
+                index_buffer,
+                obj.base_vertex as usize,
+                obj.index_offset,
+                obj.index_count,
+                MTLIndexType::UInt32,
+            );
+            let sizes = device.accelerationStructureSizesWithDescriptor(&prim);
+            let acc = device
+                .newAccelerationStructureWithSize(sizes.accelerationStructureSize)
+                .ok_or("failed to allocate topology-refresh BLAS")?;
+            acc.setLabel(Some(&crate::metal::pipeline::ns_str("rt_topology_blas")));
+            max_scratch = max_scratch.max(sizes.buildScratchBufferSize);
+            fresh[j] = Some(acc);
+            build_jobs.push((j, prim));
+        }
+
+        // Assemble the new BLAS array: [refreshed draw head, clusters, skinned],
+        // pulling each draw slot from the reused old BLAS or its freshly-built one.
+        let old_blas = std::mem::take(&mut self.blas);
+        let mut new_blas: Vec<Retained<ProtocolObject<dyn MTLAccelerationStructure>>> =
+            Vec::with_capacity(new_indices.len() + (old_blas.len() - old_draw_count));
+        for (j, reuse) in plan.reuse.iter().enumerate() {
+            match reuse {
+                Some(k) => new_blas.push(old_blas[*k].clone()),
+                None => new_blas.push(fresh[j].clone().expect("fresh BLAS built above")),
+            }
+        }
+        // Clusters then skinned, verbatim.
+        for b in &old_blas[old_draw_count..] {
+            new_blas.push(b.clone());
+        }
+
+        // Outgoing structures / buffers to retire once the frames-in-flight fence
+        // clears them. Orphaned draw BLAS go here always: the current (not yet
+        // replaced) TLAS, which an in-flight trace may still be reading, references
+        // them, and `useResource` is residency not lifetime.
+        let mut retire_structures: Vec<Retained<ProtocolObject<dyn MTLAccelerationStructure>>> =
+            plan.retire.iter().map(|&k| old_blas[k].clone()).collect();
+        let mut retire_buffers: Vec<Retained<ProtocolObject<dyn MTLBuffer>>> = Vec::new();
+        drop(old_blas);
+
+        // When asked, rebuild the TLAS + geometry table over the refreshed draw
+        // head + the cluster instances (re-appended verbatim), with the current
+        // transforms. Skipped if the set is empty (the caller drops the BVH rather
+        // than build a degenerate zero-instance TLAS). The structures are
+        // allocated here and built on the command buffer below.
+        let do_tlas = build_tlas && !(new_indices.is_empty() && cluster_count == 0);
+        let tlas_build = if do_tlas {
+            let objects: Vec<&DrawObject> = new_indices.iter().map(|&i| &draw_objects[i]).collect();
+            let mut instance_descs: Vec<MTLAccelerationStructureInstanceDescriptor> = objects
+                .iter()
+                .enumerate()
+                .map(|(i, obj)| instance_desc(obj, i))
+                .collect();
+            let mut geom_entries: Vec<RtGeomEntry> = objects
+                .iter()
+                .map(|obj| geom_entry(obj, albedo_count, normal_count))
+                .collect();
+            instance_descs.extend_from_slice(&self.cluster_instances);
+            geom_entries.extend_from_slice(&self.cluster_geom);
+
+            let instance_buffer =
+                upload_buffer(device, &instance_descs, "RT instance descriptors")?;
+            let geom_table = upload_buffer(device, &geom_entries, "RT geometry table")?;
+            let tlas_desc = make_tlas_desc(&new_blas, &instance_buffer, instance_descs.len());
+            let tlas_sizes = device.accelerationStructureSizesWithDescriptor(&tlas_desc);
+            max_scratch = max_scratch.max(tlas_sizes.buildScratchBufferSize);
+            let tlas = device
+                .newAccelerationStructureWithSize(tlas_sizes.accelerationStructureSize)
+                .ok_or("failed to allocate TLAS")?;
+            tlas.setLabel(Some(&crate::metal::pipeline::ns_str("rt_tlas")));
+            let cached_models: Vec<[[f32; 4]; 4]> = objects.iter().map(|o| o.model).collect();
+            Some((tlas, tlas_desc, instance_buffer, geom_table, cached_models))
+        } else {
+            None
+        };
+
+        // Build everything on ONE command buffer, committed WITHOUT waiting. Each
+        // new BLAS in its own encoder (Metal does not order builds within an
+        // encoder, and they share the scratch); then, when building the TLAS, a
+        // final encoder that declares every referenced BLAS resident (all were
+        // built on this or an earlier command buffer, so the TLAS build needs the
+        // explicit `useResource`, exactly as the full build does).
+        if !build_jobs.is_empty() || tlas_build.is_some() {
+            let scratch = device
+                .newBufferWithLength_options(
+                    max_scratch.max(1),
+                    MTLResourceOptions::StorageModePrivate,
+                )
+                .ok_or("failed to allocate topology-refresh scratch buffer")?;
+            let cmd = command_queue
+                .commandBuffer()
+                .ok_or("failed to create topology-refresh command buffer")?;
+            cmd.setLabel(Some(&crate::metal::pipeline::ns_str("rt_topology_build")));
+            for (j, prim) in &build_jobs {
+                let acc = fresh[*j].as_ref().expect("fresh BLAS allocated above");
+                let enc = cmd
+                    .accelerationStructureCommandEncoder()
+                    .ok_or("failed to create acceleration-structure encoder")?;
+                enc.buildAccelerationStructure_descriptor_scratchBuffer_scratchBufferOffset(
+                    acc, prim, &scratch, 0,
+                );
+                enc.endEncoding();
+            }
+            if let Some((tlas, tlas_desc, _, _, _)) = &tlas_build {
+                let enc = cmd
+                    .accelerationStructureCommandEncoder()
+                    .ok_or("failed to create acceleration-structure encoder")?;
+                declare_blas_resident(&enc, &new_blas);
+                enc.buildAccelerationStructure_descriptor_scratchBuffer_scratchBufferOffset(
+                    tlas, tlas_desc, &scratch, 0,
+                );
+                enc.endEncoding();
+            }
+            attach_async_fault_logger(&cmd, "RT topology build");
+            cmd.commit();
+            // The async build keeps reading the scratch after this returns.
+            retire_buffers.push(scratch);
+        }
+
+        // Swap in the refreshed structures; park the outgoing ones for deferred
+        // free. The new BLAS stay owned by `self.blas` (the build references them
+        // by residency, not retention), so they must not be dropped here.
+        self.blas = new_blas;
+        self.static_blas_count = new_indices.len() + cluster_count;
+        self.object_indices = new_indices;
+        self.draw_blas_sigs = new_sigs;
+        if let Some((tlas, _, instance_buffer, geom_table, cached_models)) = tlas_build {
+            retire_structures.push(std::mem::replace(&mut self.tlas, tlas));
+            retire_buffers.push(std::mem::replace(&mut self.geom_table, geom_table));
+            retire_buffers.push(std::mem::replace(
+                &mut self.instance_buffer,
+                instance_buffer,
+            ));
+            // Snapshot the transforms baked into the new TLAS for the next dirty check.
+            self.cached_models = cached_models;
+        }
+        // When `build_tlas` is clear (the skinned path), `cached_models` is rebuilt
+        // by the caller's `rebuild_skinned` over the refreshed `object_indices`.
+        if !retire_structures.is_empty() || !retire_buffers.is_empty() {
+            self.retire_pool.push(
+                frame_id,
+                RetiredRt {
+                    structures: retire_structures,
+                    buffers: retire_buffers,
+                },
+            );
+        }
         Ok(())
     }
 
@@ -1483,6 +1872,76 @@ mod tests {
         // which is where the flat-normal fallback lives.
         let (_a, n) = pool_indices(0, 0, 4, 0);
         assert_eq!(n, 4);
+    }
+
+    // A distinct geometry signature keyed off `tag` (used as the index offset),
+    // so two slots with different tags never compare equal.
+    fn sig(tag: usize) -> GeomSig {
+        GeomSig {
+            base_vertex: tag as i32,
+            vertex_offset: tag * 100,
+            index_offset: tag,
+            index_count: 3,
+        }
+    }
+
+    #[test]
+    fn topology_plan_reuses_an_unchanged_set() {
+        let old_i = [2usize, 5, 7];
+        let old_s = [sig(2), sig(5), sig(7)];
+        let plan = plan_topology_refresh(&old_i, &old_s, &old_i, &old_s);
+        assert_eq!(plan.reuse, vec![Some(0), Some(1), Some(2)]);
+        assert!(plan.retire.is_empty());
+    }
+
+    #[test]
+    fn topology_plan_builds_only_the_added_slot() {
+        let old_i = [2usize, 5];
+        let old_s = [sig(2), sig(5)];
+        let new_i = [2usize, 5, 9];
+        let new_s = [sig(2), sig(5), sig(9)];
+        let plan = plan_topology_refresh(&old_i, &old_s, &new_i, &new_s);
+        // The two existing slots reuse; the new one (9) builds fresh.
+        assert_eq!(plan.reuse, vec![Some(0), Some(1), None]);
+        assert!(plan.retire.is_empty());
+    }
+
+    #[test]
+    fn topology_plan_retires_a_removed_slot() {
+        let old_i = [2usize, 5, 7];
+        let old_s = [sig(2), sig(5), sig(7)];
+        let new_i = [2usize, 7];
+        let new_s = [sig(2), sig(7)];
+        let plan = plan_topology_refresh(&old_i, &old_s, &new_i, &new_s);
+        assert_eq!(plan.reuse, vec![Some(0), Some(2)]);
+        assert_eq!(plan.retire, vec![1]); // slot 5's old BLAS is orphaned
+    }
+
+    #[test]
+    fn topology_plan_rebuilds_a_recycled_slot_whose_geometry_moved() {
+        // Same draw index, different geometry signature: a chunk slot recycled for
+        // a different chunk. The old BLAS must NOT be reused; it is retired and a
+        // fresh one is built.
+        let old_i = [5usize];
+        let old_s = [sig(5)];
+        let new_i = [5usize];
+        let new_s = [sig(8)]; // moved geometry under the same draw index
+        let plan = plan_topology_refresh(&old_i, &old_s, &new_i, &new_s);
+        assert_eq!(plan.reuse, vec![None]);
+        assert_eq!(plan.retire, vec![0]);
+    }
+
+    #[test]
+    fn topology_plan_reuses_across_reorder_by_index() {
+        // The participating set is the same but its order changed; each slot still
+        // reuses its BLAS by draw index (the reuse points at the old position).
+        let old_i = [2usize, 5];
+        let old_s = [sig(2), sig(5)];
+        let new_i = [5usize, 2];
+        let new_s = [sig(5), sig(2)];
+        let plan = plan_topology_refresh(&old_i, &old_s, &new_i, &new_s);
+        assert_eq!(plan.reuse, vec![Some(1), Some(0)]);
+        assert!(plan.retire.is_empty());
     }
 
     #[test]

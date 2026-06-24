@@ -60,6 +60,9 @@ struct WaterParams {
     float    prefilter_mip_count;
     // Wave coefficients (16-byte aligned).
     WaterWave waves[MAX_WATER_WAVES];
+    // Planar reflection control: x = strength (>0.5 selects the planar
+    // reflection over the probe/sky cube), y = wave-normal distortion scale.
+    float4   planar;
 };
 
 struct WaterVtxIn {
@@ -157,13 +160,113 @@ static float view_linear_depth(float ndc_x, float ndc_y, float depth01,
     return distance(world.xyz, v.camera_pos.xyz);
 }
 
+// Reflection-probe set, bound at buffer(7) + texture(3..3+MAX_PROBES). Mirrors
+// `ProbeSet` / `ProbeUniforms` in default.metal / rt_reflections.metal (and
+// metal::uniforms). Lets water sample the LOCAL box-projected scene capture (a
+// pond reflects nearby geometry, not just the sky) - the same source the
+// forward IBL specular term and the RT-miss fallback use. `count` is 0 in
+// worlds with no baked probe, where the surface keeps the sky prefilter.
+constant constexpr uint  MAX_PROBES         = 8u;
+constant constexpr float PROBE_BLEND_MARGIN = 0.2;
+
+struct ProbeUniforms {
+    float4 box_min;   // xyz = influence-box min, w = enabled
+    float4 box_max;   // xyz = influence-box max
+    float4 probe_pos; // xyz = capture position
+};
+
+struct ProbeSet {
+    uint count;
+    // Three SCALAR uints, NOT a uint3 (which would be 16-byte aligned and push
+    // `probes` to offset 32 / struct 416), so `probes` stays at offset 16 and
+    // the struct is 400 bytes, matching the CPU-side metal::uniforms::ProbeSet.
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+    ProbeUniforms probes[MAX_PROBES];
+};
+static_assert(sizeof(ProbeSet) == 400,
+              "ProbeSet must be 400 bytes to match the CPU-side metal::uniforms::ProbeSet");
+
+// Box-parallax sample of one probe cube: intersect the world-space reflection
+// ray with the probe's influence box and re-anchor the sample at that hit
+// relative to the capture point, so a static cube tracks the camera. Mirrors
+// default.metal / rt_reflections.metal `sample_probe_radiance`.
+static float3 sample_probe_radiance(
+    texturecube<float>      probe_cube,
+    constant ProbeUniforms &probe,
+    float3                  world_pos,
+    float3                  R,
+    float                   lod,
+    sampler                 cube_sampler)
+{
+    float3 sample_dir = R;
+    if (probe.box_min.w > 0.5) {
+        float3 inv_r = 1.0 / R;
+        float3 t_max = (probe.box_max.xyz - world_pos) * inv_r;
+        float3 t_min = (probe.box_min.xyz - world_pos) * inv_r;
+        float3 t_far = max(t_max, t_min);
+        float dist = min(min(t_far.x, t_far.y), t_far.z);
+        if (dist > 0.0) {
+            float3 hit = world_pos + R * dist;
+            sample_dir = hit - probe.probe_pos.xyz;
+        }
+    }
+    return probe_cube.sample(cube_sampler, sample_dir, bias(lod)).rgb;
+}
+
+// Reflection-probe radiance for `world_pos` along world-space ray `R`. Weights
+// every probe whose influence box covers `world_pos` (partition of unity) and
+// returns the weight-normalised sum of their box-projected samples; falls back
+// to the nearest probe by capture distance where no box covers. Mirrors
+// default.metal / rt_reflections.metal `probe_set_specular`.
+static float3 probe_set_specular(
+    constant ProbeSet                    &set,
+    array<texturecube<float>, MAX_PROBES> probes,
+    float3                                world_pos,
+    float3                                R,
+    float                                 lod,
+    sampler                               cube_sampler)
+{
+    float3 acc = float3(0.0);
+    float wsum = 0.0;
+    float near_d = 1e30;
+    uint near_i = 0u;
+    for (uint i = 0u; i < set.count; i++) {
+        float3 c = 0.5 * (set.probes[i].box_min.xyz + set.probes[i].box_max.xyz);
+        float3 he = 0.5 * (set.probes[i].box_max.xyz - set.probes[i].box_min.xyz);
+        float3 q = abs(world_pos - c) - he;
+        float sd = -(length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0));
+        float margin = max(PROBE_BLEND_MARGIN * min(he.x, min(he.y, he.z)), 1e-4);
+        float w = smoothstep(-margin, margin, sd);
+        if (w > 0.0) {
+            acc += w * sample_probe_radiance(
+                           probes[i], set.probes[i], world_pos, R, lod, cube_sampler);
+            wsum += w;
+        }
+        float d = distance(world_pos, set.probes[i].probe_pos.xyz);
+        if (d < near_d) {
+            near_d = d;
+            near_i = i;
+        }
+    }
+    if (wsum > 0.0) {
+        return acc / wsum;
+    }
+    return sample_probe_radiance(
+        probes[near_i], set.probes[near_i], world_pos, R, lod, cube_sampler);
+}
+
 fragment float4 water_fragment(
     WaterVtxOut                       in           [[stage_in]],
     constant WaterView               &v            [[buffer(5)]],
     constant WaterParams             &p            [[buffer(6)]],
+    constant ProbeSet                &probe_set    [[buffer(7)]],
     texture2d<float, access::sample>  scene_color  [[texture(0)]],
     depth2d<float>                    scene_depth  [[texture(1)]],
     texturecube<float, access::sample> prefilter   [[texture(2)]],
+    array<texturecube<float>, MAX_PROBES> probes   [[texture(3)]],
+    texture2d<float, access::sample>  planar_reflection [[texture(11)]],
     sampler                            scene_sampler [[sampler(0)]],
     sampler                            cube_sampler  [[sampler(1)]])
 {
@@ -218,15 +321,23 @@ fragment float4 water_fragment(
     float foam = foam_t * foam_t * p.foam_intensity;
     absorbed = mix(absorbed, float3(1.0), foam);
 
-    // Reflection: sample the IBL prefilter cube at the reflected view dir.
-    // When no environment map is bound, prefilter_mip_count is 0 and we
-    // fall back to a vertical sky-tint gradient so the surface still has
-    // some reflective signal instead of going dark at the horizon.
+    // Reflection along the reflected view dir. When the planar reflection is
+    // active (`planar.x > 0.5`: the scene re-rendered mirrored across the water
+    // plane) sample it projectively at this fragment's screen UV, perturbed by
+    // the wave normal's XZ for ripple distortion - a sharp, scene-correct
+    // reflection. Otherwise fall back to the local box-projected probe set (the
+    // scene capture), else the IBL prefilter cube, else - with no environment map
+    // - a vertical sky-tint gradient so the surface still has a reflective signal.
     float3 r = reflect(-view_dir, normal);
+    float mip = clamp(p.roughness, 0.0, 1.0) * max(p.prefilter_mip_count - 1.0, 0.0);
     float3 reflected;
-    if (p.prefilter_mip_count > 0.5) {
-        float mip = clamp(p.roughness, 0.0, 1.0)
-                  * (p.prefilter_mip_count - 1.0);
+    if (p.planar.x > 0.5) {
+        float2 planar_uv = clamp(frag_uv + normal.xz * p.planar.y,
+                                 float2(0.001), float2(0.999));
+        reflected = planar_reflection.sample(scene_sampler, planar_uv).rgb;
+    } else if (probe_set.count > 0u) {
+        reflected = probe_set_specular(probe_set, probes, in.world_pos, r, mip, cube_sampler);
+    } else if (p.prefilter_mip_count > 0.5) {
         reflected = prefilter.sample(cube_sampler, r, level(mip)).rgb;
     } else {
         // Hand-tuned sky fallback: bluer overhead, paler at the horizon.

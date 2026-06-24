@@ -70,4 +70,30 @@ mod builtin_registry_tests {
         }
         assert!(checked > 0, "no built-in shaders found under {dir}");
     }
+
+    #[test]
+    fn default_metal_reflection_cut_matches_canonical() {
+        // default.metal is compiled offline and baked, so it keeps its own
+        // `constant float REFL_RESOLVE_CUT` instead of the runtime-injected
+        // shared constant the resolve shaders use. Lock it to the canonical
+        // value so the forward double-count fade can never drift from the
+        // SSR / RT resolve gates. Expects a clean `= <value>;` declaration.
+        let src = builtin_shader_source("default.metal").expect("default.metal builtin");
+        let decl = src
+            .lines()
+            .find(|l| l.contains("constant float REFL_RESOLVE_CUT"))
+            .expect("REFL_RESOLVE_CUT declaration in default.metal");
+        let value: f32 = decl
+            .split(';')
+            .next()
+            .and_then(|head| head.split('=').nth(1))
+            .map(str::trim)
+            .and_then(|s| s.parse().ok())
+            .expect("parse REFL_RESOLVE_CUT value from default.metal");
+        assert_eq!(
+            value,
+            crate::gfx::ssr::REFLECTION_ROUGHNESS_CUT,
+            "default.metal REFL_RESOLVE_CUT must equal REFLECTION_ROUGHNESS_CUT"
+        );
+    }
 }

@@ -92,6 +92,13 @@ SamplerState smp        : register(s0); // linear-clamp (scene / gbuffer / rough
 SamplerState cube_smp   : register(s1); // linear-clamp cube mip-linear (prefilter)
 SamplerState repeat_smp : register(s2); // linear-repeat (hit albedo / normal map)
 
+// The probe cube array, its sampler, and the `ProbeBlock` cbuffer are declared in
+// probe_common.hlsl, concatenated ahead of this shader (no #include handler on DX).
+// This shader already uses t7 (prefilter) and s2 (repeat_smp), so the probe cubes
+// and their sampler are remapped to t10 / s3 (b4 is free) via the
+// PROBE_CUBES_REGISTER / PROBE_SAMPLER_REGISTER #defines the host prepends. On a
+// missed ray they let the trace fall back to the local probe instead of the sky.
+
 struct VsOut
 {
     float4 sv_pos : SV_POSITION;
@@ -109,7 +116,9 @@ VsOut rt_fullscreen_vert(uint vid : SV_VertexID)
     return o;
 }
 
-static const float RT_ROUGH_CUT = 0.6;  // surfaces rougher than this get no reflection
+// Surfaces rougher than `REFLECTION_ROUGHNESS_CUT` get no reflection. The cut is the
+// shared `static const` injected by the host (pipeline.rs::reflection_cut_prelude),
+// so it matches the SSR resolve gate + the composite blur ramp exactly.
 static const float RT_F0        = 0.04; // dielectric base reflectance for the Fresnel
 
 // Skinned objects flag bit 31 of `normal_index`; the trace then fetches the hit
@@ -143,6 +152,7 @@ struct RtSetup
 {
     bool   reflects;  // false -> sky / too rough, write base unchanged
     float3 base;
+    float3 world_pos; // un-nudged world surface point (probe box-projection)
     float3 origin;    // ray origin (surface point nudged along the normal)
     float3 dir;       // world-space reflection direction
     float  weight;    // saturate(fresnel * gloss * intensity)
@@ -156,6 +166,7 @@ RtSetup rt_setup(float2 uv)
     RtSetup s;
     s.reflects = false;
     s.base = scene_tex.Sample(smp, uv).rgb;
+    s.world_pos = 0.0.xxx;
     s.origin = 0.0.xxx;
     s.dir = 0.0.xxx;
     s.weight = 0.0;
@@ -165,7 +176,7 @@ RtSetup rt_setup(float2 uv)
     float depth = g.a;
     s.roughness = rough_tex.Sample(smp, uv).r;
     if (depth <= 0.0) return s;                 // background / sky
-    float gloss = saturate((RT_ROUGH_CUT - s.roughness) / RT_ROUGH_CUT);
+    float gloss = saturate((REFLECTION_ROUGHNESS_CUT - s.roughness) / REFLECTION_ROUGHNESS_CUT);
     if (gloss <= 0.0) return s;
 
     float3 Nv = normalize(g.xyz);
@@ -174,6 +185,7 @@ RtSetup rt_setup(float2 uv)
     float3 Nw = normalize(mul(inv_view, float4(Nv, 0.0)).xyz);
     float3 V  = normalize(cam_pos.xyz - Pw);
 
+    s.world_pos = Pw;
     s.origin = Pw + Nw * 0.01;                  // nudge off the surface
     s.dir    = reflect(-V, Nw);
     s.ibl    = prefilter_mip_count > 0.5;
@@ -319,7 +331,20 @@ RtTrace rt_trace(RtSetup s)
     else
     {
         float lod = s.roughness * s.max_mip;
-        t.env = s.ibl ? prefilter.SampleLevel(cube_smp, s.dir, lod).rgb : s.base;
+        if (!s.ibl)
+        {
+            t.env = s.base;
+        }
+        else if (probes.count > 0u)
+        {
+            // Missed ray reflects the local box-projected probe, not the foreign
+            // sky cube, matching the forward IBL specular term and SSR.
+            t.env = probe_set_specular(probes, s.world_pos, s.dir, lod);
+        }
+        else
+        {
+            t.env = prefilter.SampleLevel(cube_smp, s.dir, lod).rgb;
+        }
     }
     return t;
 }
@@ -347,10 +372,12 @@ float3 rt_shade_hit(RtSetup s, RtTrace t, float3 N, float3 albedo)
 float4 rt_reflections_frag(VsOut p) : SV_TARGET
 {
     RtSetup s = rt_setup(p.uv);
-    if (!s.reflects) return float4(s.base, 1.0);
+    // Reflected radiance (.rgb) + composite weight (.a); the reflection composite
+    // blurs + blends it over the scene. A non-reflecting pixel writes weight 0.
+    if (!s.reflects) return float4(s.base, 0.0);
     RtTrace t = rt_trace(s);
     float3 reflected = t.hit ? rt_shade_hit(s, t, t.normal, t.tint) : t.env;
-    return float4(lerp(s.base, reflected, s.weight), 1.0);
+    return float4(reflected, s.weight);
 }
 
 // Textured variant: samples the hit's albedo from the bindless pool * tint and
@@ -358,7 +385,7 @@ float4 rt_reflections_frag(VsOut p) : SV_TARGET
 float4 rt_reflections_frag_textured(VsOut p) : SV_TARGET
 {
     RtSetup s = rt_setup(p.uv);
-    if (!s.reflects) return float4(s.base, 1.0);
+    if (!s.reflects) return float4(s.base, 0.0);
     RtTrace t = rt_trace(s);
 
     float3 reflected;
@@ -397,5 +424,5 @@ float4 rt_reflections_frag_textured(VsOut p) : SV_TARGET
     {
         reflected = t.env;
     }
-    return float4(lerp(s.base, reflected, s.weight), 1.0);
+    return float4(reflected, s.weight);
 }

@@ -15,6 +15,7 @@
 pub(in crate::directx) mod bloom;
 pub(in crate::directx) mod fullscreen;
 pub(in crate::directx) mod gbuffer;
+pub(in crate::directx) mod reflection_composite;
 pub(in crate::directx) mod rt_reflections;
 pub(in crate::directx) mod ssao;
 pub(in crate::directx) mod ssgi;

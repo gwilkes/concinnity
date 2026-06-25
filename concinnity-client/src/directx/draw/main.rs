@@ -35,7 +35,7 @@ impl DxContext {
     // they render through the legacy pipeline. Rebuilt every frame so
     // `update_model` / `update_visibility` edits are reflected; a no-op when
     // the bindless pass is inactive.
-    pub(super) fn build_object_buffer(&self, frame_idx: usize) {
+    pub(in crate::directx) fn build_object_buffer(&self, frame_idx: usize) {
         use crate::gfx::render_types::{GpuObjectData, pack_object_record, pack_skinned_record};
         let Some(&ptr) = self.cull.object_buffer_ptrs.get(frame_idx) else {
             return;
@@ -300,6 +300,14 @@ impl DxContext {
                 // [9] descriptor table: blurred SSAO occlusion (or 1x1 white
                 // fallback when SSAO is disabled).
                 cmd.SetGraphicsRootDescriptorTable(9, self.ssao_ao_srv_gpu());
+                // [10] reflection-probe cube array + [11] the live ProbeSet (this
+                // frame's boxes + count). The forward shader box-projects + blends
+                // them for the specular reflection; count 0 keeps the sky.
+                cmd.SetGraphicsRootDescriptorTable(10, self.probe_cube_table_gpu());
+                cmd.SetGraphicsRootConstantBufferView(
+                    11,
+                    self.probe_set_cbvs[frame_idx].GetGPUVirtualAddress(),
+                );
                 // ExecuteIndirect #1: the static + instance prefix
                 // `[0, skinned_record_base())` against the static VB/IB (bound
                 // above). The skinned tail is drawn by a second ExecuteIndirect
@@ -526,6 +534,11 @@ impl DxContext {
                     cmd.SetGraphicsRootDescriptorTable(7, self.descriptors.linear_sampler_gpu);
                     cmd.SetGraphicsRootShaderResourceView(8, object_gva);
                     cmd.SetGraphicsRootDescriptorTable(9, self.ssao_ao_srv_gpu());
+                    cmd.SetGraphicsRootDescriptorTable(10, self.probe_cube_table_gpu());
+                    cmd.SetGraphicsRootConstantBufferView(
+                        11,
+                        self.probe_set_cbvs[frame_idx].GetGPUVirtualAddress(),
+                    );
                     // ExecuteIndirect #2: skinned tail
                     // `[skinned_record_base(), cull_count())`, byte-offset into the
                     // same indirect command buffer.
@@ -742,6 +755,11 @@ impl DxContext {
                 cmd.SetGraphicsRootDescriptorTable(7, self.descriptors.linear_sampler_gpu);
                 cmd.SetGraphicsRootShaderResourceView(8, object_gva);
                 cmd.SetGraphicsRootDescriptorTable(9, self.ssao_ao_srv_gpu());
+                cmd.SetGraphicsRootDescriptorTable(10, self.probe_cube_table_gpu());
+                cmd.SetGraphicsRootConstantBufferView(
+                    11,
+                    self.probe_set_cbvs[frame_idx].GetGPUVirtualAddress(),
+                );
                 // ExecuteIndirect #1: static + instance prefix against the static
                 // VB/IB (bound above).
                 cmd.ExecuteIndirect(

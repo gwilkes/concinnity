@@ -58,6 +58,18 @@ pub(in crate::directx) fn shader_source(
     std::borrow::Cow::Borrowed(embedded)
 }
 
+// Generated HLSL prelude declaring the shared reflection roughness cut as a
+// compile-time constant, single-sourced from `concinnity_core::gfx::ssr`. Prepended
+// to the SSR / RT / reflection-composite shaders so the resolve gates and the
+// composite blur ramp cannot drift from one another (mirrors Metal's
+// `reflection_constants_prelude`). Compile-folds, so zero runtime cost.
+pub(in crate::directx) fn reflection_cut_prelude() -> String {
+    format!(
+        "static const float REFLECTION_ROUGHNESS_CUT = {:?};\n",
+        crate::gfx::ssr::REFLECTION_ROUGHNESS_CUT
+    )
+}
+
 pub(super) fn compile_hlsl(source: &str, entry: &str, target: &str) -> Result<Vec<u8>, String> {
     let src_c = std::ffi::CString::new(source).map_err(|e| format!("hlsl src cstr: {e}"))?;
     let entry_c = std::ffi::CString::new(entry).map_err(|e| format!("hlsl entry cstr: {e}"))?;

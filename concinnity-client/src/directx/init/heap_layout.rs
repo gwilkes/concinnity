@@ -70,6 +70,13 @@ pub(in crate::directx) struct SrvHeapParams {
     // 1 when hardware ray-traced reflections are enabled (the RT output target's
     // SRV), else 0.
     pub rt_output_srv_extra: usize,
+    // 2 (composited output + reduced-res blur) when the reflection composite is
+    // built (SSR resolve or RT reflections authored), else 0.
+    pub refl_composite_srv_extra: usize,
+    // One resolve SRV per distinct planar reflector plane (0..MAX_PLANAR_PLANES),
+    // reserved when the world has glass panes assigned to a planar slot, else 0.
+    // The glass pass binds these per pane.
+    pub planar_resolve_srv_extra: usize,
     // Flat deduplicated bindless pool sizes: one SRV per distinct albedo-pool
     // texture (incl. emissive / ORM maps) followed by one per distinct normal
     // map. The bindless main pass and the RT hit shader address this region by a
@@ -110,13 +117,24 @@ pub(in crate::directx) struct SrvHeapLayout {
     pub ssgi_gi_srv_slot: usize,
     pub gbuffer_srv_base_slot: usize,
     pub rt_output_srv_slot: usize,
+    // Reflection-composite SRVs: [0] composited output, [1] reduced-res blur.
+    pub refl_composite_srv_base_slot: usize,
+    // Planar reflection resolve SRVs (one per distinct reflector plane).
+    pub planar_resolve_srv_base_slot: usize,
     pub flat_pool_base_slot: usize,
+    // Contiguous MAX_PROBES-slot block of reflection-probe cube SRVs (the bindless
+    // main shader's `TextureCube probe_cubes[MAX_PROBES]` table). Filled with the sky
+    // prefilter cube at init; a baked probe overwrites its slot.
+    pub probe_cube_base_slot: usize,
     pub srv_slots: usize,
 }
 
 // The three global SRVs (shadow array, IBL irradiance, IBL prefilter) occupy
 // slots [0, 3); the first per-world block starts here.
 const GLOBAL_SRV_COUNT: usize = 3;
+
+// Reflection-probe cube array length (must equal `probe_uniforms::MAX_PROBES`).
+const PROBE_CUBE_COUNT: usize = crate::directx::probe_uniforms::MAX_PROBES;
 
 impl SrvHeapLayout {
     pub(in crate::directx) fn compute(p: &SrvHeapParams) -> Self {
@@ -157,11 +175,21 @@ impl SrvHeapLayout {
         let gbuffer_srv_base_slot = ssgi_gi_srv_slot + p.ssgi_srv_extra;
         // RT-reflection output SRV: one slot at the heap tail when RT is on.
         let rt_output_srv_slot = gbuffer_srv_base_slot + p.gbuffer_srv_extra;
+        // Reflection-composite SRVs (composited output + reduced-res blur): 2 slots
+        // when SSR resolve or RT is authored.
+        let refl_composite_srv_base_slot = rt_output_srv_slot + p.rt_output_srv_extra;
+        // Planar reflection resolve SRVs: one per distinct reflector plane, bound
+        // per pane by the glass pass.
+        let planar_resolve_srv_base_slot =
+            refl_composite_srv_base_slot + p.refl_composite_srv_extra;
         // Flat deduplicated bindless pool: [albedo SRVs..] ++ [normal SRVs..].
         // The bindless main pass and the RT hit shader bind their unbounded pool
         // table base here and index it by a flat slot.
-        let flat_pool_base_slot = rt_output_srv_slot + p.rt_output_srv_extra;
-        let srv_slots = flat_pool_base_slot + p.albedo_count + p.normal_count;
+        let flat_pool_base_slot = planar_resolve_srv_base_slot + p.planar_resolve_srv_extra;
+        // Reflection-probe cube array at the heap tail (MAX_PROBES contiguous cube
+        // SRVs); a single descriptor table covers the whole block.
+        let probe_cube_base_slot = flat_pool_base_slot + p.albedo_count + p.normal_count;
+        let srv_slots = probe_cube_base_slot + PROBE_CUBE_COUNT;
         Self {
             object_base_slot,
             hdr_srv_slot,
@@ -188,7 +216,10 @@ impl SrvHeapLayout {
             ssgi_gi_srv_slot,
             gbuffer_srv_base_slot,
             rt_output_srv_slot,
+            refl_composite_srv_base_slot,
+            planar_resolve_srv_base_slot,
             flat_pool_base_slot,
+            probe_cube_base_slot,
             srv_slots,
         }
     }
@@ -209,7 +240,7 @@ mod tests {
     // with the running total and fails the assert.
     fn assert_gap_free(p: &SrvHeapParams) {
         let l = SrvHeapLayout::compute(p);
-        let blocks: [(usize, usize); 26] = [
+        let blocks: [(usize, usize); 29] = [
             (
                 l.object_base_slot,
                 p.n_objects * 2 + p.n_clusters * 2 + p.n_atlases.max(1),
@@ -238,7 +269,10 @@ mod tests {
             (l.ssgi_gi_srv_slot, p.ssgi_srv_extra),
             (l.gbuffer_srv_base_slot, p.gbuffer_srv_extra),
             (l.rt_output_srv_slot, p.rt_output_srv_extra),
+            (l.refl_composite_srv_base_slot, p.refl_composite_srv_extra),
+            (l.planar_resolve_srv_base_slot, p.planar_resolve_srv_extra),
             (l.flat_pool_base_slot, p.albedo_count + p.normal_count),
+            (l.probe_cube_base_slot, PROBE_CUBE_COUNT),
         ];
         let mut expected_base = GLOBAL_SRV_COUNT;
         for (i, (base, count)) in blocks.iter().enumerate() {
@@ -269,6 +303,8 @@ mod tests {
             ssgi_srv_extra: 1,
             gbuffer_srv_extra: 3,
             rt_output_srv_extra: 1,
+            refl_composite_srv_extra: 2,
+            planar_resolve_srv_extra: 2,
             albedo_count: 9,
             normal_count: 4,
         });
@@ -287,6 +323,8 @@ mod tests {
             ssgi_srv_extra: 0,
             gbuffer_srv_extra: 0,
             rt_output_srv_extra: 0,
+            refl_composite_srv_extra: 0,
+            planar_resolve_srv_extra: 0,
             albedo_count: 1,
             normal_count: 1,
         });
@@ -305,6 +343,8 @@ mod tests {
             ssgi_srv_extra: 0,
             gbuffer_srv_extra: 3,
             rt_output_srv_extra: 1,
+            refl_composite_srv_extra: 2,
+            planar_resolve_srv_extra: 1,
             albedo_count: 50,
             normal_count: 12,
         });
@@ -325,6 +365,8 @@ mod tests {
             ssgi_srv_extra: 0,
             gbuffer_srv_extra: 0,
             rt_output_srv_extra: 0,
+            refl_composite_srv_extra: 0,
+            planar_resolve_srv_extra: 0,
             albedo_count: 1,
             normal_count: 1,
         });

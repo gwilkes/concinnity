@@ -238,6 +238,12 @@ pub(super) fn init_backend(
     // Takes precedence over `ssr_settings` where RT is live (the graph builder
     // picks RtReflections over SsrResolve); SSR stays the cross-backend fallback.
     rt_reflection_settings: Option<crate::gfx::rt_reflections::RtReflectionSettings>,
+    // Per-axis divisor for the roughness-aware reflection blur target, resolved
+    // from `PostProcessConfig.reflection_blur_resolution`. Honoured by the
+    // DirectX backend (sizes its reflection-composite blur target at render /
+    // this); Metal uses a fixed half-resolution blur and Vulkan has no
+    // composite, so both ignore it (dropped below on those backends).
+    reflection_blur_scale: u32,
     // Projected decals resolved from the world's `Decal` components.
     // Honoured by the Metal, DirectX, and Vulkan backends.
     decals: Vec<crate::gfx::decal::DecalRecord>,
@@ -332,6 +338,12 @@ pub(super) fn init_backend(
     #[cfg(backend_metal)]
     let _ = shadow_bytes;
 
+    // The reflection-blur divisor only feeds the DirectX reflection composite;
+    // Metal hardcodes its blur scale and Vulkan has no composite yet, so drop it
+    // on those backends to avoid the unused-binding lint.
+    #[cfg(not(backend_dx))]
+    let _ = reflection_blur_scale;
+
     #[cfg(backend_dx)]
     {
         use crate::directx::DxContext;
@@ -368,6 +380,7 @@ pub(super) fn init_backend(
             ssr_settings,
             ssgi_settings,
             rt_reflection_settings,
+            reflection_blur_scale,
             decals,
             particles,
             fog_settings,

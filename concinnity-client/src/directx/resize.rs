@@ -341,6 +341,14 @@ impl DxContext {
             rt.resize_to(&self.device, render_w, render_h, srv_cpu_base, srv_gpu_base)?;
         }
 
+        // 7-refl) Reflection composite: the full-res composited output + the
+        //     reduced-res roughness blur. Re-uses its pre-reserved RTV/SRV slots,
+        //     so the live scene binding (which points at the output SRV slot) stays
+        //     valid after the in-place descriptor rewrite.
+        if let Some(rc) = self.reflection_composite.as_mut() {
+            rc.resize_to(&self.device, render_w, render_h, srv_cpu_base, srv_gpu_base)?;
+        }
+
         // 7a) Raymarch: recreate the `hdr_resolve_copy` scene snapshot at
         //     the new dims and rewrite its SRV descriptor in place. The
         //     descriptor slot itself doesn't move, so the live raymarch
@@ -367,6 +375,13 @@ impl DxContext {
         //     binds is the main-depth slot, rewritten by the decal path.
         if let Some(glass) = self.glass.as_mut() {
             glass.resize_to(&self.device, render_w, render_h)?;
+        }
+
+        // 7d) Planar reflections: recreate the shared mirror colour + depth + the
+        //     per-plane resolves at the new render dims and rewrite their RTV / DSV /
+        //     SRVs in place, so the glass pass's per-pane resolve bindings stay valid.
+        if let Some(planar) = self.planar_reflection.as_mut() {
+            planar.resize_to(&self.device, render_w, render_h)?;
         }
 
         // 8) Commit the new dimensions. `render_*` drives the scene-pass

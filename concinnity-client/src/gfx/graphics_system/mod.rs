@@ -485,6 +485,7 @@ pub(super) fn derive_quality_settings(
         ssr: cfg.ssr_settings(),
         rt_reflections: cfg.rt_reflection_settings(),
         ssgi: cfg.ssgi_settings(),
+        reflection_blur_scale: cfg.reflection_blur_divisor(),
         auto_exposure: cfg.auto_exposure_settings(),
         auto_exposure_bias_ev: cfg.exposure_ev,
     }

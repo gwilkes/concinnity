@@ -145,6 +145,7 @@ impl GraphicsSystem {
         let ssao_settings = self.post_config.ssao_settings();
         let ssr_settings = self.post_config.ssr_settings();
         let rt_reflection_settings = self.post_config.rt_reflection_settings();
+        let reflection_blur_scale = self.post_config.reflection_blur_divisor();
         let ssgi_settings = self.post_config.ssgi_settings();
         // The authored `exposure_ev` becomes an additive bias on the adapted EV
         // when auto-exposure is on; otherwise the static path bakes it into
@@ -1594,6 +1595,7 @@ impl GraphicsSystem {
             ssr_settings,
             ssgi_settings,
             rt_reflection_settings,
+            reflection_blur_scale,
             decal_records,
             particle_records,
             fog_settings,

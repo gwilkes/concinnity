@@ -282,7 +282,7 @@ impl DxContext {
     // inactive. The per-object `(index_offset, index_count)` is the active LOD
     // slice picked by camera distance, so the bindless main pass renders the
     // chosen LOD with no shader-side change. Mirrors `metal/cull.rs`.
-    fn build_draw_args_buffer(&self, frame_idx: usize, cam_pos: [f32; 3]) {
+    pub(in crate::directx) fn build_draw_args_buffer(&self, frame_idx: usize, cam_pos: [f32; 3]) {
         use crate::gfx::render_types::{GpuDrawArgs, draw_args_flags};
         let Some(&ptr) = self.cull.draw_args_buffer_ptrs.get(frame_idx) else {
             return;
@@ -506,6 +506,88 @@ impl DxContext {
         }
     }
 
+    // Cull one reflection-probe cube face into the reserved capture slot
+    // (`directx/probe.rs::bake_ring_slot` = `FRAMES`). Mirrors `encode_cull` but
+    // (a) indexes the reserved ring slot the frame never touches, (b) forces Hi-Z
+    // occlusion OFF (the only pyramid is in the main camera's screen space, useless
+    // for a cube face), and (c) does NOT rebuild the draw-args buffer -- the bake
+    // builds object + draw-args into the reserved slot once at capture start (they
+    // are frustum-independent) and re-culls per face here. `frustum` is the face's
+    // view frustum and `cam_pos` the probe capture point. The object count is the
+    // same `cull_count()` the frame uses; the bake renders only the static + instance
+    // prefix, so culled skinned records are written but never executed.
+    pub(in crate::directx) fn encode_probe_cull(
+        &self,
+        cmd: &ID3D12GraphicsCommandList,
+        slot: usize,
+        frustum: &crate::gfx::frustum::Frustum,
+        cam_pos: [f32; 3],
+    ) {
+        let cull_pso = self
+            .cull
+            .cull_pso
+            .as_ref()
+            .expect("encode_probe_cull: cull_pso missing");
+        let cull_root = self
+            .cull
+            .cull_root_sig
+            .as_ref()
+            .expect("encode_probe_cull: cull_root_sig missing");
+        let indirect = &self.cull.indirect_cmd_buffers[slot];
+        let object_gva = unsafe { self.cull.object_buffer_resources[slot].GetGPUVirtualAddress() };
+        let draw_args_gva =
+            unsafe { self.cull.draw_args_buffer_resources[slot].GetGPUVirtualAddress() };
+        let cull_status_gva = unsafe { self.cull.cull_status_buffers[slot].GetGPUVirtualAddress() };
+
+        // A Hi-Z SRV is still bound (the root signature's descriptor table at [3]
+        // must point at a live descriptor) but `hiz_enabled = 0` makes the kernel
+        // skip the occlusion test. The probe captures whatever is in the face
+        // frustum, occluded or not.
+        let hiz_srv = self.cull.hiz.as_ref().map(|h| h.srv_gpu);
+        let mut cull_params = CullParams {
+            planes: [[0.0; 4]; 6],
+            cam_pos,
+            object_count: self.cull_count() as u32,
+            prev_view_proj: self.cull.prev_view_proj.get(),
+            hiz_size: [1.0, 1.0],
+            hiz_mip_count: 1,
+            hiz_enabled: 0,
+        };
+        for (i, p) in frustum.planes.iter().enumerate() {
+            cull_params.planes[i] = [p.normal[0], p.normal[1], p.normal[2], p.d];
+        }
+
+        unsafe {
+            cmd.ResourceBarrier(&[transition_barrier(
+                indirect,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            )]);
+            cmd.SetComputeRootSignature(cull_root);
+            cmd.SetPipelineState(cull_pso);
+            cmd.SetDescriptorHeaps(&[Some(self.descriptors.srv_heap.clone())]);
+            cmd.SetComputeRoot32BitConstants(
+                0,
+                CULL_PARAMS_DWORDS,
+                &cull_params as *const CullParams as *const std::ffi::c_void,
+                0,
+            );
+            cmd.SetComputeRootShaderResourceView(1, object_gva);
+            cmd.SetComputeRootShaderResourceView(2, draw_args_gva);
+            if let Some(srv) = hiz_srv {
+                cmd.SetComputeRootDescriptorTable(3, srv);
+            }
+            cmd.SetComputeRootUnorderedAccessView(4, indirect.GetGPUVirtualAddress());
+            cmd.SetComputeRootUnorderedAccessView(5, cull_status_gva);
+            cmd.Dispatch((self.cull_count() as u32).div_ceil(64), 1, 1);
+            cmd.ResourceBarrier(&[transition_barrier(
+                indirect,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+            )]);
+        }
+    }
+
     // Per-cascade GPU cull for the GPU-driven shadow pass. Uses the frustum-only
     // shadow cull kernel (`cull_pso_shadow` = `main_shadow`): one dispatch per
     // re-rendered cascade tests every record (static + instances + skinned) against
@@ -612,6 +694,121 @@ impl DxContext {
                 // alignment (the stride is a multiple of 4), like the instanced
                 // path's per-bucket root-SRV bumps.
                 let region_gva = base_gva + (c * n_cull * INDIRECT_COMMAND_STRIDE as usize) as u64;
+                cmd.SetComputeRootUnorderedAccessView(4, region_gva);
+                cmd.Dispatch((n_cull as u32).div_ceil(64), 1, 1);
+            }
+
+            cmd.ResourceBarrier(&[transition_barrier(
+                indirect,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+            )]);
+        }
+    }
+
+    // Reflected-frustum mirror cull for the planar reflection pass. For each
+    // `(reflected frustum, reflected eye)` in `planes`, re-runs the GPU cull into
+    // that plane's region of `indirect` (one region of `region_count` commands per
+    // plane), reading the FRAME's camera-independent object + draw-args buffers --
+    // so geometry visible only in the reflection (behind / beside the main camera,
+    // outside its frustum) is captured, not just the main camera's visible set. The
+    // reflected view-proj already carries the oblique near-plane clip, so the
+    // extracted frustum also rejects geometry behind the reflector. Uses the main
+    // single-pass cull kernel (frustum + distance, by the reflected eye) with Hi-Z
+    // OFF (the only pyramid is the main camera's screen space, useless here),
+    // exactly like the probe capture. Status writes go to a scratch buffer (never
+    // read). The whole indirect buffer flips INDIRECT_ARGUMENT -> UAV for the
+    // dispatches and back; the per-plane face render then issues each region with
+    // `ExecuteIndirect`. Mirrors `encode_shadow_culls`. A no-op when the cull path
+    // is inactive or `cull_count() == 0`.
+    pub(in crate::directx) fn encode_planar_culls(
+        &self,
+        cmd: &ID3D12GraphicsCommandList,
+        frame_idx: usize,
+        planes: &[(crate::gfx::frustum::Frustum, [f32; 3])],
+        indirect: &ID3D12Resource,
+        status_gva: u64,
+        // Per-plane region stride, in commands: the FIXED build-time record capacity
+        // the indirect buffer was sized with (`PlanarReflectionSet::n_cull`) and that
+        // the face render's `region_offset` reads with. MUST single-source with the
+        // reader -- NOT the live `cull_count()`, which can be smaller than the
+        // capacity (e.g. the skinned tail goes inactive when the RT-skin pipeline
+        // fails to build), shifting plane >= 1's read offset off the written region.
+        region_count: usize,
+    ) {
+        let (Some(cull_pso), Some(cull_root)) = (
+            self.cull.cull_pso.as_ref(),
+            self.cull.cull_root_sig.as_ref(),
+        ) else {
+            return;
+        };
+        let n_cull = self.cull_count();
+        if n_cull == 0 || planes.is_empty() {
+            return;
+        }
+        // The live count never exceeds the capacity the buffer + reader stride by, so
+        // the kernel's `n_cull` written commands always land within plane's region.
+        debug_assert!(n_cull <= region_count);
+
+        let object_gva =
+            unsafe { self.cull.object_buffer_resources[frame_idx].GetGPUVirtualAddress() };
+        let draw_args_gva =
+            unsafe { self.cull.draw_args_buffer_resources[frame_idx].GetGPUVirtualAddress() };
+        let base_gva = unsafe { indirect.GetGPUVirtualAddress() };
+
+        // Hi-Z disabled (`hiz_enabled = 0`): the kernel never samples the pyramid,
+        // but the descriptor table at root [3] must still point at a live descriptor.
+        let (hiz_size, hiz_mip_count, hiz_srv) = match self.cull.hiz.as_ref() {
+            Some(h) => (
+                [h.width as f32, h.height as f32],
+                h.mip_count,
+                Some(h.srv_gpu),
+            ),
+            None => ([1.0, 1.0], 1, None),
+        };
+
+        unsafe {
+            cmd.ResourceBarrier(&[transition_barrier(
+                indirect,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            )]);
+            cmd.SetComputeRootSignature(cull_root);
+            cmd.SetPipelineState(cull_pso);
+            cmd.SetDescriptorHeaps(&[Some(self.descriptors.srv_heap.clone())]);
+            cmd.SetComputeRootShaderResourceView(1, object_gva);
+            cmd.SetComputeRootShaderResourceView(2, draw_args_gva);
+            if let Some(srv) = hiz_srv {
+                cmd.SetComputeRootDescriptorTable(3, srv);
+            }
+            cmd.SetComputeRootUnorderedAccessView(5, status_gva);
+
+            for (plane_idx, (frustum, eye)) in planes.iter().enumerate() {
+                let mut cull_params = CullParams {
+                    planes: [[0.0; 4]; 6],
+                    cam_pos: *eye,
+                    object_count: n_cull as u32,
+                    // Unused with Hi-Z disabled (the reprojection is never taken).
+                    prev_view_proj: [[0.0; 4]; 4],
+                    hiz_size,
+                    hiz_mip_count,
+                    hiz_enabled: 0,
+                };
+                for (i, p) in frustum.planes.iter().enumerate() {
+                    cull_params.planes[i] = [p.normal[0], p.normal[1], p.normal[2], p.d];
+                }
+                cmd.SetComputeRoot32BitConstants(
+                    0,
+                    CULL_PARAMS_DWORDS,
+                    &cull_params as *const CullParams as *const std::ffi::c_void,
+                    0,
+                );
+                // Plane `plane_idx`'s output region: offset the indirect UAV's GPU
+                // address by `plane_idx * region_count` commands so the kernel's
+                // `commands[i]` write lands in this plane's slice (strided by the
+                // SAME capacity the face render reads with, not the live count).
+                let region_gva =
+                    base_gva + (plane_idx * region_count * INDIRECT_COMMAND_STRIDE as usize) as u64;
                 cmd.SetComputeRootUnorderedAccessView(4, region_gva);
                 cmd.Dispatch((n_cull as u32).div_ceil(64), 1, 1);
             }

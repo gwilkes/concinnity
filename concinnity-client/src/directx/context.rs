@@ -627,6 +627,10 @@ pub(super) struct DxDescriptors {
     // by a flat index; the streaming-residency rewrite re-points the one SRV per
     // swapped pool slot here (in addition to the legacy per-object pairs).
     pub flat_pool_base_slot: usize,
+    // Base slot of the contiguous MAX_PROBES reflection-probe cube SRV block (the
+    // bindless main shader's `probe_cubes` table). Filled with the sky prefilter
+    // cube at init; a baked probe overwrites its slot. See [`super::probe`].
+    pub probe_cube_base_slot: usize,
     // Sampler heap (shader-visible). Slots:
     //   [0] shadow comparison (s0)   [1] linear repeat (s1)
     //   [2] cube linear-clamp + mip linear (s2)   [3] text linear-clamp
@@ -819,6 +823,14 @@ pub struct DxContext {
     // is); the render-graph `PassId::Ssgi` node is gated on `ssgi.is_some()`.
     pub(super) ssgi: Option<super::post::ssgi::SsgiResources>,
 
+    // Roughness-aware reflection composite: the SSR / RT resolve writes reflected
+    // radiance + weight, then this blurs it by surface roughness (a reduced-res blur
+    // pass) and composites it over the scene into its own output -- the scene the
+    // post stack consumes via `scene_srv_for_post`. `Some` when SSR resolve or RT is
+    // authored (both feed it).
+    pub(super) reflection_composite:
+        Option<super::post::reflection_composite::ReflectionCompositeResources>,
+
     // Hardware ray-traced reflections (DXR). `rt_reflections` (output target +
     // RtParams UBO + root sig + flat/textured PSOs) and `rt_accel` (BLAS/TLAS +
     // geometry table) are both `Some` only when the world enables
@@ -853,6 +865,13 @@ pub struct DxContext {
     // Water is a separate (Metal-only) producer not ported here. Mirrors
     // src/metal glass handling.
     pub(super) glass: Option<super::glass::GlassResources>,
+
+    // Planar reflections for flat glass panes: a per-frame mirror render of the
+    // scene reflected across each distinct pane plane, sampled projectively by the
+    // glass shader (sharper + scene-correct vs the box-projected probe cube).
+    // `Some` only when the world has glass panes assigned to a planar slot. Driven
+    // inline at the head of the transparent pass (`encode_planar_reflections`).
+    pub(super) planar_reflection: Option<super::planar::PlanarReflectionSet>,
 
     // Volumetric fog. See [`FogState`].
     pub(super) fog: FogState,
@@ -978,6 +997,39 @@ pub struct DxContext {
     // build. Static-geometry rebuilds are not reflected (a pre-existing RT
     // topology limitation).
     pub(super) rt_static_vertex_count: usize,
+
+    // Reflection-probe placements (declared `ReflectionProbe` assets or an
+    // auto-seeded grid). Indexed in order by the staggered capture pass; one cube
+    // is baked per placement. See [`super::probe`].
+    pub(super) probe_placements: Vec<crate::gfx::reflection_probe::ProbePlacement>,
+    // Staggered bake cursor over `probe_placements`: a not-yet-baked probe falls
+    // back to the sky until its turn, so no single frame pays the whole capture.
+    pub(super) probe_bake_queue: crate::gfx::reflection_probe::ProbeBakeQueue,
+    // Per-frame probe set (parallax boxes + live count) bound to the forward / SSR
+    // / RT shaders. `EMPTY` until a bake installs a cube; distinct from `env_map`
+    // so the skybox + diffuse irradiance keep the sky.
+    #[allow(dead_code)] // bound to the forward shader (next slice)
+    pub(super) probe_set: super::probe_uniforms::ProbeSet,
+    // The probe whose six cube faces are currently rendering on the GPU (one at a
+    // time, spread one face per frame). Owns the reserved-ring-slot capture
+    // resources until its faces are read back. See [`super::probe`].
+    pub(super) probe_rendering: Option<super::probe::RenderingBake>,
+    // The prior probe whose read-back faces are convolving on a worker thread.
+    // Holds only the worker's payload slot (plain data), so it drops freely.
+    pub(super) probe_converting: Option<super::probe::ConvertingBake>,
+    // One baked prefilter cube per installed probe, aligned with `probe_set`
+    // (index `i` is placement `i`). Distinct from `env_map`; sampled only by the
+    // specular reflection term.
+    pub(super) probe_maps: Vec<super::probe::ProbeCube>,
+    // Per-frame CBVs holding `probe_set` (the parallax boxes + live count) bound at
+    // root param [11] by the main pass. A `FRAMES` ring so a frame writes its own
+    // slot without racing a prior frame's in-flight GPU read.
+    pub(super) probe_set_cbvs: Vec<ID3D12Resource>,
+    pub(super) probe_set_cbv_ptrs: Vec<*mut u8>,
+    // A static count-0 ProbeSet CBV the asynchronous capture binds at [11], so a
+    // probe face render samples the sky (no probe feedback) and never reads the live
+    // ring while `record_frame` rewrites it.
+    pub(super) probe_set_empty_cbv: ID3D12Resource,
 }
 
 // uniforms.view_ubo_ptrs are host-mapped and only touched on the render thread.
@@ -1070,6 +1122,14 @@ impl DxContext {
             }
             .map_err(|e| format!("SetEventOnCompletion: {e}"))?;
             unsafe { WaitForSingleObject(self.frame_sync.fence_event, u32::MAX) };
+        }
+
+        // Advance the staggered reflection-probe bake. Called after the frame-slot
+        // fence wait (so any in-flight capture resources are safe to recycle) and
+        // before the frame's passes record. Non-fatal: a failure is logged and the
+        // frame proceeds with whatever probes have baked.
+        if let Err(e) = self.bake_pending_probes(elapsed, near, far) {
+            tracing::warn!("reflection probe bake step failed: {e}");
         }
 
         // Auto-exposure EMA step. The fence wait above ensured the GPU work
@@ -1503,6 +1563,30 @@ impl DxContext {
     // and the `scene_srv_for_post` precedence.
     pub(super) fn rt_reflections_active(&self) -> bool {
         self.rt_reflections.is_some() && self.rt_accel.is_some()
+    }
+
+    // True when a reflection resolve (SSR resolve or RT reflections) runs this
+    // frame. RT takes precedence at the graph level, so at most one resolve
+    // runs; either feeds the same composite. Single-sources the predicate that
+    // `scene_srv_for_post` and the glass pass use to pick the scene-with-
+    // reflections target, and that the forward shader reads (via
+    // `ViewUniforms::reflections_enabled`) to hand glossy dielectric specular to
+    // that resolve instead of double-counting the forward probe reflection.
+    pub(super) fn reflection_resolve_active(&self) -> bool {
+        self.rt_reflections_active() || self.ssr.as_ref().and_then(|s| s.resolve.as_ref()).is_some()
+    }
+
+    // True when glass panes trace a per-pixel RT reflection this frame: RT is live
+    // AND the glass RT pipelines built (DXR + DXC). Single-sources the glass-RT
+    // decision so the two consumers agree: `encode_transparent` selects the RT
+    // trace, and `graph_exec` skips the planar mirror re-render (RT supersedes
+    // planar). They MUST gate on the same predicate -- if RT is live but the glass
+    // RT pipelines failed to build, the glass pass falls back to the probe/planar
+    // path, so the planar resolve must still be rendered for it to sample (gating
+    // the skip on `rt_reflections_active()` alone would leave it sampling a stale
+    // resolve).
+    pub(super) fn rt_glass_active(&self) -> bool {
+        self.rt_reflections_active() && self.glass.as_ref().is_some_and(|g| g.rt_pipelines_ready())
     }
 
     // True when the render graph should include `PassId::Transparent`. Wraps

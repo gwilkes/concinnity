@@ -23,6 +23,7 @@ use crate::gfx::render_types::PostProcessParams;
 /// {"name":"post_ssao","type":"PostProcessConfig","args":{"ssao":true,"ssao_radius":0.6}}
 /// {"name":"post_ssr","type":"PostProcessConfig","args":{"ssr":true,"ssr_intensity":0.8}}
 /// {"name":"post_rt","type":"PostProcessConfig","args":{"ray_traced_reflections":true,"ssr_intensity":0.8}}
+/// {"name":"post_refl_blur","type":"PostProcessConfig","args":{"ssr":true,"reflection_blur_resolution":"quarter"}}
 /// {"name":"post_ssgi","type":"PostProcessConfig","args":{"indirect_lighting":"ssgi","ssgi_intensity":0.6}}
 /// {"name":"post_auto_ev","type":"PostProcessConfig","args":{"auto_exposure":true}}
 /// {"name":"post_hdr","type":"PostProcessConfig","args":{"hdr_display":true}}
@@ -77,6 +78,16 @@ pub struct PostProcessConfig {
     /// `ssr_max_distance` tunables and takes precedence over `ssr`, falling back
     /// to it where ray tracing isn't available.
     pub ray_traced_reflections: bool,
+    /// Internal resolution of the roughness-aware reflection blur the SSR /
+    /// ray-traced reflection composite runs. `half` (default) blurs at a
+    /// quarter of the pixels for a large saving and bilinearly upsamples;
+    /// `full` blurs at native resolution; `quarter` is the cheapest. Smooth
+    /// mirror surfaces stay sharp at any setting (the composite keeps the sharp
+    /// reflection for low roughness). Only matters when `ssr` or
+    /// `ray_traced_reflections` is on. Honoured by the DirectX backend; Metal
+    /// uses a fixed half-resolution blur and Vulkan has no reflection composite
+    /// yet.
+    pub reflection_blur_resolution: ReflectionBlurResolution,
     /// Indirect-diffuse lighting source. `ibl` (default) uses the environment
     /// map's ambient alone. `ssgi` adds a screen-space global-illumination pass
     /// on top, so nearby lit surfaces bleed colour onto one another; the
@@ -237,6 +248,36 @@ impl SsgiResolution {
     }
 }
 
+/// Internal render resolution of the roughness-aware reflection blur (only
+/// meaningful when `ssr` or `ray_traced_reflections` is on). The blur is the
+/// expensive multi-tap part of the reflection composite and is low-frequency
+/// (a widening glossy cone), so running it at a fraction of the pixels and
+/// bilinearly upsampling is visually free. `half` (the default) blurs at a
+/// quarter of the pixels; `full` keeps it at native resolution; `quarter` is
+/// the cheapest. Mirrors stay sharp regardless: the composite lerps in the
+/// full-resolution reflection for low roughness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[derive(Default)]
+pub enum ReflectionBlurResolution {
+    Full,
+    #[default]
+    Half,
+    Quarter,
+}
+
+impl ReflectionBlurResolution {
+    /// Per-axis render-resolution divisor the reflection blur target is scaled
+    /// by.
+    pub fn scale_divisor(self) -> u32 {
+        match self {
+            ReflectionBlurResolution::Full => 1,
+            ReflectionBlurResolution::Half => 2,
+            ReflectionBlurResolution::Quarter => 4,
+        }
+    }
+}
+
 /// `exposure_ev` is clamped to this range before resolving to a multiplier so
 /// a stray value cannot push the scene to `inf` / `0`.
 const EXPOSURE_EV_LIMIT: f32 = 16.0;
@@ -258,6 +299,7 @@ impl Default for PostProcessConfig {
             ssr_intensity: 0.7,
             ssr_max_distance: 40.0,
             ray_traced_reflections: false,
+            reflection_blur_resolution: ReflectionBlurResolution::default(),
             indirect_lighting: IndirectLighting::Ibl,
             ambient_intensity: 1.0,
             ssgi_intensity: 0.5,
@@ -309,6 +351,14 @@ impl PostProcessConfig {
     /// indirect (ambient / IBL) term.
     pub fn ambient_intensity(&self) -> f32 {
         self.ambient_intensity.clamp(0.0, 16.0)
+    }
+
+    /// Per-axis divisor for the roughness-aware reflection blur target (the
+    /// reduced-resolution first pass of the SSR / RT reflection composite),
+    /// resolved from `reflection_blur_resolution`. The backend sizes its blur
+    /// target at render-resolution / this. Always at least 1.
+    pub fn reflection_blur_divisor(&self) -> u32 {
+        self.reflection_blur_resolution.scale_divisor()
     }
 
     /// Resolve the SSAO tunables into clamped `SsaoSettings`, or `None` when
@@ -656,6 +706,46 @@ mod tests {
         assert_eq!(cfg.ssgi_resolution, SsgiResolution::Half);
         assert_eq!(cfg.ssgi_rays, 8);
         assert_eq!(cfg.ssgi_steps, 12);
+    }
+
+    #[test]
+    fn reflection_blur_resolution_defaults_to_half() {
+        let cfg = PostProcessConfig::default();
+        assert_eq!(
+            cfg.reflection_blur_resolution,
+            ReflectionBlurResolution::Half
+        );
+        assert_eq!(cfg.reflection_blur_divisor(), 2);
+    }
+
+    #[test]
+    fn reflection_blur_resolution_maps_to_a_per_axis_divisor() {
+        assert_eq!(ReflectionBlurResolution::Full.scale_divisor(), 1);
+        assert_eq!(ReflectionBlurResolution::Half.scale_divisor(), 2);
+        assert_eq!(ReflectionBlurResolution::Quarter.scale_divisor(), 4);
+        assert_eq!(
+            ReflectionBlurResolution::default(),
+            ReflectionBlurResolution::Half
+        );
+    }
+
+    #[test]
+    fn reflection_blur_resolution_deserialises_from_jsonl_args() {
+        let cfg: PostProcessConfig =
+            serde_json::from_str(r#"{"ssr":true,"reflection_blur_resolution":"quarter"}"#)
+                .expect("parse");
+        assert_eq!(
+            cfg.reflection_blur_resolution,
+            ReflectionBlurResolution::Quarter
+        );
+        assert_eq!(cfg.reflection_blur_divisor(), 4);
+        // Omitting the field falls back to the half-resolution default.
+        let cfg: PostProcessConfig = serde_json::from_str(r#"{"ssr":true}"#).expect("parse");
+        assert_eq!(
+            cfg.reflection_blur_resolution,
+            ReflectionBlurResolution::Half
+        );
+        assert_eq!(cfg.reflection_blur_divisor(), 2);
     }
 
     #[test]

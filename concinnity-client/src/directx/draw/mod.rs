@@ -37,7 +37,14 @@ pub(super) struct ViewUniforms {
     pub vp: [[f32; 4]; 4],
     pub view_mat: [[f32; 4]; 4],
     pub elapsed: f32,
-    pub _pad0: f32,
+    // 1.0 when a reflection resolve (SSR resolve or RT reflections) composites
+    // over this frame's HDR scene. Below the reflection roughness cut the
+    // forward probe specular yields to that resolve (whose miss-fallback samples
+    // the same probe set), so a glossy dielectric does not show both the
+    // parallax-approximate forward probe reflection and the exact resolved one.
+    // 0.0 keeps the full forward probe specular (no resolve: probe-face / planar
+    // mirror bakes, reflections off, non-RT/SSR worlds).
+    pub reflections_enabled: f32,
     pub cam_x: f32,
     pub cam_y: f32,
     pub cam_z: f32,
@@ -115,6 +122,17 @@ impl DxContext {
         }
         let shadow_ubo_gva =
             unsafe { self.uniforms.shadow_ubo_resources[frame_idx].GetGPUVirtualAddress() };
+
+        // Reflection-probe set (parallax boxes + live count) into this frame's ring
+        // CBV; the bindless main pass binds it at root param [11]. A ring (one CBV per
+        // frame) so this write never races a prior frame's in-flight GPU read.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                &self.probe_set as *const super::probe_uniforms::ProbeSet as *const u8,
+                self.probe_set_cbv_ptrs[frame_idx],
+                std::mem::size_of::<super::probe_uniforms::ProbeSet>(),
+            );
+        }
 
         // Push this frame's skinning matrices into the per-frame joint buffers
         // before the skinned shadow + main passes read them. No-op when no
@@ -274,11 +292,21 @@ impl DxContext {
         let vp_mat = mat4_mul(render_proj, self.view_matrix);
 
         // Upload this frame's view UBO.
+        // Fade the forward probe specular only when a resolve will actually
+        // composite its reflection over this scene. `reflection_resolve_active`
+        // alone matches the resolve gating, but require the composite target too
+        // so the fade can never zero a reflection that was never re-added.
+        let reflections_enabled =
+            if self.reflection_composite.is_some() && self.reflection_resolve_active() {
+                1.0
+            } else {
+                0.0
+            };
         let view_uni = ViewUniforms {
             vp: vp_mat,
             view_mat: self.view_matrix,
             elapsed,
-            _pad0: 0.0,
+            reflections_enabled,
             cam_x: cam_pos[0],
             cam_y: cam_pos[1],
             cam_z: cam_pos[2],
@@ -460,7 +488,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(ViewUniforms, vp), 0);
         assert_eq!(std::mem::offset_of!(ViewUniforms, view_mat), 64);
         assert_eq!(std::mem::offset_of!(ViewUniforms, elapsed), 128);
-        assert_eq!(std::mem::offset_of!(ViewUniforms, _pad0), 132);
+        assert_eq!(std::mem::offset_of!(ViewUniforms, reflections_enabled), 132);
         assert_eq!(std::mem::offset_of!(ViewUniforms, cam_x), 136);
         assert_eq!(std::mem::offset_of!(ViewUniforms, cam_y), 140);
         assert_eq!(std::mem::offset_of!(ViewUniforms, cam_z), 144);

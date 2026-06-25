@@ -33,6 +33,7 @@ use crate::gfx::backend::QualitySettings;
 use super::context::DxContext;
 use super::post::bloom::{bloom_top_extent, create_bloom_mips_at, write_color_rtv};
 use super::post::gbuffer::GbufferSlots;
+use super::post::reflection_composite::ReflectionCompositeSlots;
 use super::texture::write_hdr_srv;
 
 // The fixed descriptor-heap slots the live-toggleable effects build into. Minted
@@ -55,6 +56,7 @@ pub(in crate::directx) struct QualitySlotHandles {
     pub ssgi_gi_srv: (D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_GPU_DESCRIPTOR_HANDLE),
     pub rt_output_rtv: D3D12_CPU_DESCRIPTOR_HANDLE,
     pub rt_output_srv: (D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_GPU_DESCRIPTOR_HANDLE),
+    pub refl_composite: ReflectionCompositeSlots,
     pub gbuffer: GbufferSlots,
 }
 
@@ -191,6 +193,31 @@ impl DxContext {
         } else if !desired_rt && self.rt_reflections.is_some() {
             self.rt_reflections = None;
             self.rt_accel = None;
+        }
+
+        // Reflection composite: the on-screen target the SSR/RT resolve writes its
+        // radiance+weight into, then blurs/blends over the scene by roughness.
+        // Present whenever a resolve can composite (SSR resolve or RT), mirroring
+        // the init `ssr_settings || rt_reflection_settings` gate, and built into the
+        // unconditionally-reserved refl_composite slots. Without this reconcile a
+        // live RT/SSR enable on a world that authored neither leaves it `None`, so
+        // `encode_reflection_composite` early-returns and the resolve's reflection
+        // is computed but never shown (`scene_srv_for_post` / glass / the forward
+        // `reflections_enabled` fade all gate on its presence).
+        let refl_composite_needed = desired_ssr || desired_rt;
+        if refl_composite_needed && self.reflection_composite.is_none() {
+            let rc = super::post::reflection_composite::ReflectionCompositeResources::new(
+                &self.device,
+                render_w,
+                render_h,
+                q.reflection_blur_scale,
+                slots.refl_composite,
+                self.info_queue.as_ref(),
+                hot_reload,
+            )?;
+            self.reflection_composite = Some(rc);
+        } else if !refl_composite_needed && self.reflection_composite.is_some() {
+            self.reflection_composite = None;
         }
 
         // Auto-exposure. Needs no descriptor-heap slots (own root UAVs +

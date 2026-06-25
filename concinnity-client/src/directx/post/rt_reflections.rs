@@ -24,7 +24,7 @@ use crate::gfx::rt_reflections::RtReflectionSettings;
 
 use crate::directx::context::{DxContext, FRAMES, align256, dump_on_err};
 use crate::directx::dxc::compile_hlsl_dxc;
-use crate::directx::pipeline::{serialize_desc_and_create, shader_source};
+use crate::directx::pipeline::{reflection_cut_prelude, serialize_desc_and_create, shader_source};
 use crate::directx::texture::{
     HDR_FORMAT, create_buffer, create_rt_target, transition_barrier, write_format_rtv,
     write_format_srv,
@@ -32,6 +32,13 @@ use crate::directx::texture::{
 
 // HLSL source (compiled via DXC to SM 6.5 for inline `RayQuery`).
 pub const RT_REFLECTIONS_HLSL: &str = include_str!("../shaders/rt_reflections.hlsl");
+// Shared reflection-probe sampling, concatenated ahead of the RT shader (no #include
+// handler on DX) so a missed ray box-projects the local probe. The RT shader already
+// uses t7 (prefilter) and s2 (repeat sampler), so the probe cube array + its sampler
+// remap to t10 / s3 via the prepended #defines; b4 (ProbeSet) is free.
+const PROBE_COMMON_HLSL: &str = include_str!("../shaders/probe_common.hlsl");
+const PROBE_REGISTER_DEFINES: &str =
+    "#define PROBE_CUBES_REGISTER t10\n#define PROBE_SAMPLER_REGISTER s3\n";
 
 // Size of the RT-reflection fragment-shader uniform block. 144 bytes; see
 // `gfx::render_types::RtParams`.
@@ -49,7 +56,13 @@ struct RtShaders {
 // DXC (SM 6.5). Returns an `Err` (which the caller turns into an SSR fallback)
 // when DXC is unavailable or the shader fails to compile.
 fn compile_rt_shaders(hot_reload: bool) -> Result<RtShaders, String> {
-    let src = shader_source(hot_reload, "rt_reflections.hlsl", RT_REFLECTIONS_HLSL);
+    let body = shader_source(hot_reload, "rt_reflections.hlsl", RT_REFLECTIONS_HLSL);
+    // The shared REFLECTION_ROUGHNESS_CUT prelude, then the register remap #defines
+    // (before probe_common's #ifndef-guarded defaults), then the shared probe
+    // helpers, then the RT shader body.
+    let cut = reflection_cut_prelude();
+    let probe_common = shader_source(hot_reload, "probe_common.hlsl", PROBE_COMMON_HLSL);
+    let src = format!("{cut}{PROBE_REGISTER_DEFINES}{probe_common}\n{body}");
     Ok(RtShaders {
         vs: compile_hlsl_dxc(&src, "rt_fullscreen_vert", "vs_6_5")?,
         flat_ps: compile_hlsl_dxc(&src, "rt_reflections_frag", "ps_6_5")?,
@@ -85,6 +98,17 @@ fn create_rt_root_signature(device: &ID3D12Device) -> Result<ID3D12RootSignature
         RegisterSpace: 1,         // space1
         OffsetInDescriptorsFromTableStart: 0,
     };
+    // The reflection-probe cube array at t10..t10+MAX_PROBES, space0 (t7 is the
+    // prefilter cube; remapped via PROBE_CUBES_REGISTER). Unbaked slots hold the sky
+    // prefilter cube, so a sample at any index is valid; the miss fallback box-projects
+    // these when ProbeSet.count > 0.
+    let probe_cube_range = D3D12_DESCRIPTOR_RANGE {
+        RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+        NumDescriptors: crate::directx::probe_uniforms::MAX_PROBES as u32,
+        BaseShaderRegister: 10, // t10..
+        RegisterSpace: 0,
+        OffsetInDescriptorsFromTableStart: D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
+    };
 
     let root_cbv = |reg: u32| D3D12_ROOT_PARAMETER {
         ParameterType: D3D12_ROOT_PARAMETER_TYPE_CBV,
@@ -118,18 +142,20 @@ fn create_rt_root_signature(device: &ID3D12Device) -> Result<ID3D12RootSignature
     };
 
     let params = [
-        root_cbv(0),           // [0] b0 RtParams
-        root_srv(0),           // [1] t0 TLAS
-        root_srv(1),           // [2] t1 vertex buffer (raw)
-        root_srv(2),           // [3] t2 index buffer (raw)
-        root_srv(3),           // [4] t3 geometry table (structured)
-        table(&scene_range),   // [5] t4 scene
-        table(&gbuffer_range), // [6] t5 gbuffer normal+depth
-        table(&rough_range),   // [7] t6 roughness
-        table(&cube_range),    // [8] t7 prefilter cube
-        table(&pool_range),    // [9] t0,space1 bindless pool
-        root_srv(8),           // [10] t8 deformed skinned verts (raw)
-        root_srv(9),           // [11] t9 skinned u16 indices (raw)
+        root_cbv(0),              // [0] b0 RtParams
+        root_srv(0),              // [1] t0 TLAS
+        root_srv(1),              // [2] t1 vertex buffer (raw)
+        root_srv(2),              // [3] t2 index buffer (raw)
+        root_srv(3),              // [4] t3 geometry table (structured)
+        table(&scene_range),      // [5] t4 scene
+        table(&gbuffer_range),    // [6] t5 gbuffer normal+depth
+        table(&rough_range),      // [7] t6 roughness
+        table(&cube_range),       // [8] t7 prefilter cube
+        table(&pool_range),       // [9] t0,space1 bindless pool
+        root_srv(8),              // [10] t8 deformed skinned verts (raw)
+        root_srv(9),              // [11] t9 skinned u16 indices (raw)
+        table(&probe_cube_range), // [12] t10.. reflection-probe cube array
+        root_cbv(4),              // [13] b4 ProbeSet
     ];
 
     let linear_clamp = |reg: u32| D3D12_STATIC_SAMPLER_DESC {
@@ -153,7 +179,10 @@ fn create_rt_root_signature(device: &ID3D12Device) -> Result<ID3D12RootSignature
         ShaderRegister: 2, // s2
         ..linear_clamp(2)
     };
-    let samplers = [linear_clamp(0), linear_clamp(1), repeat];
+    // s3: cube mip-linear clamp for the reflection-probe cube array (probe_common.hlsl
+    // `cube_sampler`, remapped via PROBE_SAMPLER_REGISTER), matching the s1 prefilter
+    // sampler.
+    let samplers = [linear_clamp(0), linear_clamp(1), repeat, linear_clamp(3)];
 
     let desc = D3D12_ROOT_SIGNATURE_DESC {
         NumParameters: params.len() as u32,
@@ -401,6 +430,9 @@ impl DxContext {
             (Some(r), Some(a), Some(g)) => (r, a, g),
             _ => return,
         };
+        // The trace writes reflected radiance + weight into `rt.output`; the
+        // reflection composite (below) blurs + composites it over the scene.
+        let reflection_srv = rt.output_srv_gpu;
 
         // Build + upload this frame's RtParams. `inv_view_rot` is the view->world
         // rotation (the transpose of the view matrix's orthonormal 3x3), same as
@@ -499,6 +531,14 @@ impl DxContext {
             // geometry, so the binding is always live.
             cmd.SetGraphicsRootShaderResourceView(10, accel.deformed_verts_gva());
             cmd.SetGraphicsRootShaderResourceView(11, accel.skinned_index_gva());
+            // Reflection-probe miss fallback (probe_common.hlsl): the cube array table
+            // at t10 + the per-frame ProbeSet CBV at b4. count == 0 keeps the sky path,
+            // so a probe-less world is byte-identical to before.
+            cmd.SetGraphicsRootDescriptorTable(12, self.probe_cube_table_gpu());
+            cmd.SetGraphicsRootConstantBufferView(
+                13,
+                self.probe_set_cbvs[frame_idx].GetGPUVirtualAddress(),
+            );
             cmd.IASetPrimitiveTopology(
                 windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
             );
@@ -513,5 +553,9 @@ impl DxContext {
             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
         );
         unsafe { cmd.ResourceBarrier(&[out_to_psr]) };
+
+        // Blur the reflection by roughness and composite it over the scene into the
+        // reflection-composite output (the scene the post stack then consumes).
+        self.encode_reflection_composite(cmd, reflection_srv);
     }
 }

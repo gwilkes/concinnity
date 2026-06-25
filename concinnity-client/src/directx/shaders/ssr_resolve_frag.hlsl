@@ -30,6 +30,11 @@ TextureCube  prefilter : register(t3);
 SamplerState smp       : register(s0);
 SamplerState cube_smp  : register(s1);
 
+// `cube_sampler` (s2), the probe cube array (t7..), and the `ProbeBlock` cbuffer
+// (b4) are declared in probe_common.hlsl, concatenated ahead of this shader (the
+// DX HLSL path has no #include handler). On a missed ray they let the resolve
+// fall back to the local reflection probe instead of the foreign sky cube.
+
 struct VsOut
 {
     float4 sv_pos : SV_POSITION;
@@ -38,26 +43,14 @@ struct VsOut
 
 static const int   SSR_MAX_STEPS = 48;
 static const int   SSR_REFINE    = 5;
-// Surfaces rougher than this get no SSR; glossiness ramps in below it.
-static const float SSR_ROUGH_CUT = 0.6;
+// Surfaces rougher than `REFLECTION_ROUGHNESS_CUT` get no SSR; glossiness ramps in
+// below it. The cut is the shared `static const` injected by the host
+// (pipeline.rs::reflection_cut_prelude), so it matches the RT resolve + composite.
+
 // Dielectric base reflectance (water, glass, polished stone) for the Fresnel.
 static const float SSR_F0        = 0.04;
 // UV margin over which a hit near the screen border fades out.
 static const float SSR_EDGE_FADE = 0.12;
-// Largest screen-space (UV) blur radius, reached as roughness approaches the
-// cut-off. The reflected scene colour is gathered over a disk this wide so a
-// glossy-but-not-mirror surface reflects a blurred image; a near-zero
-// roughness shrinks the radius to a single sharp tap.
-static const float SSR_BLUR_MAX  = 0.018;
-
-// Eight evenly spaced offsets on the unit circle (cos/sin of k * 45 deg) for
-// the roughness-keyed reflection gather.
-static const float2 SSR_BLUR_RING[8] = {
-    float2( 1.0,         0.0       ), float2( 0.70710678,  0.70710678),
-    float2( 0.0,         1.0       ), float2(-0.70710678,  0.70710678),
-    float2(-1.0,         0.0       ), float2(-0.70710678, -0.70710678),
-    float2( 0.0,        -1.0       ), float2( 0.70710678, -0.70710678),
-};
 
 // Rebuild a view-space position from a UV and its linear (view-space) depth.
 // The inverse of ssr_project; matches ssao_view_pos in the SSAO kernel.
@@ -75,52 +68,49 @@ float2 ssr_project(float3 q, float tan_y, float asp)
     return float2(ndc.x * 0.5 + 0.5, 1.0 - (ndc.y * 0.5 + 0.5));
 }
 
-// Gather the reflected scene colour over a roughness-scaled disk. A zero
-// radius is one sharp tap (mirror); a wider radius averages an eight-tap ring
-// plus the centre, approximating the wider reflection cone of a rough surface.
-float3 ssr_gather(float2 uv, float radius)
-{
-    float3 c = scene.Sample(smp, uv).rgb;
-    if (radius <= 1e-5)
-    {
-        return c;
-    }
-    [unroll] for (int i = 0; i < 8; i++)
-    {
-        c += scene.Sample(smp, uv + SSR_BLUR_RING[i] * radius).rgb;
-    }
-    return c * (1.0 / 9.0);
-}
-
 float4 main(VsOut p) : SV_TARGET
 {
     float3 base  = scene.Sample(smp, p.uv).rgb;
     float4 c     = gbuffer.Sample(smp, p.uv);
     float  depth = c.a;
-    if (depth <= 0.0) return float4(base, 1.0);     // background / sky
+    if (depth <= 0.0) return float4(base, 0.0);     // background / sky: weight 0
 
     float roughness = rough_tex.Sample(smp, p.uv).r;
-    // Glossy surfaces reflect sharply; rough ones get nothing.
-    float gloss = saturate((SSR_ROUGH_CUT - roughness) / SSR_ROUGH_CUT);
-    if (gloss <= 0.0) return float4(base, 1.0);
+    // Glossy surfaces reflect sharply; rough ones get nothing. A non-reflecting
+    // pixel writes weight 0 so the composite keeps the scene there.
+    float gloss = saturate((REFLECTION_ROUGHNESS_CUT - roughness) / REFLECTION_ROUGHNESS_CUT);
+    if (gloss <= 0.0) return float4(base, 0.0);
 
     float3 N = normalize(c.xyz);
     float3 P = ssr_view_pos(p.uv, depth, tan_half_fov_y, aspect);
     float3 V = normalize(-P);                       // P in view space, camera at origin
     float3 R = reflect(-V, N);                      // reflected ray direction
 
-    // Environment fallback: the reflection the IBL prefilter cubemap gives in
-    // the reflected direction, sampled at a roughness-keyed mip so a rougher
-    // surface reflects a blurrier environment (matching the main pass). With
-    // no EnvironmentMap bound there is nothing to fall back to, so the
-    // environment stays the base shading and missed rays behave as before.
+    // Environment fallback for a missed (or screen-edge) ray, in the reflected
+    // direction at a roughness-keyed mip so a rougher surface reflects a blurrier
+    // environment (matching the main pass). With a baked reflection probe this is
+    // the local scene capture (box-projected + blended across covering probes),
+    // the same source the forward IBL specular term uses, rather than the foreign
+    // sky HDR; otherwise it is the IBL prefilter cube. With no EnvironmentMap bound
+    // there is nothing to fall back to, so missed rays keep the base shading.
     bool   ibl = prefilter_mip_count > 0.5;
     float3 env = base;
     if (ibl)
     {
         float3 r_world = mul((float3x3)inv_view, R);
         float  lod     = roughness * (prefilter_mip_count - 1.0);
-        env = prefilter.SampleLevel(cube_smp, r_world, lod).rgb;
+        if (probes.count > 0u)
+        {
+            // The full inv_view (its translation column carries the camera
+            // position) lifts the view-space surface point P to world space, which
+            // the probe box-projection needs.
+            float3 world_pos = mul(inv_view, float4(P, 1.0)).xyz;
+            env = probe_set_specular(probes, world_pos, r_world, lod);
+        }
+        else
+        {
+            env = prefilter.SampleLevel(cube_smp, r_world, lod).rgb;
+        }
     }
 
     float3 step_v = R * stride;
@@ -160,15 +150,14 @@ float4 main(VsOut p) : SV_TARGET
         }
     }
 
-    // The reflected colour: a screen-space hit gathered over a roughness-scaled
-    // disk, or the environment cube when the ray missed. A hit near the screen
-    // border or at the end of its march fades toward the environment rather
-    // than snapping flat to the base shading.
-    float  blur_radius = (roughness / SSR_ROUGH_CUT) * SSR_BLUR_MAX;
+    // The reflected colour: a single sharp screen-space tap (the reflection
+    // composite blurs it by roughness), or the environment cube when the ray
+    // missed. A hit near the screen border or at the end of its march fades toward
+    // the environment rather than snapping flat to the base shading.
     float3 reflected;
     if (hit)
     {
-        float3 hit_color = ssr_gather(hit_uv, blur_radius);
+        float3 hit_color = scene.Sample(smp, hit_uv).rgb;
         float2 e = smoothstep(0.0, SSR_EDGE_FADE, hit_uv)
                  * smoothstep(0.0, SSR_EDGE_FADE, 1.0 - hit_uv);
         float edge = e.x * e.y;
@@ -184,5 +173,8 @@ float4 main(VsOut p) : SV_TARGET
     float ndv     = saturate(dot(N, V));
     float fresnel = SSR_F0 + (1.0 - SSR_F0) * pow(1.0 - ndv, 5.0);
     float w = saturate(fresnel * gloss * intensity);
-    return float4(lerp(base, reflected, w), 1.0);
+    // Reflected radiance (.rgb) + composite weight (.a). The reflection composite
+    // blurs this by surface roughness and blends it over the scene; the resolve no
+    // longer composites inline.
+    return float4(reflected, w);
 }

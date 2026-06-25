@@ -544,7 +544,7 @@ impl DxContext {
             camera_pos: [params.cam_pos[0], params.cam_pos[1], params.cam_pos[2], 0.0],
             viewport: [params.width as f32, params.height as f32],
             time: params.elapsed,
-            _pad: 0.0,
+            prefilter_mip_count: self.env_map.prefilter_mip_count as f32,
         }
     }
 
@@ -725,8 +725,29 @@ impl DxContext {
                 // (`DxContext::transparent_enabled`), so it only appears when
                 // the world declared visible `GlassPanel`s. Water is a separate
                 // (Metal-only) producer not ported here.
+                //
+                // Planar reflections run inline at the head of the pass (same cmd
+                // list -> the per-plane mirror resolves are ready before the glass
+                // draws sample them). A no-op when the world has no planar set.
+                // Skipped only when the per-pixel RT glass trace will actually run
+                // (`rt_glass_active`: RT live AND the glass RT pipelines built),
+                // since the trace supersedes planar (sharp + off-screen-correct) and
+                // the mirror re-render would be wasted. Gating on `rt_glass_active`
+                // (not `rt_reflections_active`) keeps planar alive when RT is live
+                // but the glass RT pipelines failed to build, so the glass pass's
+                // probe/planar fallback samples a freshly rendered resolve. Mirrors
+                // Metal's `planar_live = rt.accel.is_none()` gate.
+                if !self.rt_glass_active() {
+                    self.encode_planar_reflections(cmd, params)?;
+                }
                 let view = self.build_transparent_view(params);
-                self.encode_transparent(cmd, params.frame_idx, &view)?;
+                self.encode_transparent(
+                    cmd,
+                    params.frame_idx,
+                    &view,
+                    params.fov_y_radians,
+                    params.aspect,
+                )?;
             }
             PassId::HizBuild => {
                 // Two-pass occlusion: rebuild the Hi-Z pyramid mid-frame from

@@ -27,7 +27,7 @@ use crate::directx::cull::{
 use crate::directx::pipeline::{
     compile_composite_shaders, compile_hlsl, compile_text_shaders, create_composite_pso,
     create_composite_root_signature, create_text_pso, create_text_root_signature,
-    main_input_layout, serialize_and_create_root_sig, shader_source,
+    main_input_layout, reflection_cut_prelude, serialize_and_create_root_sig, shader_source,
 };
 use crate::directx::texture::{HDR_FORMAT, create_buffer, create_uav_buffer};
 
@@ -53,6 +53,9 @@ const MAIN_FRAG_HLSL: &str = concinnity_core::build::shader::BUILTIN_DEFAULT_FRA
 // model/material/texture binding model differs.
 const MAIN_VERT_BINDLESS_HLSL: &str = include_str!("../shaders/main_bindless_vert.hlsl");
 const MAIN_FRAG_BINDLESS_HLSL: &str = include_str!("../shaders/main_bindless_frag.hlsl");
+// Shared reflection-probe sampling, concatenated ahead of the bindless fragment
+// shader (the DX HLSL path has no #include handler). See probe_common.hlsl.
+const PROBE_COMMON_HLSL: &str = include_str!("../shaders/probe_common.hlsl");
 
 // GPU-instanced sibling of MAIN_VERT_HLSL. Reads per-instance world matrices
 // from a root SRV at t3 instead of the PushConstants `model` field (which is
@@ -146,15 +149,18 @@ pub(in crate::directx) fn compile_main_bindless_shaders(
         "main",
         "vs_5_1",
     )?;
-    let ps = compile_hlsl(
-        &shader_source(
-            hot_reload,
-            "main_bindless_frag.hlsl",
-            MAIN_FRAG_BINDLESS_HLSL,
-        ),
-        "main",
-        "ps_5_1",
-    )?;
+    // The probe sampling helpers + the probe cube array / ProbeSet cbuffer are
+    // declared in probe_common.hlsl, concatenated ahead of the fragment source.
+    // The shared REFLECTION_ROUGHNESS_CUT prelude goes first so the forward
+    // specular fade keys off the same cut as the SSR/RT resolve + composite.
+    let cut = reflection_cut_prelude();
+    let probe_common = shader_source(hot_reload, "probe_common.hlsl", PROBE_COMMON_HLSL);
+    let frag = shader_source(
+        hot_reload,
+        "main_bindless_frag.hlsl",
+        MAIN_FRAG_BINDLESS_HLSL,
+    );
+    let ps = compile_hlsl(&format!("{cut}{probe_common}\n{frag}"), "main", "ps_5_1")?;
     Ok((vs, ps))
 }
 
@@ -400,6 +406,16 @@ fn create_main_bindless_root_signature(
         RegisterSpace: 0,
         OffsetInDescriptorsFromTableStart: D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
     };
+    // [10] table: the reflection-probe cube array at t7..t7+MAX_PROBES (probe_common.hlsl
+    // `TextureCube probe_cubes[MAX_PROBES] : register(t7)`). Unbaked slots hold the sky
+    // prefilter cube, so a sample at any index is always valid.
+    let probe_cube_range = D3D12_DESCRIPTOR_RANGE {
+        RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+        NumDescriptors: crate::directx::probe_uniforms::MAX_PROBES as u32,
+        BaseShaderRegister: 7, // t7..
+        RegisterSpace: 0,
+        OffsetInDescriptorsFromTableStart: D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
+    };
 
     let params = [
         // [0] Root constant: per-draw object id at b0 (1 DWORD).
@@ -509,6 +525,28 @@ fn create_main_bindless_root_signature(
                 DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
                     NumDescriptorRanges: 1,
                     pDescriptorRanges: &ssao_srv_range,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+        },
+        // [10] Descriptor table: reflection-probe cube array (t7..)
+        D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+                    NumDescriptorRanges: 1,
+                    pDescriptorRanges: &probe_cube_range,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+        },
+        // [11] Root CBV: the ProbeSet (parallax boxes + live count) at b4.
+        D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_CBV,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                Descriptor: D3D12_ROOT_DESCRIPTOR {
+                    ShaderRegister: 4, // b4
+                    RegisterSpace: 0,
                 },
             },
             ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
@@ -1069,7 +1107,11 @@ pub(super) fn build_main_pipelines(
         let object_buffer_size = align256(
             (n_cull * std::mem::size_of::<crate::gfx::render_types::GpuObjectData>()) as u64,
         );
-        for _ in 0..FRAMES {
+        // `FRAMES + 1`: the extra slot (index `FRAMES`) is reserved for the
+        // asynchronous reflection-probe capture, which builds its CPU-written
+        // bindless buffers into a slot the frame never touches (it uses
+        // `[0, FRAMES)`). See `directx/probe.rs::bake_ring_slot`.
+        for _ in 0..FRAMES + 1 {
             let buf = create_buffer(
                 device,
                 object_buffer_size,
@@ -1138,7 +1180,11 @@ pub(super) fn build_main_pipelines(
         // the cull path is active (matches Metal); resting state `UAV` so it
         // binds as a root UAV with no transition.
         let status_size = align256((n_cull as u64) * std::mem::size_of::<u32>() as u64);
-        for _ in 0..FRAMES {
+        // `FRAMES + 1`: the extra slot (index `FRAMES`) is the reserved
+        // reflection-probe capture slot (see the object-buffer loop above). The
+        // bake culls each cube face into `indirect_cmd_buffers[FRAMES]` reading
+        // `draw_args_buffer_resources[FRAMES]`, a slot the frame never overwrites.
+        for _ in 0..FRAMES + 1 {
             let da = create_buffer(
                 device,
                 draw_args_size,
@@ -1352,4 +1398,16 @@ pub(super) fn build_composite_pipeline(
         ),
     )?;
     Ok((composite_root_sig, composite_pso))
+}
+
+#[cfg(test)]
+mod tests {
+    // The bindless main fragment shader is concatenated from probe_common.hlsl +
+    // main_bindless_frag.hlsl and compiled at runtime (FXC ps_5_1). This compiles
+    // it offline so a HLSL syntax / register error in the reflection-probe sampling
+    // fails a test instead of only surfacing as an init failure on the GPU host.
+    #[test]
+    fn bindless_main_shaders_compile() {
+        super::compile_main_bindless_shaders(false).expect("bindless main shaders must compile");
+    }
 }

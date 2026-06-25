@@ -22,7 +22,11 @@ cbuffer TransparentView : register(b0)
     float4   camera_pos;  // world-space camera, .w unused
     float2   viewport;    // attachment dimensions in pixels
     float    time;        // seconds since startup
-    float    _pad;
+    // Mips in the sky prefilter cube; 0 = no EnvironmentMap bound (the reflection
+    // then keeps the white rim where no probe covers). DX puts this per-frame
+    // value in TransparentView (not GlassParams, where Metal does) because the
+    // per-panel GlassParams CBV is static; it is only a "has env" gate for glass.
+    float    prefilter_mip_count;
 }
 
 cbuffer GlassParams : register(b1)
@@ -33,7 +37,9 @@ cbuffer GlassParams : register(b1)
     float  opacity;
     float  refraction_strength;
     float  fresnel_power;
-    float  _pad1;
+    // 1.0 when this pane has a planar reflection slot: sample the sharp mirror
+    // render (t3) projectively instead of the box-projected probe cube.
+    float  planar;
 }
 
 Texture2D<float4> scene_color : register(t0);
@@ -42,7 +48,18 @@ Texture2DMS<float> scene_depth : register(t1);
 #else
 Texture2D<float>   scene_depth : register(t1);
 #endif
+// Sky IBL prefilter cube: the reflection fallback where no probe covers the pane.
+TextureCube<float4> prefilter_cube : register(t2);
+// This pane's planar reflection resolve (the scene re-rendered mirrored across the
+// pane plane), bound per pane. Sampled projectively when `planar > 0.5`.
+Texture2D<float4> planar_reflection : register(t3);
 SamplerState post_samp : register(s0);
+
+// The probe cube array (t7), the `ProbeBlock` cbuffer (b4), and `cube_sampler`
+// (s2) are declared in probe_common.hlsl, concatenated ahead of this shader (no
+// #include handler on DX). They let glass sample the LOCAL box-projected scene
+// capture instead of only the foreign sky cube -- the same source the forward IBL
+// specular and the SSR/RT miss fallback use.
 
 struct VsIn
 {
@@ -103,13 +120,41 @@ float4 ps_main(VsOut input) : SV_TARGET
                               float2(0.001, 0.001), float2(0.999, 0.999));
     float3 refracted = scene_color.Sample(post_samp, refract_uv).rgb * tint.rgb;
 
-    // Schlick-Fresnel rim: brighter + more opaque at grazing angles.
-    float n_dot_v = saturate(dot(n, view_dir));
-    float fresnel = pow(1.0 - n_dot_v, max(fresnel_power, 1e-3));
+    // Reflection along the mirror direction. When the planar reflection is active
+    // (`planar > 0.5`: the scene re-rendered mirrored across this pane's plane)
+    // sample it projectively at this fragment's own screen UV -- a flat pane is a
+    // perfect mirror, so the mirrored render lands exactly under the reflector and
+    // needs no distortion. Otherwise prefer the local box-projected probe set (the
+    // scene capture) when the world has baked probes, else the sky prefilter cube,
+    // else a white rim so a probe-less, env-less world still reads as glass. A pane
+    // is smooth, so every path is sharp (mip 0).
+    float3 R = reflect(-view_dir, n);
+    float3 reflection;
+    if (planar > 0.5)
+    {
+        reflection = planar_reflection.Sample(post_samp, frag_uv).rgb;
+    }
+    else if (probes.count > 0u)
+    {
+        reflection = probe_set_specular(probes, input.world_pos, R, 0.0);
+    }
+    else if (prefilter_mip_count > 0.5)
+    {
+        reflection = prefilter_cube.SampleLevel(cube_sampler, R, 0.0).rgb;
+    }
+    else
+    {
+        reflection = float3(1.0, 1.0, 1.0);
+    }
 
-    float3 rim = float3(1.0, 1.0, 1.0);
-    float3 colour = lerp(refracted, rim, fresnel * 0.5);
-    float alpha = saturate(lerp(opacity, 1.0, fresnel));
+    // Schlick Fresnel (F0 = 0.04 dielectric) drives the reflection/refraction
+    // blend: ~4% head-on, rising to a full mirror at grazing. `fresnel_power`
+    // stays the author's grazing-rim shaping control for the opacity ramp.
+    float n_dot_v = saturate(dot(n, view_dir));
+    float rim = pow(1.0 - n_dot_v, max(fresnel_power, 1e-3));
+    float refl_weight = saturate(0.04 + 0.96 * rim);
+    float3 colour = lerp(refracted, reflection, refl_weight);
+    float alpha = saturate(lerp(opacity, 1.0, rim));
 
     return float4(colour, alpha);
 }

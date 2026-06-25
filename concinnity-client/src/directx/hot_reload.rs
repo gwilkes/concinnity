@@ -486,6 +486,17 @@ impl DxContext {
             )
         );
 
+        // Reflection composite (blur + composite PSOs); only when built.
+        let refl_composite_rebuilt = rebuild_if_live!(
+            self.reflection_composite.is_some(),
+            super::post::reflection_composite::rebuild_reflection_composite_pipelines(
+                device,
+                self.reflection_composite.as_ref().unwrap(),
+                hr,
+                info_queue
+            )
+        );
+
         // All builds succeeded; swap into the live context. After this
         // point the next frame's draw calls bind the freshly compiled
         // pipelines.
@@ -547,6 +558,11 @@ impl DxContext {
         }
         if let (Some(rebuilt), Some(rt)) = (rt_rebuilt, self.rt_reflections.as_mut()) {
             super::post::rt_reflections::swap_rt_reflections_pipelines(rt, rebuilt);
+        }
+        if let (Some(rebuilt), Some(rc)) =
+            (refl_composite_rebuilt, self.reflection_composite.as_mut())
+        {
+            super::post::reflection_composite::swap_reflection_composite_pipelines(rc, rebuilt);
         }
         if let (Some(rebuilt), Some(taa)) = (taa_rebuilt, self.taa.as_mut()) {
             swap_taa_pipelines(taa, rebuilt);

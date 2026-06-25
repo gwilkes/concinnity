@@ -33,7 +33,10 @@ cbuffer ViewBlock : register(b1)
     float4x4 vp;
     float4x4 view_mat;
     float elapsed;
-    float _pad0;
+    // 1.0 when an SSR/RT reflection resolve composites over this frame; the
+    // forward probe specular then yields to it below the roughness cut (see the
+    // specular_ibl fade). 0.0 keeps the full forward probe reflection.
+    float reflections_enabled;
     float cam_x;
     float cam_y;
     float cam_z;
@@ -67,7 +70,8 @@ SamplerComparisonState shadow_sampler  : register(s0);
 SamplerState           linear_sampler  : register(s1);
 TextureCube            irradiance_cube : register(t5);
 TextureCube            prefilter_cube  : register(t6);
-SamplerState           cube_sampler    : register(s2);
+// `cube_sampler` (s2), the probe cube array (t7..), and the `ProbeBlock` cbuffer
+// (b4) are declared in probe_common.hlsl, concatenated ahead of this shader.
 // Blurred SSAO occlusion (1x1 white when SSAO is disabled).
 Texture2D              ssao_tex        : register(t4);
 
@@ -359,9 +363,31 @@ float4 main(PsIn p) : SV_TARGET
         // sparkle on near mirrors; flat close-up pixels have a near-zero
         // footprint, so they keep the plain roughness mip.
         float  lod = roughness * (prefilter_mip_count - 1.0);
-        float3 prefiltered = prefilter_cube.SampleBias(cube_sampler, R, lod).rgb;
+        // A baked reflection probe reflects the actual surrounding geometry
+        // (box-projected + blended across covering probes); the imported HDR sky
+        // is only the fallback where no probe is baked.
+        float3 prefiltered = (probes.count > 0u)
+            ? probe_set_specular(probes, p.world_pos, R, lod)
+            : prefilter_cube.SampleBias(cube_sampler, R, lod).rgb;
         // Karis split-sum: F0 * scale + bias from env_brdf_approx (already in `ab`).
         float3 specular_ibl = prefiltered * (F0 * ab.x + ab.y);
+
+        // When an SSR/RT reflection resolve composites over this frame it owns
+        // the sharp specular for glossy surfaces (its miss-fallback samples this
+        // same probe set), so keeping the full forward probe specular here
+        // double-counts the reflection: a parallax-approximate probe copy under
+        // the exact resolved one. Fade the forward specular out below the
+        // resolve's roughness cut (rough surfaces, which the resolve skips, keep
+        // it). Gate on dielectrics: the resolve weights its reflection by a
+        // dielectric Fresnel (F0 ~ 0.04), so a metal's albedo-tinted probe
+        // reflection is not something the resolve can stand in for; metals keep
+        // their full forward probe specular and the resolve only adds a faint
+        // dielectric-strength term on top (no visible double).
+        if (reflections_enabled > 0.5)
+        {
+            float fade = smoothstep(REFLECTION_ROUGHNESS_CUT * 0.7, REFLECTION_ROUGHNESS_CUT, roughness);
+            specular_ibl *= lerp(1.0, fade, 1.0 - metallic);
+        }
 
         ambient = diffuse_ibl + specular_ibl;
     }

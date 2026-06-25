@@ -16,7 +16,9 @@ use crate::gfx::fullscreen::{FullscreenPass, encode_fullscreen};
 use crate::gfx::render_types::SsrParams;
 
 use crate::directx::context::{DxContext, FRAMES, align256, dump_on_err};
-use crate::directx::pipeline::{compile_hlsl, serialize_desc_and_create, shader_source};
+use crate::directx::pipeline::{
+    compile_hlsl, reflection_cut_prelude, serialize_desc_and_create, shader_source,
+};
 use crate::directx::post::gbuffer::GbufferResources;
 use crate::directx::texture::{
     create_buffer, create_rt_target, write_format_rtv, write_format_srv,
@@ -26,6 +28,10 @@ use crate::directx::texture::{
 
 pub const SSR_FULLSCREEN_VERT_HLSL: &str = include_str!("../shaders/ssr_fullscreen_vert.hlsl");
 pub const SSR_RESOLVE_FRAG_HLSL: &str = include_str!("../shaders/ssr_resolve_frag.hlsl");
+// Shared reflection-probe sampling (sample_probe_radiance + probe_set_specular),
+// concatenated ahead of the resolve shader so a missed ray can box-project the
+// local probe instead of the sky cube. The DX HLSL path has no #include handler.
+const PROBE_COMMON_HLSL: &str = include_str!("../shaders/probe_common.hlsl");
 
 // HDR-format SSR resolve output. Replaces `hdr_resolve` as the scene colour
 // the TAA / bloom / composite passes consume when SSR is on.
@@ -56,11 +62,17 @@ fn compile_ssr_shaders(hot_reload: bool) -> Result<SsrShaders, String> {
             "main",
             "vs_5_1",
         )?,
-        resolve_ps: compile_hlsl(
-            &shader_source(hot_reload, "ssr_resolve_frag.hlsl", SSR_RESOLVE_FRAG_HLSL),
-            "main",
-            "ps_5_1",
-        )?,
+        resolve_ps: {
+            // Concatenate probe_common.hlsl ahead of the resolve shader (no #include
+            // handler on DX). It declares the probe cube array (t7), the ProbeSet
+            // cbuffer (b4), and the cube sampler (s2) the miss fallback samples; all
+            // three registers are free in the resolve shader. The cut prelude (the
+            // shared REFLECTION_ROUGHNESS_CUT) goes first.
+            let cut = reflection_cut_prelude();
+            let probe_common = shader_source(hot_reload, "probe_common.hlsl", PROBE_COMMON_HLSL);
+            let frag = shader_source(hot_reload, "ssr_resolve_frag.hlsl", SSR_RESOLVE_FRAG_HLSL);
+            compile_hlsl(&format!("{cut}{probe_common}\n{frag}"), "main", "ps_5_1")?
+        },
     })
 }
 
@@ -96,6 +108,17 @@ fn create_ssr_resolve_root_signature(device: &ID3D12Device) -> Result<ID3D12Root
         RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
         NumDescriptors: 1,
         BaseShaderRegister: 3, // t3
+        RegisterSpace: 0,
+        OffsetInDescriptorsFromTableStart: D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
+    };
+    // [5] table: the reflection-probe cube array at t7..t7+MAX_PROBES (probe_common.hlsl
+    // `TextureCube probe_cubes[MAX_PROBES] : register(t7)`). Unbaked slots hold the sky
+    // prefilter cube, so a sample at any index is valid; the miss fallback box-projects
+    // these when ProbeSet.count > 0.
+    let probe_cube_range = D3D12_DESCRIPTOR_RANGE {
+        RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+        NumDescriptors: crate::directx::probe_uniforms::MAX_PROBES as u32,
+        BaseShaderRegister: 7, // t7..
         RegisterSpace: 0,
         OffsetInDescriptorsFromTableStart: D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
     };
@@ -155,6 +178,28 @@ fn create_ssr_resolve_root_signature(device: &ID3D12Device) -> Result<ID3D12Root
             },
             ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
         },
+        // [5] reflection-probe cube array table (t7..)
+        D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+                    NumDescriptorRanges: 1,
+                    pDescriptorRanges: &probe_cube_range,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+        },
+        // [6] Root CBV: ProbeSet at b4 (probe_common.hlsl `cbuffer ProbeBlock`)
+        D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_CBV,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                Descriptor: D3D12_ROOT_DESCRIPTOR {
+                    ShaderRegister: 4,
+                    RegisterSpace: 0,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+        },
     ];
     // s0: linear-clamp for scene / gbuffer / roughness.
     let scene_samp = D3D12_STATIC_SAMPLER_DESC {
@@ -186,7 +231,13 @@ fn create_ssr_resolve_root_signature(device: &ID3D12Device) -> Result<ID3D12Root
         ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
         ..Default::default()
     };
-    let samplers = [scene_samp, cube_samp];
+    // s2: cube mip-linear clamp for the reflection-probe cube array (probe_common.hlsl
+    // `cube_sampler : register(s2)`), identical filtering to the s1 prefilter sampler.
+    let probe_samp = D3D12_STATIC_SAMPLER_DESC {
+        ShaderRegister: 2,
+        ..cube_samp
+    };
+    let samplers = [scene_samp, cube_samp, probe_samp];
     let desc = D3D12_ROOT_SIGNATURE_DESC {
         NumParameters: params.len() as u32,
         pParameters: params.as_ptr(),
@@ -448,23 +499,17 @@ impl DxContext {
         if let Some(up) = &self.upscale.backend {
             return up.output_srv_gpu();
         }
-        // Hardware RT reflections take precedence over SSR: when live they write
-        // their own output target in the SsrResolve slot, and the post stack
-        // samples that. Gated on both the resolve resources and the acceleration
-        // structure (the same gate as `rt_reflections_enabled`).
-        if self.rt_reflections_active()
-            && let Some(rt) = self.rt_reflections.as_ref()
+        // When a reflection resolve ran this frame, the roughness composite wrote the
+        // scene-with-reflections into its own output; the post stack samples that.
+        // Both SSR and RT feed the same composite (RT takes precedence at the graph
+        // level, so at most one resolve runs). A SSGI-only world runs no resolve, so
+        // it samples `hdr_resolve` directly (SSGI already composited its bounce in).
+        if let Some(rc) = self.reflection_composite.as_ref()
+            && self.reflection_resolve_active()
         {
-            return rt.output_srv_gpu;
+            return rc.output_srv_gpu;
         }
-        // Only the SSR *resolve* writes a replacement scene; a SSGI-only world
-        // has no resolve output, so the post stack samples `hdr_resolve` directly
-        // (SSGI has already composited its bounce into it earlier in the RMW
-        // chain).
-        match self.ssr.as_ref().and_then(|s| s.resolve.as_ref()) {
-            Some(r) => r.output_srv_gpu,
-            None => self.hdr.srv_gpu,
-        }
+        self.hdr.srv_gpu
     }
 
     // GPU descriptor handle of the IBL prefilter cubemap SRV. Fixed at heap
@@ -503,6 +548,8 @@ impl DxContext {
         let Some(ssr) = &self.ssr else { return };
         let Some(resolve) = &ssr.resolve else { return };
         let Some(gbuffer) = &self.gbuffer else { return };
+        // The resolve writes reflected radiance + weight into `resolve.output`.
+        let reflection_srv = resolve.output_srv_gpu;
         encode_fullscreen(
             &SsrResolvePass {
                 ctx: self,
@@ -515,6 +562,9 @@ impl DxContext {
             },
             cmd,
         );
+        // Blur the reflection by roughness and composite it over the scene into the
+        // reflection-composite output (the scene the post stack then consumes).
+        self.encode_reflection_composite(cmd, reflection_srv);
     }
 }
 
@@ -575,6 +625,14 @@ impl FullscreenPass for SsrResolvePass<'_> {
             cmd.SetGraphicsRootDescriptorTable(2, self.gbuffer.normal_depth_srv_gpu);
             cmd.SetGraphicsRootDescriptorTable(3, self.gbuffer.roughness_srv_gpu);
             cmd.SetGraphicsRootDescriptorTable(4, self.ctx.prefilter_cube_srv_gpu());
+            // Reflection-probe miss fallback (probe_common.hlsl): the cube array table
+            // at t7 + the per-frame ProbeSet CBV at b4. count == 0 keeps the exact sky
+            // path, so a probe-less world is byte-identical to before.
+            cmd.SetGraphicsRootDescriptorTable(5, self.ctx.probe_cube_table_gpu());
+            cmd.SetGraphicsRootConstantBufferView(
+                6,
+                self.ctx.probe_set_cbvs[self.frame_idx].GetGPUVirtualAddress(),
+            );
             cmd.IASetPrimitiveTopology(
                 windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
             );
@@ -586,5 +644,17 @@ impl FullscreenPass for SsrResolvePass<'_> {
 
     fn end(&self, cmd: &Self::Rec) {
         self.ctx.end_fullscreen_rt(cmd, &self.resolve.output);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // The SSR resolve fragment shader is concatenated from probe_common.hlsl +
+    // ssr_resolve_frag.hlsl and compiled at runtime (FXC ps_5_1). Compile it offline
+    // so a HLSL syntax / register error in the reflection-probe miss fallback fails a
+    // test instead of only surfacing as an init failure on the GPU host.
+    #[test]
+    fn ssr_resolve_shaders_compile() {
+        super::compile_ssr_shaders(false).expect("ssr resolve shaders must compile");
     }
 }

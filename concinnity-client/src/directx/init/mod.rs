@@ -131,6 +131,12 @@ impl DxContext {
         // the `SsrResolve` slot. Any failure (no DXR, DXC absent, build error)
         // falls back to SSR. Reuses the SSR `intensity` / `max_distance` knobs.
         rt_reflection_settings: Option<crate::gfx::rt_reflections::RtReflectionSettings>,
+        // Per-axis divisor for the roughness-aware reflection blur target,
+        // resolved from `PostProcessConfig.reflection_blur_resolution`. The
+        // reflection composite sizes its reduced-resolution blur target at
+        // render-resolution / this; `Half` (=2) is the default and matches the
+        // historical hardcoded scale.
+        reflection_blur_scale: u32,
         // Authored projected decals resolved from the world's `Decal`
         // components. The decal pipeline + unit-cube buffers are always built
         // (so runtime `add_decal` works from an empty world); the encoder
@@ -327,6 +333,13 @@ impl DxContext {
         // `rt_enabled` still gates whether RT is BUILT at init, just not the slot.
         let rt_rtv_extra = 1;
         let rt_srv_extra = 1;
+        // Reflection composite: 2 RTVs (composited output + reduced-res blur) at the
+        // RTV-heap tail + 2 SRVs at the SRV-heap tail. Reserved UNCONDITIONALLY (like
+        // SSR / RT) so a live `apply_quality_settings` reflection enable can build it
+        // into its fixed slots; the resources themselves build at init only when SSR
+        // resolve or RT is authored.
+        let refl_composite_rtv_extra = 2;
+        let refl_composite_srv_extra = 2;
         // Unified G-buffer pre-pass: 3 RTVs (normal+depth, roughness, velocity),
         // 1 DSV (private depth), 3 SRVs. Slots always reserved; `gbuffer_enabled`
         // still gates whether the pre-pass resources are built at init (any
@@ -356,7 +369,8 @@ impl DxContext {
                     + ssgi_rtv_extra as u32
                     + decal_rtv_extra as u32
                     + gbuffer_rtv_extra as u32
-                    + rt_rtv_extra as u32,
+                    + rt_rtv_extra as u32
+                    + refl_composite_rtv_extra as u32,
                 ..Default::default()
             })
         }
@@ -415,6 +429,24 @@ impl DxContext {
         let flat_albedo_count = textures.len().max(1);
         let flat_normal_count = normal_maps.len() + 1;
         let _ = decal_srv_extra; // folded into the heap_layout decal block.
+
+        // Planar reflections: group each glass pane's plane into a bounded set of
+        // distinct reflector planes (near-coplanar panes share one mirror render;
+        // panes past the budget fall back to the probe cube). The distinct count
+        // sizes the reserved planar-resolve SRV block; `slots[i]` is pane `i`'s
+        // resolve slot (or `None`). Computed here (pre-heap) so the block is sized
+        // before the heap is created; the set itself is built after the render dims
+        // are known.
+        let planar_panes: Vec<[f32; 4]> = glass_panels
+            .iter()
+            .map(|p| crate::directx::planar::pane_plane(p.normal, p.centre))
+            .collect();
+        let planar_assignment = crate::gfx::planar_reflection::assign_planar_slots(
+            &planar_panes,
+            crate::directx::planar::MAX_PLANAR_PLANES,
+        );
+        let planar_resolve_srv_extra = planar_assignment.representatives.len();
+
         let heap_layout::SrvHeapLayout {
             object_base_slot,
             hdr_srv_slot,
@@ -441,7 +473,10 @@ impl DxContext {
             ssgi_gi_srv_slot,
             gbuffer_srv_base_slot,
             rt_output_srv_slot,
+            refl_composite_srv_base_slot,
+            planar_resolve_srv_base_slot,
             flat_pool_base_slot,
+            probe_cube_base_slot,
             srv_slots,
         } = heap_layout::SrvHeapLayout::compute(&heap_layout::SrvHeapParams {
             n_objects,
@@ -454,6 +489,8 @@ impl DxContext {
             ssgi_srv_extra,
             gbuffer_srv_extra,
             rt_output_srv_extra: rt_srv_extra,
+            refl_composite_srv_extra,
+            planar_resolve_srv_extra,
             albedo_count: flat_albedo_count,
             normal_count: flat_normal_count,
         });
@@ -631,6 +668,73 @@ impl DxContext {
                 prefilter,
                 prefilter_mip_count: 0,
             }
+        };
+
+        // Reflection-probe cube array: point every slot at the sky prefilter cube so
+        // the bindless main shader's `probe_cubes` table is valid before any probe
+        // bakes (unbaked slots stay the sky; a baked probe overwrites its slot in
+        // `probe_install`). The forward shader only samples a slot when
+        // `ProbeSet.count` covers it, but the descriptor table must still be valid.
+        let probe_sky_mips = env_map.prefilter_mip_count.max(1);
+        for k in 0..crate::directx::probe_uniforms::MAX_PROBES {
+            crate::directx::texture::write_cube_srv_mips(
+                &device,
+                &env_map.prefilter.resource,
+                probe_sky_mips,
+                slot_cpu(probe_cube_base_slot + k),
+            );
+        }
+
+        // ProbeSet constant buffers: a `FRAMES` ring the main pass binds at root
+        // param [11] (written per frame from `probe_set`), plus a static count-0 CBV
+        // the asynchronous capture binds so a probe face samples the sky, not other
+        // probes (and never reads the live ring while `record_frame` rewrites it).
+        let probe_set_size =
+            align256(std::mem::size_of::<crate::directx::probe_uniforms::ProbeSet>() as u64);
+        let mut probe_set_cbvs: Vec<ID3D12Resource> = Vec::with_capacity(FRAMES);
+        let mut probe_set_cbv_ptrs: Vec<*mut u8> = Vec::with_capacity(FRAMES);
+        for _ in 0..FRAMES {
+            let buf = create_buffer(
+                &device,
+                probe_set_size,
+                D3D12_HEAP_TYPE_UPLOAD,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+            )?;
+            let mut ptr = std::ptr::null_mut::<std::ffi::c_void>();
+            unsafe { buf.Map(0, None, Some(&mut ptr)) }
+                .map_err(|e| format!("map probe set cbv: {e}"))?;
+            // Initialise to the empty set (count 0) until the first frame writes it.
+            let empty = crate::directx::probe_uniforms::ProbeSet::EMPTY;
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    &empty as *const crate::directx::probe_uniforms::ProbeSet as *const u8,
+                    ptr as *mut u8,
+                    std::mem::size_of::<crate::directx::probe_uniforms::ProbeSet>(),
+                );
+            }
+            probe_set_cbv_ptrs.push(ptr as *mut u8);
+            probe_set_cbvs.push(buf);
+        }
+        let probe_set_empty_cbv = {
+            let buf = create_buffer(
+                &device,
+                probe_set_size,
+                D3D12_HEAP_TYPE_UPLOAD,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+            )?;
+            let mut ptr = std::ptr::null_mut::<std::ffi::c_void>();
+            unsafe { buf.Map(0, None, Some(&mut ptr)) }
+                .map_err(|e| format!("map probe empty cbv: {e}"))?;
+            let empty = crate::directx::probe_uniforms::ProbeSet::EMPTY;
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    &empty as *const crate::directx::probe_uniforms::ProbeSet as *const u8,
+                    ptr as *mut u8,
+                    std::mem::size_of::<crate::directx::probe_uniforms::ProbeSet>(),
+                );
+                buf.Unmap(0, None);
+            }
+            buf
         };
 
         // Cache the first directional light's direction for per-frame CSM updates.
@@ -1234,6 +1338,53 @@ impl DxContext {
             output_srv: (slot_cpu(rt_output_srv_slot), slot_gpu(rt_output_srv_slot)),
         };
 
+        // Reflection composite: 2 RTVs at the very tail (after the RT RTV) + 2 SRVs
+        // at the SRV-heap tail. `output` is the scene-with-reflections the post stack
+        // consumes; `blur` is the reduced-res roughness blur. Built when SSR resolve
+        // or RT is authored (both feed the same composite); the slots stay reserved
+        // either way for a live reflection enable.
+        let refl_composite_rtv_base = FRAMES
+            + 1
+            + bloom_count
+            + taa_rtv_extra
+            + ssao_rtv_extra
+            + ssr_rtv_extra
+            + ssgi_rtv_extra
+            + decal_rtv_extra
+            + gbuffer_rtv_extra
+            + rt_rtv_extra;
+        let refl_composite_rtv = |i: usize| D3D12_CPU_DESCRIPTOR_HANDLE {
+            ptr: rtv_base.ptr + (refl_composite_rtv_base + i) * rtv_descriptor_size,
+        };
+        let refl_composite_slots =
+            crate::directx::post::reflection_composite::ReflectionCompositeSlots {
+                output_rtv: refl_composite_rtv(0),
+                output_srv: (
+                    slot_cpu(refl_composite_srv_base_slot),
+                    slot_gpu(refl_composite_srv_base_slot),
+                ),
+                blur_rtv: refl_composite_rtv(1),
+                blur_srv: (
+                    slot_cpu(refl_composite_srv_base_slot + 1),
+                    slot_gpu(refl_composite_srv_base_slot + 1),
+                ),
+            };
+        let reflection_composite = if ssr_settings.is_some() || rt_reflection_settings.is_some() {
+            Some(
+                crate::directx::post::reflection_composite::ReflectionCompositeResources::new(
+                    &device,
+                    render_w,
+                    render_h,
+                    reflection_blur_scale,
+                    refl_composite_slots,
+                    info_queue.as_ref(),
+                    hot_reload,
+                )?,
+            )
+        } else {
+            None
+        };
+
         // Unified G-buffer pre-pass descriptor slots (always reserved). Minted
         // here so both the conditional init build below and the runtime
         // `apply_quality_settings` rebuild use the same fixed slots.
@@ -1286,6 +1437,7 @@ impl DxContext {
             ssgi_gi_srv: ssgi_slots.gi_srv,
             rt_output_rtv: rt_slots.output_rtv,
             rt_output_srv: rt_slots.output_srv,
+            refl_composite: refl_composite_slots,
             gbuffer: gbuffer_slots,
         };
 
@@ -1664,10 +1816,40 @@ impl DxContext {
             None
         };
 
+        // Planar reflections: one mirror-render resolve per distinct reflector
+        // plane (the `assign_planar_slots` representatives), each SRV in a reserved
+        // heap slot the glass pass binds per pane. `None` when no pane was assigned
+        // a planar slot (no glass, or every plane degenerate / over budget).
+        let planar_reflection = if planar_assignment.representatives.is_empty() {
+            None
+        } else {
+            // Build-time draw-record count (matches `DxContext::cull_count`): sizes
+            // each plane's region of the mirror-cull indirect buffer.
+            let planar_n_cull = n_objects + n_instances + n_chunk_max + n_skinned;
+            let resolve_srv_cpu: Vec<_> = (0..planar_assignment.representatives.len())
+                .map(|i| slot_cpu(planar_resolve_srv_base_slot + i))
+                .collect();
+            let resolve_srv_gpu: Vec<_> = (0..planar_assignment.representatives.len())
+                .map(|i| slot_gpu(planar_resolve_srv_base_slot + i))
+                .collect();
+            Some(crate::directx::planar::PlanarReflectionSet::new(
+                &device,
+                msaa_samples,
+                render_w,
+                render_h,
+                &planar_assignment.representatives,
+                &resolve_srv_cpu,
+                &resolve_srv_gpu,
+                clear_color,
+                planar_n_cull,
+            )?)
+        };
+
         // Translucent glass panels: the generic producer for the shared
         // transparent pass. `Some` only when the world declared any
         // `GlassPanel`. Shares the main-depth SRV with the decal pass; the
-        // scene-copy snapshot uses its own reserved heap slot.
+        // scene-copy snapshot uses its own reserved heap slot. `planar_assignment.slots`
+        // gives each pane its planar resolve slot (or `None` -> probe-cube fallback).
         let glass = if glass_panels.is_empty() {
             None
         } else {
@@ -1676,6 +1858,7 @@ impl DxContext {
                 &command_queue,
                 msaa_samples,
                 &glass_panels,
+                &planar_assignment.slots,
                 slot_cpu(transparent_scene_copy_srv_slot),
                 slot_gpu(transparent_scene_copy_srv_slot),
                 decal_depth_srv_gpu,
@@ -1775,6 +1958,7 @@ impl DxContext {
                 srv_heap,
                 srv_descriptor_size,
                 flat_pool_base_slot,
+                probe_cube_base_slot,
                 sampler_heap,
                 shadow_sampler_gpu,
                 linear_sampler_gpu,
@@ -1899,6 +2083,7 @@ impl DxContext {
             transient_pool,
             ssr,
             ssgi,
+            reflection_composite,
             rt_reflections,
             rt_accel,
             rt_dynamic_mode,
@@ -1909,6 +2094,7 @@ impl DxContext {
             },
             raymarch,
             glass,
+            planar_reflection,
             fog: super::context::FogState {
                 resources: fog_resources,
                 settings: fog_settings,
@@ -2001,6 +2187,17 @@ impl DxContext {
             quality_slots,
             rt_capable: raytracing_supported,
             rt_static_vertex_count: vertices.len(),
+            // Reflection probes: empty until `set_reflection_probes` supplies
+            // placements (declared or auto-seeded). See [`super::context`].
+            probe_placements: Vec::new(),
+            probe_bake_queue: crate::gfx::reflection_probe::ProbeBakeQueue::new(0),
+            probe_set: super::probe_uniforms::ProbeSet::EMPTY,
+            probe_rendering: None,
+            probe_converting: None,
+            probe_maps: Vec::new(),
+            probe_set_cbvs,
+            probe_set_cbv_ptrs,
+            probe_set_empty_cbv,
         })
     }
 }

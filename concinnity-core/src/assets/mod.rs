@@ -117,6 +117,8 @@ pub use point_light::PointLight;
 pub use post_process_config::IndirectLighting;
 pub use post_process_config::PostProcessConfig;
 #[allow(unused_imports)]
+pub use post_process_config::ReflectionBlurResolution;
+#[allow(unused_imports)]
 pub use post_process_config::SsgiResolution;
 #[allow(unused_imports)]
 pub use post_process_config::UpscaleQuality;

@@ -1070,8 +1070,10 @@ fn write_cube_srv_single_mip(
     unsafe { device.CreateShaderResourceView(resource, Some(&srv_desc), srv_cpu) };
 }
 
-// Write a multi-mip TextureCube SRV at the given heap slot.
-fn write_cube_srv_mips(
+// Write a multi-mip TextureCube SRV at the given heap slot. `pub(super)` so the
+// reflection-probe init fill + install (`directx/probe.rs`) can point a probe cube
+// array slot at the sky prefilter (init) or a baked probe cube (install).
+pub(super) fn write_cube_srv_mips(
     device: &ID3D12Device,
     resource: &ID3D12Resource,
     mip_count: u32,
@@ -1187,6 +1189,20 @@ pub(super) fn upload_environment_map(
         },
         prefilter_mip_count: mip_bytes.len() as u32,
     })
+}
+
+// Create a multi-mip prefiltered radiance cube from a reflection-probe ENVM
+// payload's prefilter mips and return the bare resource (no SRV). The probe
+// capture (`directx/probe.rs`) stores these per probe; the SRVs into the probe
+// cube array are written separately when the array is bound to the shaders.
+// `mip_bytes[m]` is `6 * (face_size >> m)² * 16` bytes in face-major order.
+pub(super) fn upload_probe_prefilter_cube(
+    device: &ID3D12Device,
+    queue: &ID3D12CommandQueue,
+    face_size: u32,
+    mip_bytes: &[&[u8]],
+) -> Result<ID3D12Resource, String> {
+    upload_prefilter_cube_resource(device, queue, face_size, mip_bytes)
 }
 
 // Create a single-mip RGBA32F TextureCube resource and upload `bytes` (six

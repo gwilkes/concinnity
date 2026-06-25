@@ -56,6 +56,7 @@ impl RenderBackend for DxContext {
         fn set_ui_cursor_hidden(&mut self, hidden: bool);
         fn set_menu_mode(&mut self, on: bool);
         fn set_camera_capture(&mut self, capture: bool);
+        fn set_reflection_probes(&mut self, probes: &[crate::gfx::reflection_probe::ProbePlacement]);
         fn set_vsync(&mut self, on: bool);
         fn set_window_mode(&mut self, mode: crate::assets::WindowMode);
         fn set_window_size(&mut self, width: u32, height: u32);

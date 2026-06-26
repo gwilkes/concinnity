@@ -258,8 +258,18 @@ impl GraphicsSystem {
                     backend.update_skinned_pose(pose.skinned_index, &pose.joint_matrices);
                 }
 
-                // apply any imperative scene jumps pushed by UiInputSystem this tick
-                for cmd in ctx.drain::<SceneCommand>() {
+                // apply any imperative scene jumps sent by UiInputSystem this
+                // tick, copied out of the event queue so the borrow is released
+                // before the jump touches the backend
+                let scene_cmds: Vec<SceneCommand> = match ctx.events::<SceneCommand>() {
+                    Some(events) => events
+                        .read(&mut self.scene_cmd_cursor)
+                        .into_iter()
+                        .cloned()
+                        .collect(),
+                    None => Vec::new(),
+                };
+                for cmd in scene_cmds {
                     scene_reel::jump_to_scene(
                         &mut self.reel,
                         &self.prop_draw_indices,

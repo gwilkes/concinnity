@@ -954,7 +954,7 @@ fn fire_action(
         // a plain integer here (see concinnity_cook::pipeline::resolve_scene_refs).
         match scene_ref.parse::<u32>() {
             Ok(id) => {
-                ctx.push(SceneCommand {
+                ctx.events_mut::<SceneCommand>().send(SceneCommand {
                     scene: AssetId(id),
                     transition: "FadeBlack".to_string(),
                 });
@@ -1188,7 +1188,9 @@ mod tests {
         world.add_component(make_frame_input(50.0, 50.0, true));
         world.step();
 
-        let has_cmd = world.query::<SceneCommand>().next().is_some();
+        let has_cmd = world
+            .events::<SceneCommand>()
+            .is_some_and(|e| !e.is_empty());
         assert!(has_cmd);
     }
 
@@ -1323,7 +1325,9 @@ mod tests {
         world.add_component(frame_input_at(600.0, 460.0, [2560.0, 1440.0]));
         world.step();
         assert!(
-            world.query::<SceneCommand>().next().is_some(),
+            world
+                .events::<SceneCommand>()
+                .is_some_and(|e| !e.is_empty()),
             "click at the scaled rect should fire the region"
         );
 
@@ -1333,7 +1337,7 @@ mod tests {
         world.add_component(frame_input_at(300.0, 230.0, [2560.0, 1440.0]));
         world.step();
         assert!(
-            world.query::<SceneCommand>().next().is_none(),
+            world.events::<SceneCommand>().is_none_or(|e| e.is_empty()),
             "click at the unscaled coords should miss the scaled region"
         );
     }
@@ -1370,7 +1374,9 @@ mod tests {
         world.add_component(make_frame_input(50.0, 50.0, true));
         world.step();
 
-        let has_cmd = world.query::<SceneCommand>().next().is_some();
+        let has_cmd = world
+            .events::<SceneCommand>()
+            .is_some_and(|e| !e.is_empty());
         assert!(
             !has_cmd,
             "scene-level region should not fire while view is active"

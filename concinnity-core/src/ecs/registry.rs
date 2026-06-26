@@ -50,7 +50,6 @@ crate::define_components! {
         CameraShot        => assets::CameraShot,        23,
         Prefab            => assets::Prefab,            24,
         HitRegion         => assets::HitRegion,         25,
-        SceneCommand      => assets::SceneCommand,      26,
         File              => assets::File,              27,
         BlockType         => assets::BlockType,         28,
         VoxelChunk        => assets::VoxelChunk,        29,
@@ -126,6 +125,10 @@ mod tests {
     }
 }
 
+// Retired component discriminants (0..128), stable on disk; never reuse:
+//   26 SceneCommand -- now an Events<SceneCommand> queue, not a component. It
+//      was RuntimeOnly (never serialized), so no blob references the gap.
+//
 // Retired system discriminants (128..255), stable on disk; never reuse:
 //   130 GraphicsSystem, 131 FpsCounter, 141 Camera3DSystem, 142 PhysicsSystem,
 //   143 UiInputSystem, 145 AnimationSystem, 146 AudioSystem, 147 StatHud

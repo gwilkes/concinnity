@@ -87,6 +87,9 @@ pub struct GraphicsSystem {
     prop_scene: Vec<Option<AssetId>>,
     // active SceneReel bookkeeping; None when no SceneReel was declared.
     reel: Option<scene_reel::ReelState>,
+    // Cursor into the Events<SceneCommand> queue, tracking which scene jumps
+    // this system has already applied.
+    scene_cmd_cursor: crate::ecs::EventCursor,
     // Font atlas data, keyed by asset id, built during init().
     loaded_fonts: std::collections::HashMap<AssetId, text::LoadedFont>,
     // Asset-streaming subsystem for the albedo texture pool. Some only when a
@@ -336,6 +339,7 @@ impl GraphicsSystem {
             prop_parents: Vec::new(),
             prop_scene: Vec::new(),
             reel: None,
+            scene_cmd_cursor: crate::ecs::EventCursor::default(),
             loaded_fonts: std::collections::HashMap::new(),
             texture_streamer: None,
             normal_map_streamer: None,

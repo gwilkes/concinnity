@@ -20,7 +20,7 @@ mod registry;
 // keeps its historical `crate::ecs::*` import paths.
 pub use concinnity_core::ecs::{
     BlobAssetDef, Component, ComponentAsset, ComponentSlot, ComponentStorage, ComponentType,
-    PayloadLocator, PipelineContext, Resources, asset_api, asset_id,
+    EventCursor, Events, PayloadLocator, PipelineContext, Resources, asset_api, asset_id,
 };
 
 // The `SystemAsset` value enum is generated client-side from each system's
@@ -214,6 +214,13 @@ impl World {
         self.components.push_typed(c);
     }
 
+    // Borrow the event queue for event type E, if any have been sent. Mirror of
+    // `PipelineContext::events`, for code holding a `World` directly (tests).
+    #[allow(dead_code)]
+    pub fn events<E: 'static>(&self) -> Option<&Events<E>> {
+        self.resources.get::<Events<E>>()
+    }
+
     #[allow(dead_code)]
     pub fn systems(&self) -> &[SystemAsset] {
         &self.systems
@@ -381,12 +388,25 @@ impl World {
         &self.profile
     }
 
+    // Advance every event queue one frame so its two-frame retention holds for
+    // readers that run after the writer. Called once per frame, before systems
+    // run. Each migrated event type is listed here explicitly.
+    fn update_events(&mut self) {
+        if let Some(events) = self
+            .resources
+            .get_mut::<Events<crate::assets::SceneCommand>>()
+        {
+            events.update();
+        }
+    }
+
     // Tick -- systems run in order, Done systems are removed.
     // Returns Done when no systems remain, Stop on hard halt.
     pub fn step(&mut self) -> StepResult {
         // Rotate the profiler's system-timing buffers so the frame that just
         // finished becomes the readable snapshot for this frame's readers.
         self.profile.begin_frame();
+        self.update_events();
         let mut ctx = PipelineContext {
             components: &mut self.components,
             blob: &mut self.blob,

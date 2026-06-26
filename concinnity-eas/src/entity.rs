@@ -52,6 +52,17 @@ impl Entity {
             generation,
         })
     }
+
+    // A handle the allocator never hands out (the top index is unreachable in
+    // practice). For a runtime-only component that has to name an Entity field
+    // but is never built from serialized args -- its real value is inserted at
+    // runtime, so this placeholder is never observed by any system.
+    pub fn dangling() -> Entity {
+        Entity {
+            index: u32::MAX,
+            generation: FIRST_GEN,
+        }
+    }
 }
 
 #[derive(Debug)]

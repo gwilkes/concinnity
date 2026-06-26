@@ -72,6 +72,21 @@ mod voxel_world;
 mod water_surface;
 mod window;
 
+// Per-instance components an entity is composed from: its placement, render
+// description, collision, hierarchy, and gameplay tags.
+mod children;
+mod collider;
+mod global_transform;
+mod held;
+mod interactable;
+mod mesh_renderer;
+mod model_renderer;
+mod parent;
+mod pickup;
+mod render_handle;
+mod scene_member;
+mod transform;
+
 // HUD-overlay request components. Declaring one runs the matching internal
 // overlay behavior (in the client crate); both are pure data here.
 mod fps_counter;
@@ -168,6 +183,20 @@ pub use water_surface::WaterSurface;
 #[allow(unused_imports)]
 pub use water_surface::{MAX_WATER_WAVES, WaterWave};
 pub use window::{Window, WindowArgs, WindowMode};
+
+// Per-instance components an entity is composed from.
+pub use children::Children;
+pub use collider::Collider;
+pub use global_transform::GlobalTransform;
+pub use held::Held;
+pub use interactable::Interactable;
+pub use mesh_renderer::MeshRenderer;
+pub use model_renderer::ModelRenderer;
+pub use parent::Parent;
+pub use pickup::Pickup;
+pub use render_handle::RenderHandle;
+pub use scene_member::SceneMember;
+pub use transform::Transform;
 
 // HUD-overlay request components; their behavior lives in the client crate.
 pub use fps_counter::FpsCounter;

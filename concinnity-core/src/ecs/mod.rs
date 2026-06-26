@@ -223,6 +223,56 @@ impl<'a> PipelineContext<'a> {
         self.components.push_typed(c);
     }
 
+    // Allocate a bare entity that owns no components yet (gameplay-only
+    // entities, or the target of subsequent `insert`).
+    #[allow(dead_code)]
+    pub fn spawn(&mut self) -> Entity {
+        self.components.spawn()
+    }
+
+    // Whether a handle refers to a currently-live entity.
+    #[allow(dead_code)]
+    pub fn is_alive(&self, entity: Entity) -> bool {
+        self.components.is_alive(entity)
+    }
+
+    // Add a component to an existing entity, so an entity can own more than one
+    // component. The entity must be alive and must not already have C.
+    #[allow(dead_code)]
+    pub fn insert<C: ComponentSlot>(&mut self, entity: Entity, c: C) {
+        self.components.insert_typed(entity, c);
+    }
+
+    // Remove component C from an entity (leaving the entity and its other
+    // components intact), returning the value if it was present.
+    #[allow(dead_code)]
+    pub fn remove<C: ComponentSlot>(&mut self, entity: Entity) -> Option<C> {
+        self.components.remove_typed::<C>(entity)
+    }
+
+    // Despawn an entity, removing it from every column and recycling its id.
+    #[allow(dead_code)]
+    pub fn despawn(&mut self, entity: Entity) {
+        self.components.despawn(entity);
+    }
+
+    // Read-only join over two component types: iterate the first type's rows
+    // and yield both refs for every entity that also has the second.
+    #[allow(dead_code)]
+    pub fn join2<A: ComponentSlot, B: ComponentSlot>(
+        &self,
+    ) -> impl Iterator<Item = (Entity, &A, &B)> {
+        self.components.join2::<A, B>()
+    }
+
+    // Read-only join over three component types, lead on the first.
+    #[allow(dead_code)]
+    pub fn join3<A: ComponentSlot, B: ComponentSlot, C: ComponentSlot>(
+        &self,
+    ) -> impl Iterator<Item = (Entity, &A, &B, &C)> {
+        self.components.join3::<A, B, C>()
+    }
+
     // Borrow the singleton resource of type T, if present.
     pub fn resource<T: std::any::Any>(&self) -> Option<&T> {
         self.resources.get::<T>()
@@ -450,7 +500,7 @@ macro_rules! define_components {
         concinnity_eas::define_component_storage! {
             storage: ComponentStorage,
             slot: ComponentSlot,
-            $( $variant => $ty ),+
+            $( $variant => $ty, $disc ),+
         }
 
         impl ComponentStorage {
@@ -458,7 +508,7 @@ macro_rules! define_components {
             // generic typed push (which mints the Entity and stamps the tick).
             pub fn push(&mut self, asset: ComponentAsset) {
                 match asset {
-                    $( ComponentAsset::$variant(c) => self.push_typed(c), )+
+                    $( ComponentAsset::$variant(c) => { self.push_typed(c); } )+
                 }
             }
 

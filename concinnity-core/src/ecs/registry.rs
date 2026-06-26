@@ -82,6 +82,18 @@ crate::define_components! {
         Slider            => assets::Slider,            61,
         ScrollPanel       => assets::ScrollPanel,       62,
         ReflectionProbe   => assets::ReflectionProbe,   65,
+        Transform         => assets::Transform,         66,
+        MeshRenderer      => assets::MeshRenderer,      67,
+        ModelRenderer     => assets::ModelRenderer,     68,
+        Collider          => assets::Collider,          69,
+        Interactable      => assets::Interactable,      70,
+        Pickup            => assets::Pickup,            71,
+        Parent            => assets::Parent,            72,
+        Children          => assets::Children,          73,
+        SceneMember       => assets::SceneMember,       74,
+        GlobalTransform   => assets::GlobalTransform,   75,
+        RenderHandle      => assets::RenderHandle,      76,
+        Held              => assets::Held,              77,
 }
 
 #[cfg(test)]
@@ -112,6 +124,34 @@ mod tests {
                 default_args.is_object(),
                 "{}: args schema is not a JSON object (got {default_args}). A declarable \
                  asset's args must be a JSON object of common types.",
+                ty.as_str()
+            );
+        }
+    }
+
+    // The per-instance components an entity is composed from are RuntimeOnly:
+    // never authored in a world, never in the asset reference, and exempt from
+    // the declarable-args contract above. Guard that they stay that way so a
+    // stray `External` origin can't leak one into the authoring surface.
+    #[test]
+    fn per_instance_components_are_runtime_only() {
+        for ty in [
+            ComponentType::Transform,
+            ComponentType::MeshRenderer,
+            ComponentType::ModelRenderer,
+            ComponentType::Collider,
+            ComponentType::Interactable,
+            ComponentType::Pickup,
+            ComponentType::Parent,
+            ComponentType::Children,
+            ComponentType::SceneMember,
+            ComponentType::GlobalTransform,
+            ComponentType::RenderHandle,
+            ComponentType::Held,
+        ] {
+            assert!(
+                !ty.registration().addable(),
+                "{} must be RuntimeOnly (not declarable)",
                 ty.as_str()
             );
         }

@@ -20,7 +20,7 @@ mod registry;
 // keeps its historical `crate::ecs::*` import paths.
 pub use concinnity_core::ecs::{
     BlobAssetDef, Component, ComponentAsset, ComponentSlot, ComponentStorage, ComponentType,
-    PayloadLocator, PipelineContext, asset_api, asset_id,
+    PayloadLocator, PipelineContext, Resources, asset_api, asset_id,
 };
 
 // The `SystemAsset` value enum is generated client-side from each system's
@@ -103,6 +103,9 @@ pub struct World {
     systems: Vec<SystemAsset>,
     blob: BlobData,
     profile: FrameProfile,
+    // Type-keyed engine singletons (e.g. the per-frame FrameInput snapshot
+    // GraphicsSystem publishes) and the event queues.
+    resources: Resources,
     // Set once `build_internal_systems` has run, so a second `start()` on the
     // same world does not append the internal systems twice.
     internal_systems_built: bool,
@@ -124,6 +127,7 @@ impl World {
             systems: Vec::new(),
             blob,
             profile: FrameProfile::default(),
+            resources: Resources::new(),
             internal_systems_built: false,
         }
     }
@@ -237,6 +241,7 @@ impl World {
             components: &mut self.components,
             blob: &mut self.blob,
             profile: &mut self.profile,
+            resources: &mut self.resources,
         };
         for system in &mut self.systems {
             system.init(&mut ctx);
@@ -386,6 +391,7 @@ impl World {
             components: &mut self.components,
             blob: &mut self.blob,
             profile: &mut self.profile,
+            resources: &mut self.resources,
         };
         let mut i = 0;
         while i < self.systems.len() {

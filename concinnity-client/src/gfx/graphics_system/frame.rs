@@ -784,7 +784,7 @@ impl GraphicsSystem {
                 // does not drift behind the menu; the UI still gets the cursor
                 // position, clicks, and Escape.
                 let gameplay = !menu_active;
-                ctx.push(FrameInput {
+                let frame_input = FrameInput {
                     forward: raw.forward && gameplay,
                     backward: raw.backward && gameplay,
                     left: raw.left && gameplay,
@@ -807,7 +807,12 @@ impl GraphicsSystem {
                     // Not gated by `gameplay`: the rebind capture works while the
                     // settings menu is open (the camera is what freezes behind it).
                     captured_key: raw.captured_key,
-                });
+                };
+                // Publish the same snapshot two ways: the resource readers can
+                // fetch by type, and the component column the camera and UI
+                // systems still drain/query.
+                ctx.insert_resource(frame_input.clone());
+                ctx.push(frame_input);
 
                 StepResult::Continue
             }

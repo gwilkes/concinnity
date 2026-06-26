@@ -240,10 +240,10 @@ impl StatHudSystem {
 
 impl System for StatHudSystem {
     fn step(&mut self, ctx: &mut PipelineContext) -> StepResult {
-        // F1 toggles the HUD. FrameInput is queried (not drained) so
-        // Camera3DSystem still consumes it later this frame; the same snapshot
-        // carries the cursor position for the mouse chip.
-        let frame_input = ctx.query::<FrameInput>().next();
+        // F1 toggles the HUD. The per-frame input snapshot is read from the
+        // FrameInput resource GraphicsSystem publishes earlier in the frame; it
+        // also carries the cursor position for the mouse chip.
+        let frame_input = ctx.resource::<FrameInput>();
         let toggled = frame_input.is_some_and(|input| input.hud_toggle);
         if let Some(input) = frame_input {
             self.mouse_pos = (input.mouse_x, input.mouse_y);

@@ -20,9 +20,6 @@
 use crate::assets;
 use crate::ecs::{AssetKind, BlobAssetDef, Component, PayloadLocator, Registration};
 use crate::result::CnResult;
-// The per-type storage primitives `define_components!` builds each component's
-// column from. Referenced by the expanded `ComponentStorage`.
-use concinnity_eas::{Column, Entities, Tick};
 
 crate::define_components! {
         Window            => assets::Window,            1,

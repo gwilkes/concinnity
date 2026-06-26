@@ -24,6 +24,7 @@ mod join_bench;
 mod mask;
 mod resource;
 mod sparse;
+mod storage;
 mod tick;
 
 pub use access::Access;

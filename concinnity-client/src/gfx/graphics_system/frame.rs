@@ -280,11 +280,25 @@ impl GraphicsSystem {
                         .collect(),
                     None => Vec::new(),
                 };
+                // Source scene-jump visibility from the decomposed components when
+                // active, snapshotting once for the whole command batch.
+                let decomposed_vis = if self.decomposed_render && !scene_cmds.is_empty() {
+                    Some(super::scene::decomposed_visibility_snapshot(ctx))
+                } else {
+                    None
+                };
                 for cmd in scene_cmds {
+                    let (draws, scenes) = match &decomposed_vis {
+                        Some((d, s)) => (d.as_slice(), s.as_slice()),
+                        None => (
+                            self.prop_draw_indices.as_slice(),
+                            self.prop_scene.as_slice(),
+                        ),
+                    };
                     scene_reel::jump_to_scene(
                         &mut self.reel,
-                        &self.prop_draw_indices,
-                        &self.prop_scene,
+                        draws,
+                        scenes,
                         elapsed,
                         cmd.scene,
                         &cmd.transition,
@@ -575,15 +589,22 @@ impl GraphicsSystem {
                     }
                 }
 
-                // advance SceneReel and apply fade / visibility changes
+                // advance SceneReel and apply fade / visibility changes. When the
+                // decomposed path is active, source visibility from the live
+                // components; the snapshot is rebuilt each frame the reel exists.
                 if self.reel.is_some() {
-                    scene_reel::tick_reel(
-                        &mut self.reel,
-                        &self.prop_draw_indices,
-                        &self.prop_scene,
-                        elapsed,
-                        backend,
-                    );
+                    if self.decomposed_render {
+                        let (draws, scenes) = super::scene::decomposed_visibility_snapshot(ctx);
+                        scene_reel::tick_reel(&mut self.reel, &draws, &scenes, elapsed, backend);
+                    } else {
+                        scene_reel::tick_reel(
+                            &mut self.reel,
+                            &self.prop_draw_indices,
+                            &self.prop_scene,
+                            elapsed,
+                            backend,
+                        );
+                    }
                 }
 
                 // Drive albedo-texture streaming: re-score every slot by

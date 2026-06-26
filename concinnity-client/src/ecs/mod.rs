@@ -199,7 +199,7 @@ impl World {
     // `SkeletonPose` components from outside the system step.
     #[allow(dead_code)]
     pub fn query_mut<C: ComponentSlot>(&mut self) -> std::slice::IterMut<'_, C> {
-        C::slot_mut(&mut self.components).iter_mut()
+        self.components.values_mut::<C>().iter_mut()
     }
 
     // Push a runtime-produced component into the matching typed slot. Mirror
@@ -207,7 +207,7 @@ impl World {
     // `Prop`s added by a world.jsonl hot-reload so subsequent systems see them.
     #[allow(dead_code)]
     pub fn push<C: ComponentSlot>(&mut self, c: C) {
-        C::slot_mut(&mut self.components).push(c);
+        self.components.push_typed(c);
     }
 
     #[allow(dead_code)]

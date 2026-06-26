@@ -19,6 +19,9 @@ doctest = false
 vulkan = []
 
 [dependencies]
+# Generic closed-world ECS mechanism (entities, columns, ticks). Domain-free,
+# so the dependency runs one way: concinnity-eas <- concinnity-core.
+concinnity-eas = { path = "../concinnity-eas" }
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
 serde_json = { version = "1", features = ["preserve_order"] }

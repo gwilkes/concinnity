@@ -11,7 +11,7 @@
 // clamped forward so the signed-window comparison never aliases.
 pub const MAX_CHANGE_AGE: u32 = u32::MAX / 2;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Tick(pub u32);
 
 impl Tick {
@@ -49,6 +49,11 @@ impl Tick {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_is_zero() {
+        assert_eq!(Tick::default(), Tick::ZERO);
+    }
 
     #[test]
     fn bump_advances() {

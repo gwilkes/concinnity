@@ -19,6 +19,8 @@ mod command;
 mod entity;
 mod event;
 mod join;
+#[cfg(test)]
+mod join_bench;
 mod mask;
 mod resource;
 mod sparse;

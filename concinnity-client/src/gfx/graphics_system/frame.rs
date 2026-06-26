@@ -367,12 +367,14 @@ impl GraphicsSystem {
                         }
                         // Mouse sensitivity is owned by the camera controller,
                         // not the renderer: hand the new radians/pixel value
-                        // across as a ControlsCommand the camera drains this tick
+                        // across as a ControlsCommand the camera reads this tick
                         // (live, no restart).
                         if cmd.setting == "mouse_sensitivity" {
-                            ctx.push(crate::assets::ControlsCommand {
-                                mouse_sensitivity: stored,
-                            });
+                            ctx.events_mut::<crate::assets::ControlsCommand>().send(
+                                crate::assets::ControlsCommand {
+                                    mouse_sensitivity: stored,
+                                },
+                            );
                         }
                         // Move the handle to the new fraction.
                         if let Some((handle_id, track_x, track_w, handle_w)) = geom {
@@ -491,9 +493,11 @@ impl GraphicsSystem {
                             let next = settings::cycle(cur, opts.len(), cmd.op);
                             let gain = settings::master_volume_at(next);
                             cfg.audio.master_volume = Some(gain);
-                            ctx.push(crate::assets::AudioCommand {
-                                master_volume: gain,
-                            });
+                            ctx.events_mut::<crate::assets::AudioCommand>().send(
+                                crate::assets::AudioCommand {
+                                    master_volume: gain,
+                                },
+                            );
                             Some(opts[next])
                         }
                         // Quality-feature toggles: flip the matching field on the

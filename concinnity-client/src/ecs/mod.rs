@@ -221,6 +221,19 @@ impl World {
         self.resources.get::<Events<E>>()
     }
 
+    // Mutably borrow (creating if absent) the event queue for event type E.
+    // Mirror of `PipelineContext::events_mut`, for code holding a `World`
+    // directly: tests, and the editor's debug-driven command injection.
+    #[allow(dead_code)]
+    pub fn events_mut<E: 'static>(&mut self) -> &mut Events<E> {
+        if !self.resources.contains::<Events<E>>() {
+            self.resources.insert(Events::<E>::new());
+        }
+        self.resources
+            .get_mut::<Events<E>>()
+            .expect("Events<E> was just inserted")
+    }
+
     #[allow(dead_code)]
     pub fn systems(&self) -> &[SystemAsset] {
         &self.systems
@@ -388,16 +401,20 @@ impl World {
         &self.profile
     }
 
-    // Advance every event queue one frame so its two-frame retention holds for
-    // readers that run after the writer. Called once per frame, before systems
-    // run. Each migrated event type is listed here explicitly.
-    fn update_events(&mut self) {
-        if let Some(events) = self
-            .resources
-            .get_mut::<Events<crate::assets::SceneCommand>>()
-        {
+    // Advance one event queue a frame so its two-frame retention holds for
+    // readers that run after the writer.
+    fn update_event_queue<E: 'static>(&mut self) {
+        if let Some(events) = self.resources.get_mut::<Events<E>>() {
             events.update();
         }
+    }
+
+    // Advance every migrated event queue once per frame, before systems run.
+    // Each migrated event type is listed here explicitly.
+    fn update_events(&mut self) {
+        self.update_event_queue::<crate::assets::SceneCommand>();
+        self.update_event_queue::<crate::assets::ControlsCommand>();
+        self.update_event_queue::<crate::assets::AudioCommand>();
     }
 
     // Tick -- systems run in order, Done systems are removed.

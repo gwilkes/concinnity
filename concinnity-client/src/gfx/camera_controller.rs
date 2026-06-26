@@ -34,6 +34,8 @@ pub struct Camera3DSystem {
     // indices into the Prop list for props that have interactable=true,
     // collected at init() so step() can query_mut only those props
     interactable_indices: Vec<usize>,
+    // Cursor into the Events<ControlsCommand> queue (live settings changes).
+    controls_cursor: crate::ecs::EventCursor,
 }
 
 impl Camera3DSystem {
@@ -50,6 +52,7 @@ impl Camera3DSystem {
             last_step: None,
             velocity: [0.0; 3],
             interactable_indices: Vec::new(),
+            controls_cursor: crate::ecs::EventCursor::default(),
         }
     }
 
@@ -92,10 +95,12 @@ impl System for Camera3DSystem {
 
     fn step(&mut self, ctx: &mut PipelineContext) -> StepResult {
         // Apply any live controls change (settings-menu sensitivity slider)
-        // pushed this tick by GraphicsSystem, which runs first. Drained so the
-        // signals do not accumulate; the last one this tick wins.
-        for cmd in ctx.drain::<ControlsCommand>() {
-            self.mouse_sensitivity = cmd.mouse_sensitivity;
+        // sent this tick by GraphicsSystem, which runs first. The last one this
+        // tick wins.
+        if let Some(events) = ctx.events::<ControlsCommand>() {
+            for cmd in events.read(&mut self.controls_cursor) {
+                self.mouse_sensitivity = cmd.mouse_sensitivity;
+            }
         }
 
         // Read (not drain) the input snapshot deposited by GraphicsSystem this
@@ -319,10 +324,10 @@ mod tests {
         world.add_component(camera(Some(ctrl)));
         world.start().unwrap();
 
-        // GraphicsSystem would push this when the slider is dragged; the camera
-        // drains it this tick. A mouse delta in the same frame must rotate by the
+        // GraphicsSystem would send this when the slider is dragged; the camera
+        // reads it this tick. A mouse delta in the same frame must rotate by the
         // NEW sensitivity (0.005), not the controller's 0.001.
-        world.add_component(ControlsCommand {
+        world.events_mut::<ControlsCommand>().send(ControlsCommand {
             mouse_sensitivity: 0.005,
         });
         world.add_component(FrameInput {

@@ -86,8 +86,6 @@ crate::define_components! {
         SettingCommand    => assets::SettingCommand,    60,
         Slider            => assets::Slider,            61,
         ScrollPanel       => assets::ScrollPanel,       62,
-        ControlsCommand   => assets::ControlsCommand,   63,
-        AudioCommand      => assets::AudioCommand,      64,
         ReflectionProbe   => assets::ReflectionProbe,   65,
 }
 
@@ -125,9 +123,10 @@ mod tests {
     }
 }
 
-// Retired component discriminants (0..128), stable on disk; never reuse:
-//   26 SceneCommand -- now an Events<SceneCommand> queue, not a component. It
-//      was RuntimeOnly (never serialized), so no blob references the gap.
+// Retired component discriminants (0..128), stable on disk; never reuse. Each
+// is now an Events<T> queue, not a component; all were RuntimeOnly (never
+// serialized), so no blob references the gaps:
+//   26 SceneCommand, 63 ControlsCommand, 64 AudioCommand
 //
 // Retired system discriminants (128..255), stable on disk; never reuse:
 //   130 GraphicsSystem, 131 FpsCounter, 141 Camera3DSystem, 142 PhysicsSystem,

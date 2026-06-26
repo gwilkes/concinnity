@@ -1,0 +1,16 @@
+[package]
+name = "concinnity-eas"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "concinnity_eas"
+doctest = false
+
+# No dependencies on purpose. EAS is the closed-world ECS mechanism and must
+# stay free of engine domain types and heavy crates: the dependency arrow is
+# concinnity-eas <- concinnity-core <- concinnity-client. A thread pool is
+# injected as a trait rather than taken as a dependency here.
+[dependencies]

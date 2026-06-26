@@ -666,9 +666,33 @@ impl VkContext {
                 // quad's clip-space depth matches the stored main-depth the
                 // fragment shader tests against. Water is a separate
                 // (Metal-only) producer not ported here.
+                // Planar reflections run inline at the head of the pass (same cmd
+                // buffer -> each plane's mirror target is ready before the glass
+                // draws sample it). A no-op when the world has no planar set.
+                // Skipped when the per-pixel RT glass trace is live: it supersedes
+                // planar (sharp + off-screen-correct), so the mirror re-render would
+                // be wasted. Gating on `rt_glass_active` (not `rt_reflections_active`)
+                // keeps planar alive when RT is live but the glass RT pipelines
+                // failed to build, so the glass probe / planar fallback samples a
+                // freshly rendered resolve. Mirrors DirectX.
+                if !self.rt_glass_active() {
+                    self.encode_planar_reflections(
+                        cmd,
+                        params.frame_idx,
+                        params.vp_mat,
+                        params.cam_pos,
+                        params.elapsed,
+                    )?;
+                }
                 let view =
                     self.build_transparent_view(params.vp_mat, params.cam_pos, params.elapsed);
-                self.encode_transparent(cmd, params.frame_idx, &view)?;
+                self.encode_transparent(
+                    cmd,
+                    params.frame_idx,
+                    &view,
+                    params.fov_y_radians,
+                    params.aspect,
+                )?;
             }
             PassId::HizBuild => {
                 // Two-pass occlusion: rebuild the Hi-Z pyramid mid-frame from

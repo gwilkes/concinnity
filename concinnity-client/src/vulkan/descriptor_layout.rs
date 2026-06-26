@@ -27,7 +27,13 @@ pub(in crate::vulkan) type Binding = (u32, vk::DescriptorType, vk::ShaderStageFl
 //   4  irradiance cube           (FS)
 //   5  prefiltered env cube      (FS)
 //   6  SSAO occlusion / fallback (FS)
-pub(in crate::vulkan) fn global_set() -> [Binding; 7] {
+//   7  ProbeSet UBO              (FS)
+// Binding 8 is the reflection-probe cube array; it carries `descriptorCount =
+// MAX_PROBES` rather than 1, so it does NOT go through `create_descriptor_set_layout`
+// (which fixes every binding at count 1). It is appended inline where the global
+// layout is built in `init.rs` (the same way the bindless texture pool's array
+// binding is built); `PROBE_CUBE_ARRAY_BINDING` is its locked binding number.
+pub(in crate::vulkan) fn global_set() -> [Binding; 8] {
     use vk::DescriptorType as T;
     use vk::ShaderStageFlags as S;
     [
@@ -38,8 +44,15 @@ pub(in crate::vulkan) fn global_set() -> [Binding; 7] {
         (4, T::COMBINED_IMAGE_SAMPLER, S::FRAGMENT),
         (5, T::COMBINED_IMAGE_SAMPLER, S::FRAGMENT),
         (6, T::COMBINED_IMAGE_SAMPLER, S::FRAGMENT),
+        (7, T::UNIFORM_BUFFER, S::FRAGMENT),
     ]
 }
+
+// Binding number of the reflection-probe cube array in global set 0. A
+// `samplerCube probe_cubes[MAX_PROBES]` array (descriptorCount = MAX_PROBES),
+// appended to the layout inline in `init.rs` since the count-1 layout helper
+// cannot express it. Sits exactly one past the count-1 `global_set()` table.
+pub(in crate::vulkan) const PROBE_CUBE_ARRAY_BINDING: u32 = 8;
 
 // Per-object set (set 1): albedo at 0, normal map at 1.
 pub(in crate::vulkan) fn object_set() -> [Binding; 2] {
@@ -102,8 +115,17 @@ mod tests {
                 (4, T::COMBINED_IMAGE_SAMPLER, S::FRAGMENT),
                 (5, T::COMBINED_IMAGE_SAMPLER, S::FRAGMENT),
                 (6, T::COMBINED_IMAGE_SAMPLER, S::FRAGMENT),
+                (7, T::UNIFORM_BUFFER, S::FRAGMENT),
             ]
         );
+    }
+
+    // The probe cube array binding sits exactly one past the count-1 global-set
+    // table, so the layout (count-1 bindings 0..n + the count-MAX_PROBES array
+    // binding) stays gap-free. A reorder that collides it with the table fails here.
+    #[test]
+    fn probe_cube_array_binding_follows_global_set() {
+        assert_eq!(PROBE_CUBE_ARRAY_BINDING, global_set().len() as u32);
     }
 
     #[test]

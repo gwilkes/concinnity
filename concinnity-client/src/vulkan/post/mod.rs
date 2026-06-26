@@ -6,6 +6,7 @@
 // `metal/post/` shape:
 //
 //   bloom.rs    prefilter + downsample/upsample mip chain
+//   reflection_composite.rs  roughness blur + composite of the SSR/RT reflection
 //   ssao.rs     GTAO depth+normal pre-pass + horizon-search kernel + blur
 //   ssgi.rs     hemisphere gather + depth-aware blur over the SSR G-buffer
 //   ssr.rs      depth+normal+roughness pre-pass + fullscreen ray-march resolve
@@ -15,6 +16,7 @@
 pub(in crate::vulkan) mod bloom;
 pub(in crate::vulkan) mod fullscreen;
 pub(in crate::vulkan) mod gbuffer;
+pub(in crate::vulkan) mod reflection_composite;
 pub(in crate::vulkan) mod rt_reflections;
 pub(in crate::vulkan) mod ssao;
 pub(in crate::vulkan) mod ssgi;
@@ -23,6 +25,7 @@ pub(in crate::vulkan) mod taa;
 pub(in crate::vulkan) mod upscale;
 
 pub(in crate::vulkan) use gbuffer::GbufferResources;
+pub(in crate::vulkan) use reflection_composite::ReflectionCompositeResources;
 pub(in crate::vulkan) use rt_reflections::RtReflectionsResources;
 pub(in crate::vulkan) use ssao::SsaoResources;
 pub(in crate::vulkan) use ssgi::SsgiResources;

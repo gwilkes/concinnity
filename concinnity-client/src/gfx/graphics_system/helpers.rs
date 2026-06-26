@@ -181,9 +181,7 @@ pub(super) fn init_backend(
     // Number of skinned draw objects (the world's `SkinnedMesh` count). Threaded
     // purely to size each backend's shared GPU-cull buffers for the merged total
     // (static + instances + skinned) at init; the skinned geometry itself is
-    // uploaded later via `upload_skinned`. Honoured by the DirectX backend (the
-    // GPU-driven skinned fold); Vulkan / Metal accept it for parity and size it in
-    // when their skinned fold lands.
+    // uploaded later via `upload_skinned`.
     n_skinned: usize,
     // Worst-case resident chunk count for a streaming VoxelWorld (0 otherwise).
     // Threaded purely to reserve a chunk record region in each backend's shared
@@ -205,9 +203,8 @@ pub(super) fn init_backend(
     normal_maps: &[(u32, u32, Vec<u8>)],
     light_uniforms: crate::gfx::render_types::LightUniforms,
     shadow_map_size: u32,
-    // shadow-cascade update policy from GraphicsConfig.shadow_update. Honoured
-    // by the Metal backend; DirectX and Vulkan accept it for signature parity
-    // (they re-render every cascade every frame).
+    // shadow-cascade update policy from GraphicsConfig.shadow_update. The shared
+    // `ShadowCascadeScheduler` staggers which cascades re-render each frame.
     shadow_update: crate::assets::ShadowUpdate,
     // glyph atlas textures for text rendering; empty = no text support
     text_atlases: Vec<(u32, u32, Vec<u8>)>,
@@ -219,52 +216,40 @@ pub(super) fn init_backend(
     // serialised ColorLut payload (3D grading LUT). None disables grading;
     // the runtime then binds an identity LUT.
     color_lut_bytes: Option<&[u8]>,
-    // temporal anti-aliasing toggle from PostProcessConfig.taa. Honoured by
-    // the Metal backend; DirectX and Vulkan accept it for signature parity.
+    // temporal anti-aliasing toggle from PostProcessConfig.taa.
     taa_enabled: bool,
     // SSAO (GTAO) settings from PostProcessConfig; None disables SSAO.
-    // Honoured by the Metal and DirectX backends; Vulkan accepts it for parity.
     ssao_settings: Option<crate::gfx::ssao::SsaoSettings>,
-    // SSR settings from PostProcessConfig; None disables SSR. Honoured by
-    // the Metal and DirectX backends; Vulkan accepts it for parity.
+    // SSR settings from PostProcessConfig; None disables SSR.
     ssr_settings: Option<crate::gfx::ssr::SsrSettings>,
-    // SSGI settings from PostProcessConfig; None disables SSGI. Honoured by the
-    // Metal, DirectX, and Vulkan backends (the hemisphere-gather GI pass over
-    // the shared SSR depth + normal pre-pass G-buffer).
+    // SSGI settings from PostProcessConfig; None disables SSGI.
     ssgi_settings: Option<crate::gfx::ssgi::SsgiSettings>,
     // RT-reflection settings from PostProcessConfig; None disables RT
-    // reflections. Honoured only by the Metal backend (and only on a GPU that
-    // supports ray tracing); DirectX / Vulkan have no hardware-RT path yet.
-    // Takes precedence over `ssr_settings` where RT is live (the graph builder
-    // picks RtReflections over SsrResolve); SSR stays the cross-backend fallback.
+    // reflections. Requires a GPU with ray-tracing support, else the graph falls
+    // back to SSR. Takes precedence over `ssr_settings` where RT is live (the
+    // graph builder picks RtReflections over SsrResolve); SSR stays the fallback.
     rt_reflection_settings: Option<crate::gfx::rt_reflections::RtReflectionSettings>,
     // Per-axis divisor for the roughness-aware reflection blur target, resolved
-    // from `PostProcessConfig.reflection_blur_resolution`. Honoured by the
-    // DirectX backend (sizes its reflection-composite blur target at render /
-    // this); Metal uses a fixed half-resolution blur and Vulkan has no
-    // composite, so both ignore it (dropped below on those backends).
+    // from `PostProcessConfig.reflection_blur_resolution`. The reflection-composite
+    // blur target is sized at render / this.
     reflection_blur_scale: u32,
     // Projected decals resolved from the world's `Decal` components.
-    // Honoured by the Metal, DirectX, and Vulkan backends.
     decals: Vec<crate::gfx::decal::DecalRecord>,
     // Particle-emitter records resolved from the world's `ParticleEmitter`
-    // components. Honoured by the Metal backend; DirectX and Vulkan accept the
-    // slice for parity but spawn / render nothing.
+    // components.
     particles: Vec<crate::gfx::particles::ParticleEmitterRecord>,
-    // Volumetric-fog settings resolved from `VolumetricFog`. Honoured by the
-    // Metal and DirectX backends; Vulkan accepts it for parity but renders no fog.
+    // Volumetric-fog settings resolved from `VolumetricFog`.
     fog_settings: Option<crate::gfx::volumetric_fog::FogSettings>,
     // Auto-exposure settings resolved from PostProcessConfig; None disables
-    // auto-exposure. Honoured by the Metal backend; DirectX / Vulkan accept it
-    // for parity but ignore it.
+    // auto-exposure.
     auto_exposure_settings: Option<crate::gfx::auto_exposure::AutoExposureSettings>,
     // Authored `exposure_ev` carried through as a bias on the adapted EV when
     // auto-exposure is on; ignored when it is off.
     auto_exposure_bias_ev: f32,
-    // World-side HDR display request from `PostProcessConfig.hdr_display`.
-    // Honoured by every backend: Metal reconfigures the CAMetalLayer +
-    // composite shader once the active panel's EDR capability clears the
-    // threshold; DirectX picks the scRGB-linear DXGI colour space when
+    // World-side HDR display request from `PostProcessConfig.hdr_display`. Each
+    // backend gates this on its own HDR-capability check: Metal reconfigures the
+    // CAMetalLayer + composite shader once the active panel's EDR capability
+    // clears the threshold; DirectX picks the scRGB-linear DXGI colour space when
     // `CheckColorSpaceSupport` accepts it; Vulkan opts into the
     // `VK_EXT_swapchain_colorspace` instance extension and picks the
     // scRGB-linear surface format when both the loader exposes the
@@ -278,42 +263,34 @@ pub(super) fn init_backend(
     // No effect when `hdr_display` is false or the active panel reports no
     // EDR headroom.
     hdr_pq: bool,
-    // Temporal upscaling toggle from `PostProcessConfig.temporal_upscaling`.
-    // Honoured only by the Metal backend (MetalFX temporal scaler); DirectX
-    // and Vulkan accept it for signature parity. With this on, the renderer
-    // draws the 3D scene at `(drawable * upscale_scale)` and a per-backend
-    // upscaler reconstructs a drawable-resolution image.
+    // Temporal upscaling toggle from `PostProcessConfig.temporal_upscaling`. With
+    // this on, the renderer draws the 3D scene at `(drawable * upscale_scale)` and
+    // a per-backend upscaler reconstructs a drawable-resolution image.
     temporal_upscaling: bool,
     // Per-axis input-to-output ratio from `PostProcessConfig.upscale_quality`
     // (e.g. 2/3 for Quality, 0.5 for Performance). Ignored when
     // `temporal_upscaling` is false.
     upscale_scale: f32,
     // Upscaler backend selector from `PostProcessConfig.upscale_backend`.
-    // Honoured by DirectX (FSR3 / DLSS / XeSS); Metal / Vulkan ignore it and
-    // drop it below.
+    // Honoured by the DirectX and Vulkan backends (FSR3 / DLSS / XeSS); Metal
+    // always uses MetalFX, so it ignores the selector and drops it below.
     upscale_backend: crate::assets::UpscalerBackend,
     // Two-pass Hi-Z occlusion toggle from
-    // `PostProcessConfig.occlusion_two_pass`. Honoured only by the Metal
-    // backend (which gates it on the bindless cull path being active);
-    // DirectX / Vulkan ignore it for now (their executors have no phase-2
-    // path yet), so the param is dropped on those backends below.
+    // `PostProcessConfig.occlusion_two_pass`. Each backend gates it on the
+    // bindless GPU-cull path being active (the phase-2 cull pipeline must exist).
     occlusion_two_pass: bool,
     // Transparent water surfaces drained from the world's `WaterSurface`
     // components. Honoured by the Metal backend; DirectX / Vulkan accept the
     // slice for parity but render no water yet.
     water_surfaces: Vec<crate::assets::WaterSurface>,
     // Translucent glass panels drained from the world's `GlassPanel`
-    // components. Honoured by the Metal + DirectX backends (the shared
-    // transparent pass's glass producer); Vulkan accepts the slice for parity
-    // and renders no glass yet.
+    // components.
     glass_panels: Vec<crate::assets::GlassPanel>,
     // Raymarched SDF volumes drained from the world's `SdfVolume`
     // components, paired with their compiled-payload fragment shader
-    // source bytes + asset label. Honoured by the Metal backend; DirectX
-    // / Vulkan accept the slice for signature parity and ignore it.
+    // source bytes + asset label.
     sdf_volumes: Vec<(crate::assets::SdfVolume, Vec<u8>, String)>,
-    // Shader hot-reload toggle, true only under `cn debug`. Currently honoured
-    // only by the Metal backend; DirectX / Vulkan accept it for parity.
+    // Shader hot-reload toggle, true only under `cn debug`.
     hot_reload: bool,
 ) -> Option<Box<dyn crate::gfx::backend::RenderBackend>> {
     // `water_surfaces` is Metal-only today (the Vulkan + DirectX GLSL /
@@ -338,11 +315,8 @@ pub(super) fn init_backend(
     #[cfg(backend_metal)]
     let _ = shadow_bytes;
 
-    // The reflection-blur divisor only feeds the DirectX reflection composite;
-    // Metal hardcodes its blur scale and Vulkan has no composite yet, so drop it
-    // on those backends to avoid the unused-binding lint.
-    #[cfg(not(backend_dx))]
-    let _ = reflection_blur_scale;
+    // The reflection-blur divisor feeds every backend's reflection composite
+    // (each sizes its blur target at render / this).
 
     #[cfg(backend_dx)]
     {
@@ -440,6 +414,7 @@ pub(super) fn init_backend(
             ssr_settings,
             ssgi_settings,
             rt_reflection_settings,
+            reflection_blur_scale,
             decals,
             particles,
             fog_settings,
@@ -498,6 +473,7 @@ pub(super) fn init_backend(
             ssr_settings,
             ssgi_settings,
             rt_reflection_settings,
+            reflection_blur_scale,
             decals,
             particles,
             fog_settings,

@@ -705,6 +705,13 @@ pub(super) struct VkUniforms {
     pub(super) view_ubo_buffers: Vec<vk::Buffer>,
     pub(super) view_ubo_memories: Vec<vk::DeviceMemory>,
     pub(super) view_ubo_ptrs: Vec<*mut u8>,
+    // Per-frame-in-flight `ProbeSet` UBO (reflection-probe count + per-probe
+    // parallax boxes), bound at global set 0 binding 7, persistently mapped.
+    // `record_frame` memcpys `self.probe_set` into `probe_set_ubo_ptrs` each
+    // frame; it stays `EMPTY` (count 0 = sky reflection) until a probe bakes.
+    pub(super) probe_set_ubo_buffers: Vec<vk::Buffer>,
+    pub(super) probe_set_ubo_memories: Vec<vk::DeviceMemory>,
+    pub(super) probe_set_ubo_ptrs: Vec<*mut u8>,
     // Single `LightUniforms` UBO, uploaded once at init and bound into every
     // object descriptor set.
     pub(super) light_ubo: vk::Buffer,
@@ -726,6 +733,15 @@ impl VkUniforms {
                 .view_ubo_buffers
                 .iter()
                 .zip(self.view_ubo_memories.iter())
+            {
+                device.unmap_memory(mem);
+                device.destroy_buffer(buf, None);
+                device.free_memory(mem, None);
+            }
+            for (&buf, &mem) in self
+                .probe_set_ubo_buffers
+                .iter()
+                .zip(self.probe_set_ubo_memories.iter())
             {
                 device.unmap_memory(mem);
                 device.destroy_buffer(buf, None);
@@ -912,6 +928,14 @@ pub struct VkContext {
     // `scene_srv_for_post` gating on `s.resolve.as_ref()`.
     pub(super) ssr_resolve_active: bool,
 
+    // Roughness-aware reflection composite. `Some` whenever a reflection path owns
+    // the post-stack scene image (the SSR resolve is active OR RT reflections are
+    // active). Both resolves write reflected radiance + weight into their output
+    // target, then this blurs by roughness and composites over the scene into
+    // `reflection_composite.output` -- the scene image the post stack consumes in
+    // place of the raw resolve output. Mirrors `DxContext::reflection_composite`.
+    pub(super) reflection_composite: Option<ReflectionCompositeResources>,
+
     // Screen-space global illumination. `Some` only when the world's
     // `PostProcessConfig` selected `indirect_lighting: ssgi`. The gather +
     // composite run on the hdr_resolve RMW chain after the main pass, reusing
@@ -994,6 +1018,12 @@ pub struct VkContext {
     // scene between `SsrResolve` and `TaaResolve`. Water is a separate
     // (Metal-only) producer not ported here. Mirrors `src/directx/glass.rs`.
     pub(super) glass: Option<crate::vulkan::glass::GlassResources>,
+
+    // Planar reflections for flat glass panes: one render-resolution mirror render
+    // per distinct reflector plane, sampled projectively by the glass pass. `Some`
+    // only when the world declared glass panes assigned to a planar slot. Mirrors
+    // `src/directx/planar.rs`.
+    pub(super) planar_reflection: Option<crate::vulkan::planar::PlanarReflectionSet>,
 
     // Resolved swapchain colour-output mode, selected when the world's
     // `PostProcessConfig.hdr_display` was on AND the surface advertised a
@@ -1200,6 +1230,32 @@ pub struct VkContext {
     // Owned IBL cube textures. Live for the lifetime of the context.
     pub(super) env_map: EnvironmentMapTextures,
 
+    // Reflection-probe placements (declared `ReflectionProbe`s or an auto-seeded
+    // grid), supplied once after construction via `set_reflection_probes`. The
+    // cube capture that bakes one prefiltered cube per placement runs across
+    // later frames (next slice); held here so that capture can walk them.
+    #[allow(dead_code)] // consumed by the probe capture pass (next slice).
+    pub(super) probe_placements: Vec<crate::gfx::reflection_probe::ProbePlacement>,
+    // The probe set (count + per-probe parallax boxes) bound to the forward /
+    // SSR / RT shaders. `EMPTY` (count 0 = sky reflection) until the staggered
+    // capture bakes cubes and installs them; each install bumps the count.
+    pub(super) probe_set: super::probe_uniforms::ProbeSet,
+    // Baked reflection-probe prefilter cubes, one per installed probe, parallel
+    // to `probe_set.probes[..probe_set.count]`. Distinct from `env_map`; sampled
+    // only by the specular reflection term once the capture installs them. Grows as
+    // the staggered bake installs each probe. Destroyed in `Drop`.
+    pub(super) probe_maps: Vec<GpuImage>,
+
+    // Staggered asynchronous probe-bake state, driven each frame by
+    // `bake_pending_probes` (the shared `reflection_probe::next_bake_action`
+    // transition table). `probe_bake_queue` hands out placements in order; at most one
+    // probe is `probe_rendering` (six faces submitting one per frame, on per-face
+    // fences) and one `probe_converting` (its faces read back, the prefilter
+    // convolution running off the render thread). Mirrors DirectX / Metal.
+    pub(super) probe_bake_queue: crate::gfx::reflection_probe::ProbeBakeQueue,
+    pub(super) probe_rendering: Option<super::probe::RenderingBake>,
+    pub(super) probe_converting: Option<super::probe::ConvertingBake>,
+
     // Deferred buffer destruction (text transient buffers)
     pub(super) deferred_destroy: RefCell<Vec<DeferredBuffer>>,
 
@@ -1305,6 +1361,14 @@ impl VkContext {
                     u64::MAX,
                 )
                 .map_err(|e| format!("wait fences: {e}"))?;
+        }
+
+        // Advance the staggered reflection-probe bake one step. Runs here -- after
+        // this frame's slot fence wait, before `record_frame` -- so any cube it
+        // installs (a binding-8 rewrite + `probe_set.count` bump) is picked up by this
+        // frame's `record_frame` ProbeSet upload + rendering. Non-fatal.
+        if let Err(e) = self.bake_pending_probes() {
+            tracing::warn!("reflection probe bake step failed: {e}");
         }
 
         // Reset this frame's render stats. `record_frame` accumulates
@@ -1762,6 +1826,15 @@ impl Drop for VkContext {
         let device = self.device.clone();
         let device = &device;
 
+        // Abandon any in-flight staggered probe bake: free its per-face command
+        // buffers (before `self.commands` is destroyed below) + fences + bake target.
+        // `wait_idle` above retired its GPU work. The converting slot holds only CPU
+        // data (drops freely; its worker thread, if still running, touches no vk
+        // handle, only the shared payload `OnceLock`).
+        if let Some(rendering) = self.probe_rendering.take() {
+            rendering.destroy(device, self.commands.command_pool);
+        }
+
         // Deferred text buffers.
         for db in self.deferred_destroy.borrow().iter() {
             db.destroy(device);
@@ -1845,6 +1918,11 @@ impl Drop for VkContext {
             ssr.destroy(device);
         }
 
+        // Reflection composite (roughness blur + composite of the SSR/RT output).
+        if let Some(rc) = &mut self.reflection_composite {
+            rc.destroy(device);
+        }
+
         // SSGI resources (gather + composite).
         if let Some(ssgi) = &mut self.ssgi {
             ssgi.destroy(device);
@@ -1885,6 +1963,13 @@ impl Drop for VkContext {
         // ring, descriptor pool, render passes, snapshot image).
         if let Some(rm) = &mut self.raymarch {
             rm.destroy(device);
+        }
+
+        // Planar reflection resources (mirror targets + framebuffers + per-(plane,
+        // frame) view ring + global sets + descriptor pool). Destroyed before glass,
+        // whose per-pane sets reference the planar target views.
+        if let Some(planar) = &mut self.planar_reflection {
+            planar.destroy(device);
         }
 
         // Glass / transparent-pass resources (pipeline, per-panel buffers +
@@ -1956,6 +2041,10 @@ impl Drop for VkContext {
             t.destroy(device);
         }
         for t in &self.text_atlas_textures {
+            t.destroy(device);
+        }
+        // Baked reflection-probe cubes (empty until the capture pass bakes).
+        for t in &self.probe_maps {
             t.destroy(device);
         }
 

@@ -60,6 +60,7 @@ impl MtlContext {
             &q.ssr,
             &q.ssgi,
             &rt_settings,
+            q.reflection_blur_scale,
             &q.auto_exposure,
             q.auto_exposure_bias_ev,
             self.hot_reload,

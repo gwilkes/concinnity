@@ -387,6 +387,17 @@ impl VkContext {
             )
         );
 
+        // Reflection composite (only when a reflection path owns the scene image).
+        // Rebuilds the roughness blur + composite pipelines.
+        let reflection_composite_rebuilt = rebuild_if_live!(
+            self.reflection_composite.is_some(),
+            crate::vulkan::post::reflection_composite::rebuild_reflection_composite_pipelines(
+                device,
+                self.reflection_composite.as_ref().unwrap(),
+                hr,
+            )
+        );
+
         // TAA (only when PostProcessConfig opted in). Rebuilds the resolve
         // pipeline; the velocity channel lives on the unified G-buffer pre-pass.
         let taa_rebuilt = rebuild_if_live!(
@@ -492,6 +503,12 @@ impl VkContext {
         }
         if let (Some(rebuilt), Some(rt)) = (rt_rebuilt, self.rt_reflections.as_mut()) {
             rt.swap_pipelines(device, rebuilt);
+        }
+        if let (Some(rebuilt), Some(rc)) = (
+            reflection_composite_rebuilt,
+            self.reflection_composite.as_mut(),
+        ) {
+            rc.swap_pipelines(device, rebuilt);
         }
         if let (Some(rebuilt), Some(taa)) = (taa_rebuilt, self.taa.as_mut()) {
             taa.swap_pipelines(device, rebuilt);

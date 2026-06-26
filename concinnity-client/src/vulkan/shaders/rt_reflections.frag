@@ -88,11 +88,19 @@ layout(set = 0, binding = 6) uniform sampler2D   gbuffer;   // view normal (xyz)
 layout(set = 0, binding = 7) uniform sampler2D   rough_tex; // roughness (r)
 layout(set = 0, binding = 8) uniform samplerCube prefilter; // IBL prefilter cube (miss fallback)
 
+// set 1: the forward global set, bound here only for its reflection-probe count +
+// per-probe parallax boxes (binding 7) + cube array (binding 8); a ray that misses
+// the scene falls back to the local probe instead of the sky. The shared probe
+// sampling is substituted in below at set index 1 (the marker must not appear in
+// this comment, or it would be substituted here too).
+{PROBE_COMMON}
+
 #ifdef RT_TEXTURED
-// set 1 binding 1: the bindless albedo + normal-map pool, identical to the main
+// set 2 binding 1: the bindless albedo + normal-map pool, identical to the main
 // bindless pass (binding 0 there is the object SSBO, unused here). Only the
-// textured variant references it.
-layout(set = 1, binding = 1) uniform sampler2D tex_pool[{POOL_SIZE}];
+// textured variant references it. Set 2 (not 1) so the global probe set above
+// keeps a fixed index (1) across the flat + textured variants.
+layout(set = 2, binding = 1) uniform sampler2D tex_pool[{POOL_SIZE}];
 #endif
 
 const float RT_ROUGH_CUT = 0.6;  // surfaces rougher than this get no reflection
@@ -165,11 +173,14 @@ void main() {
     vec3 base = texture(scene_tex, frag_uv).rgb;
     vec4 g = texture(gbuffer, frag_uv);
     float depth = g.a;
-    if (depth <= 0.0) { out_color = vec4(base, 1.0); return; } // background / sky
+    // Background / sky, or a non-reflecting (too-rough) surface: weight 0 so the
+    // reflection composite keeps the scene there. The resolve writes reflected
+    // radiance (.rgb) + composite weight (.a), not yet blended.
+    if (depth <= 0.0) { out_color = vec4(base, 0.0); return; }
 
     float roughness = texture(rough_tex, frag_uv).r;
     float gloss = clamp((RT_ROUGH_CUT - roughness) / RT_ROUGH_CUT, 0.0, 1.0);
-    if (gloss <= 0.0) { out_color = vec4(base, 1.0); return; }
+    if (gloss <= 0.0) { out_color = vec4(base, 0.0); return; }
 
     vec3 Nv = normalize(g.xyz);
     vec3 Pv = rt_view_pos(frag_uv, depth, params.tan_half_fov_y, params.aspect);
@@ -261,9 +272,18 @@ void main() {
         reflected = rt_shade_hit(nw, tint, e.roughness, e.metallic, emissive, dir, ibl, max_mip, shadow);
 #endif
     } else {
+        // The ray escaped the scene: fall back to the local reflection probe (box-
+        // parallax, blended across covering probes) when one is baked, else the IBL
+        // prefilter sky, else the base shading.
         float lod = roughness * max_mip;
-        reflected = ibl ? textureLod(prefilter, dir, lod).rgb : base;
+        if (probe_set.count > 0u) {
+            reflected = probe_set_specular(Pw, dir, lod);
+        } else {
+            reflected = ibl ? textureLod(prefilter, dir, lod).rgb : base;
+        }
     }
 
-    out_color = vec4(mix(base, reflected, weight), 1.0);
+    // Reflected radiance + composite weight, not yet blended; the reflection
+    // composite pass blurs by roughness and composites this over the scene.
+    out_color = vec4(reflected, weight);
 }

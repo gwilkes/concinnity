@@ -60,7 +60,22 @@ pub(in crate::vulkan) fn compile_rt_shaders(
         "rt_reflections.vert",
     )?;
     let frag_template = shader_source(hot_reload, "rt_reflections.frag", RT_REFLECTIONS_FRAG_GLSL);
-    let frag_src = frag_template.replace("{POOL_SIZE}", &pool_size.max(1).to_string());
+    // Inject the shared reflection-probe sampling (its own {MAX_PROBES} + the
+    // global-set index {PROBE_DESC_SET} = 1 are substituted after), then the
+    // bindless pool size. The probe set/cubes ride the global set bound at set 1.
+    let probe_common = shader_source(
+        hot_reload,
+        "probe_common.glsl",
+        super::super::pipeline::PROBE_COMMON_GLSL,
+    );
+    let frag_src = frag_template
+        .replace("{PROBE_COMMON}", &probe_common)
+        .replace(
+            "{MAX_PROBES}",
+            &crate::vulkan::probe_uniforms::MAX_PROBES.to_string(),
+        )
+        .replace("{PROBE_DESC_SET}", "1")
+        .replace("{POOL_SIZE}", &pool_size.max(1).to_string());
     let flat_fs = compile_glsl_rt(
         &frag_src,
         shaderc::ShaderKind::Fragment,
@@ -322,6 +337,9 @@ impl RtReflectionsResources {
         prefilter_view: vk::ImageView,
         cube_sampler: vk::Sampler,
         bindless_set_layout: Option<vk::DescriptorSetLayout>,
+        // The forward global set's layout, bound as set 1 so the pass can sample the
+        // reflection-probe set + cube array (binding 7/8) on a ray miss.
+        global_set_layout: vk::DescriptorSetLayout,
         pool_size: usize,
         hot_reload: bool,
     ) -> Result<Self, String> {
@@ -394,7 +412,10 @@ impl RtReflectionsResources {
             ],
         )?;
 
-        let flat_layouts = [set_layout];
+        // set 0 = the RT resolve set; set 1 = the global set (probe set/cubes). The
+        // textured variant adds the bindless pool as set 2 (kept past the global set
+        // so probe_common's set index stays a fixed 1 across both variants).
+        let flat_layouts = [set_layout, global_set_layout];
         let layout_flat = unsafe {
             device.create_pipeline_layout(
                 &vk::PipelineLayoutCreateInfo::default().set_layouts(&flat_layouts),
@@ -403,7 +424,7 @@ impl RtReflectionsResources {
         }
         .map_err(|e| format!("rt flat pipeline layout: {e}"))?;
         let layout_textured = if let Some(bsl) = bindless_set_layout {
-            let layouts = [set_layout, bsl];
+            let layouts = [set_layout, global_set_layout, bsl];
             Some(
                 unsafe {
                     device.create_pipeline_layout(
@@ -889,6 +910,17 @@ impl VkContext {
         self.rt_reflections.is_some() && self.rt_accel.is_some()
     }
 
+    // True when the glass pass should trace per-pixel RT reflections this frame:
+    // RT is live (the scene TLAS is built) AND the glass RT pipelines compiled at
+    // init. Single-sources the glass encoder's RT-vs-base selection and the
+    // `graph_exec` planar skip, so the two always agree -- gating the skip on
+    // `rt_reflections_active()` alone would drop the planar re-render even when the
+    // glass RT pipelines failed to build, leaving the glass fallback sampling a
+    // stale resolve. Mirrors `DxContext::rt_glass_active`.
+    pub(in crate::vulkan) fn rt_glass_active(&self) -> bool {
+        self.rt_reflections_active() && self.glass.as_ref().is_some_and(|g| g.rt_pipelines_ready())
+    }
+
     // Run the per-frame dynamic acceleration-structure update on `cmd` (the
     // frame's "start" command buffer, submitted before every per-pass trace),
     // then re-point this frame's RT descriptor set at the live TLAS + geometry
@@ -972,6 +1004,20 @@ impl VkContext {
             deformed,
             skinned_indices,
         );
+        // Re-point the glass pass's RT descriptor ring at the same live handles, so
+        // a glass trace this frame samples the current TLAS / geometry table. A
+        // no-op when the world has no glass or the glass RT pipelines are absent.
+        if let Some(glass) = self.glass.as_ref() {
+            glass.wire_rt_dynamic(
+                &device,
+                frame_idx,
+                tlas,
+                geom_buffer,
+                geom_size,
+                deformed,
+                skinned_indices,
+            );
+        }
     }
 
     // Encode the RT-reflection resolve: a fullscreen triangle that traces each
@@ -1056,12 +1102,21 @@ impl VkContext {
                 std::slice::from_ref(&rt.resolve_sets[frame_idx]),
                 &[],
             );
+            // set 1: the global set, for the reflection-probe miss fallback.
+            device.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                layout,
+                1,
+                std::slice::from_ref(&self.descriptors.global_sets[frame_idx]),
+                &[],
+            );
             if textured {
                 device.cmd_bind_descriptor_sets(
                     cmd,
                     vk::PipelineBindPoint::GRAPHICS,
                     layout,
-                    1,
+                    2,
                     std::slice::from_ref(&self.cull.bindless_sets[frame_idx]),
                     &[],
                 );
@@ -1069,6 +1124,10 @@ impl VkContext {
             device.cmd_draw(cmd, 3, 1, 0, 0);
             device.cmd_end_render_pass(cmd);
         }
+        // Blur the trace's radiance+weight by roughness and composite it over the
+        // scene into the reflection composite's output (the scene image the post
+        // stack consumes). No-op when the composite is absent.
+        self.encode_reflection_composite(cmd, rt.output.view, frame_idx);
     }
 }
 

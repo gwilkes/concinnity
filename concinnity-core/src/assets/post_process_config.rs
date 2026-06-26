@@ -84,9 +84,7 @@ pub struct PostProcessConfig {
     /// `full` blurs at native resolution; `quarter` is the cheapest. Smooth
     /// mirror surfaces stay sharp at any setting (the composite keeps the sharp
     /// reflection for low roughness). Only matters when `ssr` or
-    /// `ray_traced_reflections` is on. Honoured by the DirectX backend; Metal
-    /// uses a fixed half-resolution blur and Vulkan has no reflection composite
-    /// yet.
+    /// `ray_traced_reflections` is on.
     pub reflection_blur_resolution: ReflectionBlurResolution,
     /// Indirect-diffuse lighting source. `ibl` (default) uses the environment
     /// map's ambient alone. `ssgi` adds a screen-space global-illumination pass

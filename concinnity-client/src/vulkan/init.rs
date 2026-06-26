@@ -105,6 +105,11 @@ impl VkContext {
         // unsupported GPU, or any build failure leaves RT off and SSR remains the
         // fallback. Mirrors the DirectX / Metal `rt_reflection_settings`.
         rt_settings: Option<crate::gfx::rt_reflections::RtReflectionSettings>,
+        // Per-axis render-resolution divisor for the reflection composite's roughness
+        // blur target, resolved from `PostProcessConfig.reflection_blur_resolution`
+        // (Half=2 default). The blur is low-frequency so running it reduced and
+        // bilinear-upsampling in the composite is visually free.
+        reflection_blur_scale: u32,
         // Authored projected decals resolved from the world's `Decal`
         // components. The decal pipeline + per-frame uniforms are always
         // built (so runtime `add_decal` works from an empty world); the
@@ -841,6 +846,32 @@ impl VkContext {
             view_ubo_ptrs.push(ptr);
         }
 
+        // Per-frame `ProbeSet` UBO ring (global set 0 binding 7): the
+        // reflection-probe count + per-probe parallax boxes. Persistently mapped;
+        // `record_frame` writes `self.probe_set` here each frame.
+        let probe_set_ubo_size = std::mem::size_of::<super::probe_uniforms::ProbeSet>() as u64;
+        let mut probe_set_ubo_buffers = Vec::with_capacity(frames);
+        let mut probe_set_ubo_memories = Vec::with_capacity(frames);
+        let mut probe_set_ubo_ptrs: Vec<*mut u8> = Vec::with_capacity(frames);
+        for _ in 0..frames {
+            let (buf, mem) = create_buffer(
+                &instance,
+                &device,
+                physical_device,
+                probe_set_ubo_size,
+                vk::BufferUsageFlags::UNIFORM_BUFFER,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )?;
+            let ptr = unsafe {
+                device
+                    .map_memory(mem, 0, probe_set_ubo_size, vk::MemoryMapFlags::empty())
+                    .map_err(|e| format!("map probe set ubo: {e}"))? as *mut u8
+            };
+            probe_set_ubo_buffers.push(buf);
+            probe_set_ubo_memories.push(mem);
+            probe_set_ubo_ptrs.push(ptr);
+        }
+
         let (light_ubo, light_ubo_memory) = create_buffer(
             &instance,
             &device,
@@ -956,10 +987,40 @@ impl VkContext {
         // SSAO is enabled, otherwise to the 1×1 `ssao_white` fallback so the
         // main pass's `ambient *= ao` multiplier collapses to a pass-through).
         // Global set (set 0): the geometry path's view / light / shadow UBOs +
-        // shadow-map + IBL cubes + SSAO sampler. Binding table + lock-down test
-        // live in `descriptor_layout.rs`.
-        let global_set_layout =
-            create_descriptor_set_layout(&device, &super::descriptor_layout::global_set())?;
+        // shadow-map + IBL cubes + SSAO sampler + ProbeSet UBO (binding 7) + the
+        // reflection-probe cube array (binding 8). Binding table + lock-down test
+        // live in `descriptor_layout.rs`. Built inline (not via the count-1
+        // `create_descriptor_set_layout` helper) because binding 8 is a
+        // `descriptorCount = MAX_PROBES` cube array; the count-1 bindings come from
+        // the locked `global_set()` table, then the array binding is appended (the
+        // same shape as the bindless texture pool's array binding below).
+        let global_set_layout = {
+            let mut bindings: Vec<vk::DescriptorSetLayoutBinding> =
+                super::descriptor_layout::global_set()
+                    .iter()
+                    .map(|&(b, ty, stage)| {
+                        vk::DescriptorSetLayoutBinding::default()
+                            .binding(b)
+                            .descriptor_type(ty)
+                            .descriptor_count(1)
+                            .stage_flags(stage)
+                    })
+                    .collect();
+            bindings.push(
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(super::descriptor_layout::PROBE_CUBE_ARRAY_BINDING)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .descriptor_count(super::probe_uniforms::MAX_PROBES as u32)
+                    .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            );
+            unsafe {
+                device.create_descriptor_set_layout(
+                    &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+                    None,
+                )
+            }
+            .map_err(|e| format!("global set layout: {e}"))?
+        };
         // Per-object set (set 1): albedo + normal map.
         let object_set_layout =
             create_descriptor_set_layout(&device, &super::descriptor_layout::object_set())?;
@@ -1310,6 +1371,7 @@ impl VkContext {
                 &hdr_views,
                 env_map.prefilter.view,
                 cube_sampler,
+                global_set_layout,
                 hot_reload,
             )?)
         } else {
@@ -1422,18 +1484,20 @@ impl VkContext {
         let mut pool_sizes = vec![
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::UNIFORM_BUFFER)
-                // global (3 per frame) + shadow global (1 per frame) + gbuffer
-                // bindless GbView UBO (1 per frame).
-                .descriptor_count(n_frames * 3 + n_frames + gbuffer_sets_count),
+                // global (4 per frame: view + light + shadow + ProbeSet) + shadow
+                // global (1 per frame) + gbuffer bindless GbView UBO (1 per frame).
+                .descriptor_count(n_frames * 4 + n_frames + gbuffer_sets_count),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 // per-obj(2) + per-frame {shadow + IBL irradiance + IBL
-                // prefilter + SSAO occlusion} + text atlas + per-cluster(2) +
-                // per-frame composite(3: HDR resolve + bloom mip 0 + 3D colour
-                // LUT) + per-frame bindless texture pool.
+                // prefilter + SSAO occlusion} + per-frame probe cube array
+                // (MAX_PROBES) + text atlas + per-cluster(2) + per-frame
+                // composite(3: HDR resolve + bloom mip 0 + 3D colour LUT) +
+                // per-frame bindless texture pool.
                 .descriptor_count(
                     n_obj * 2
                         + n_frames * 4
+                        + n_frames * super::probe_uniforms::MAX_PROBES as u32
                         + n_atlas
                         + n_cluster * 2
                         + n_frames * 3
@@ -1533,6 +1597,25 @@ impl VkContext {
                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                 .image_view(ssao_view)
                 .sampler(linear_sampler);
+            // ProbeSet UBO (binding 7): this frame's reflection-probe set.
+            let probe_set_info = vk::DescriptorBufferInfo::default()
+                .buffer(probe_set_ubo_buffers[i])
+                .offset(0)
+                .range(probe_set_ubo_size);
+            // Probe cube array (binding 8): every slot points at the IBL prefilter
+            // cube until a probe bakes. No descriptor-indexing extension is
+            // enabled, so every one of the MAX_PROBES descriptors must hold a valid
+            // cube (an unwritten slot is UB); the EMPTY ProbeSet (count 0) keeps the
+            // shader on the sky path, so these are never actually sampled yet.
+            let probe_cube_infos: Vec<vk::DescriptorImageInfo> = (0
+                ..super::probe_uniforms::MAX_PROBES)
+                .map(|_| {
+                    vk::DescriptorImageInfo::default()
+                        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                        .image_view(env_map.prefilter.view)
+                        .sampler(cube_sampler)
+                })
+                .collect();
             let writes = [
                 vk::WriteDescriptorSet::default()
                     .dst_set(set)
@@ -1569,6 +1652,17 @@ impl VkContext {
                     .dst_binding(6)
                     .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                     .image_info(std::slice::from_ref(&ssao_img_info)),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(7)
+                    .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                    .buffer_info(std::slice::from_ref(&probe_set_info)),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(super::descriptor_layout::PROBE_CUBE_ARRAY_BINDING)
+                    .dst_array_element(0)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(&probe_cube_infos),
             ];
             unsafe { device.update_descriptor_sets(&writes, &[]) };
         }
@@ -1824,6 +1918,7 @@ impl VkContext {
                         env_map.prefilter.view,
                         cube_sampler,
                         bindless_set_layout,
+                        global_set_layout,
                         bindless_pool_size,
                         hot_reload,
                     ) {
@@ -1861,6 +1956,39 @@ impl VkContext {
         let ssr_resolve_on = ssr_authored && !rt_active;
         // How the TLAS tracks moving props (`CN_RT_DYNAMIC`); inert when RT off.
         let rt_dynamic_mode = crate::vulkan::raytrace::RtDynamicMode::from_env();
+
+        // Reflection composite: built whenever a reflection path owns the post-stack
+        // scene image (the SSR resolve is active OR RT reflections are active, which
+        // are mutually exclusive). Both resolves write radiance+weight into their
+        // output target; this blurs by roughness and composites over the scene into
+        // its own output, which then replaces the raw resolve output as the scene
+        // image every downstream pass samples.
+        let composite_opt = if rt_active || ssr_resolve_on {
+            let gb = gbuffer_opt
+                .as_ref()
+                .expect("a reflection path implies the unified G-buffer pre-pass");
+            let hdr_views: Vec<vk::ImageView> =
+                hdr_resolve_images.iter().map(|img| img.view).collect();
+            Some(
+                super::post::reflection_composite::ReflectionCompositeResources::new(
+                    &instance,
+                    &device,
+                    physical_device,
+                    command_pool,
+                    graphics_queue,
+                    render_extent.width,
+                    render_extent.height,
+                    frames,
+                    reflection_blur_scale,
+                    &hdr_views,
+                    &gb.normal_depth_views(),
+                    &gb.roughness_views(),
+                    hot_reload,
+                )?,
+            )
+        } else {
+            None
+        };
 
         // Per-object cull-status buffers (one u32 each), built unconditionally
         // on the bindless cull path: phase-1 cull writes them (binding 3 of the
@@ -2646,17 +2774,14 @@ impl VkContext {
         let composite_layouts: Vec<_> = (0..frames).map(|_| composite_set_layout).collect();
         let composite_sets = alloc_descriptor_sets(&device, descriptor_pool, &composite_layouts)?;
         for (i, &set) in composite_sets.iter().enumerate() {
-            // Scene image precedence: RT reflection output (it took the SSR
-            // resolve slot) > SSR resolve output > raw HDR resolve (a SSGI-only
-            // build composited its bounce into the latter upstream). TAA / upscale
-            // override this below.
-            let scene_view = if let Some(rt) = rt_opt.as_ref() {
-                rt.output.view
-            } else if let Some(s) = ssr_opt.as_ref().filter(|_| ssr_resolve_on) {
-                s.output.view
-            } else {
-                hdr_resolve_images[i].view
-            };
+            // Scene image: the reflection composite output (the SSR / RT reflection
+            // blended over the scene) when a reflection path is active, else the raw
+            // HDR resolve (a SSGI-only build composited its bounce into the latter
+            // upstream). TAA / upscale override this below.
+            let scene_view = composite_opt
+                .as_ref()
+                .map(|c| c.output.view)
+                .unwrap_or(hdr_resolve_images[i].view);
             write_composite_set(
                 &device,
                 set,
@@ -2692,18 +2817,12 @@ impl VkContext {
             &hdr_resolve_images,
             &bloom_mips,
         )?;
-        // SSR replaces the bloom prefilter's scene input (input 0) with the
-        // SSR resolve output, the same scene image the composite samples
-        // when SSR is on and TAA is off. Only when the resolve is active
-        // (SSGI-only leaves the prefilter on the raw HDR resolve).
-        // RT reflection output (when live) > SSR resolve output. Both are a
-        // single shared image, so every frame's prefilter input 0 points at it.
-        if let Some(view) = rt_opt.as_ref().map(|r| r.output.view).or_else(|| {
-            ssr_opt
-                .as_ref()
-                .filter(|_| ssr_resolve_on)
-                .map(|s| s.output.view)
-        }) {
+        // The reflection composite replaces the bloom prefilter's scene input
+        // (input 0) with its output, the same scene image the composite pass
+        // samples when a reflection path is active and TAA is off (a SSGI-only
+        // build leaves the prefilter on the raw HDR resolve). One shared image, so
+        // every frame's prefilter input 0 points at it.
+        if let Some(view) = composite_opt.as_ref().map(|c| c.output.view) {
             for frame_sets in &bloom_input_sets {
                 rebind_bloom_input0(&device, frame_sets[0], view, composite_sampler);
             }
@@ -2727,16 +2846,11 @@ impl VkContext {
                 composite_sampler,
                 hot_reload,
             )?;
-            // When RT reflections or the SSR resolve owns the scene image, TAA
-            // samples that (the HDR scene with reflections composited in) instead
-            // of the raw HDR resolve. RT takes precedence over SSR. A SSGI-only
-            // build leaves TAA on the raw HDR resolve.
-            if let Some(view) = rt_opt.as_ref().map(|r| r.output.view).or_else(|| {
-                ssr_opt
-                    .as_ref()
-                    .filter(|_| ssr_resolve_on)
-                    .map(|s| s.output.view)
-            }) {
+            // When a reflection path owns the scene image, TAA samples the
+            // reflection composite output (the HDR scene with reflections composited
+            // in) instead of the raw HDR resolve. A SSGI-only build leaves TAA on the
+            // raw HDR resolve.
+            if let Some(view) = composite_opt.as_ref().map(|c| c.output.view) {
                 taa.rewire_scene(&device, view, composite_sampler);
             }
             for (i, &set) in composite_sets.iter().enumerate() {
@@ -2899,6 +3013,69 @@ impl VkContext {
             hot_reload,
         )?;
 
+        // Planar reflections: group each glass pane's world-space plane into a
+        // bounded set of distinct reflector planes (near-coplanar panes share one
+        // mirror render; panes past the budget fall back to the probe cube), then
+        // build one render-resolution mirror target per distinct plane. Built
+        // before glass so each pane's planar binding can point at its plane's
+        // target. `slots[i]` is pane `i`'s target slot (or `None`).
+        let planar_planes: Vec<[f32; 4]> = glass_panels
+            .iter()
+            .map(|p| crate::vulkan::planar::pane_plane(p.normal, p.centre))
+            .collect();
+        let planar_assignment = crate::gfx::planar_reflection::assign_planar_slots(
+            &planar_planes,
+            crate::vulkan::planar::MAX_PLANAR_PLANES,
+        );
+        // The reflected-frustum mirror cull is bindless-only (it needs the GPU cull
+        // set layout + the per-frame object/draw-args SSBOs); a non-bindless world
+        // has no `cull_set_layout`, so planar is skipped and its panes keep the
+        // probe / sky reflection. Mirrors `metal::planar`'s bindless gate.
+        let planar_reflection = if planar_assignment.representatives.is_empty() {
+            None
+        } else if let Some(csl) = cull_set_layout {
+            let cull_sources = crate::vulkan::planar::PlanarCullSources {
+                frame_object_buffers: &object_buffers,
+                frame_draw_args_buffers: &draw_args_buffers,
+                cull_set_layout: csl,
+                cull_count: n_cull,
+                hiz: hiz.as_ref().map(|h| {
+                    let (view, sampler) = h.read_set_sources();
+                    (h.read_set_layout, view, sampler)
+                }),
+            };
+            Some(crate::vulkan::planar::PlanarReflectionSet::new(
+                &instance,
+                &device,
+                physical_device,
+                frames,
+                msaa_samples,
+                render_extent.width,
+                render_extent.height,
+                &planar_assignment.representatives,
+                main_render_pass,
+                global_set_layout,
+                light_ubo,
+                light_ubo_size,
+                shadow_ubo,
+                shadow_ubo_size,
+                shadow_map.view,
+                shadow_sampler,
+                env_map.irradiance.view,
+                env_map.prefilter.view,
+                cube_sampler,
+                ssao_white.view,
+                linear_sampler,
+                cull_sources,
+            )?)
+        } else {
+            None
+        };
+        let planar_target_views: Vec<vk::ImageView> = planar_reflection
+            .as_ref()
+            .map(|s| (0..s.plane_count()).map(|i| s.target_view(i)).collect())
+            .unwrap_or_default();
+
         // Translucent glass panels: the generic producer for the shared
         // transparent pass. `Some` only when the world declared any
         // `GlassPanel`. The pass blends into the post-SSR scene image (SSR
@@ -2911,12 +3088,11 @@ impl VkContext {
             let (glass_scene_views, glass_scene_images): (Vec<vk::ImageView>, Vec<vk::Image>) = (0
                 ..frames)
                 .map(|i| {
-                    // Glass blends into the post-reflection scene: RT output > SSR
-                    // resolve output > raw HDR resolve.
-                    if let Some(rt) = rt_opt.as_ref() {
-                        (rt.output.view, rt.output.image)
-                    } else if let Some(s) = ssr_opt.as_ref().filter(|_| ssr_resolve_on) {
-                        (s.output.view, s.output.image)
+                    // Glass blends into the post-reflection scene: the reflection
+                    // composite output when a reflection path is active, else the raw
+                    // HDR resolve.
+                    if let Some(c) = composite_opt.as_ref() {
+                        (c.output.view, c.output.image)
                     } else {
                         (hdr_resolve_images[i].view, hdr_resolve_images[i].image)
                     }
@@ -2924,6 +3100,20 @@ impl VkContext {
                 .unzip();
             let glass_depth_views: Vec<vk::ImageView> =
                 depth_images.iter().map(|img| img.view).collect();
+            // The initial acceleration-structure handles for the glass RT path
+            // (`None` when RT is off at launch; the per-frame `rt_dynamic_update`
+            // fills the ring before the RT path is taken). The glass RT pipelines
+            // themselves are built whenever the device is RT-capable.
+            let glass_rt_inputs = rt_accel_opt.as_ref().map(|a| {
+                let (geom_buffer, geom_size) = a.geom_table();
+                crate::vulkan::glass::GlassRtInputs {
+                    tlas: a.tlas(),
+                    geom_buffer,
+                    geom_size,
+                    deformed_verts: a.deformed_verts(),
+                    skinned_indices: a.skinned_indices(),
+                }
+            });
             Some(crate::vulkan::glass::GlassResources::new(
                 &instance,
                 &device,
@@ -2938,6 +3128,15 @@ impl VkContext {
                 &glass_scene_images,
                 &glass_depth_views,
                 linear_sampler,
+                global_set_layout,
+                &planar_assignment.slots,
+                &planar_target_views,
+                rt_capable,
+                vertex_buffer,
+                index_buffer,
+                glass_rt_inputs,
+                bindless_set_layout,
+                bindless_pool_size,
                 &glass_panels,
                 hot_reload,
             )?)
@@ -3210,6 +3409,7 @@ impl VkContext {
             transient_pool,
             ssr: ssr_opt,
             ssr_resolve_active: ssr_resolve_on,
+            reflection_composite: composite_opt,
             ssgi: ssgi_opt,
             gbuffer: gbuffer_opt,
             rt_reflections: rt_opt,
@@ -3234,6 +3434,7 @@ impl VkContext {
             fog_sun_color,
             raymarch,
             glass,
+            planar_reflection,
             auto_exposure,
             auto_exposure_settings,
             auto_exposure_state,
@@ -3318,6 +3519,9 @@ impl VkContext {
                 view_ubo_buffers,
                 view_ubo_memories,
                 view_ubo_ptrs,
+                probe_set_ubo_buffers,
+                probe_set_ubo_memories,
+                probe_set_ubo_ptrs,
                 light_ubo,
                 light_ubo_memory,
                 light_uniforms,
@@ -3346,6 +3550,12 @@ impl VkContext {
             prefilter_mip_count: env_map.prefilter_mip_count,
             cube_sampler,
             env_map,
+            probe_placements: Vec::new(),
+            probe_set: super::probe_uniforms::ProbeSet::EMPTY,
+            probe_maps: Vec::new(),
+            probe_bake_queue: crate::gfx::reflection_probe::ProbeBakeQueue::new(0),
+            probe_rendering: None,
+            probe_converting: None,
             deferred_destroy: RefCell::new(Vec::new()),
             window,
             debug_utils,

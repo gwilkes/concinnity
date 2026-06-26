@@ -105,10 +105,8 @@ pub struct QualitySettings {
     pub ssgi: Option<SsgiSettings>,
     // Per-axis divisor for the roughness-aware reflection blur target (the
     // reduced-resolution first pass of the SSR / RT reflection composite),
-    // resolved from `PostProcessConfig.reflection_blur_resolution`. Honoured by
-    // the DirectX backend (sizes its blur target at render / this on a live
-    // reflection rebuild); Metal uses a fixed half-resolution blur and Vulkan
-    // has no composite, so both ignore it.
+    // resolved from `PostProcessConfig.reflection_blur_resolution`. Every backend
+    // sizes its blur target at render / this on a live reflection rebuild.
     pub reflection_blur_scale: u32,
     pub auto_exposure: Option<AutoExposureSettings>,
     // The authored exposure bias (stops) auto-exposure applies on top of its

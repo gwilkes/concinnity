@@ -431,8 +431,6 @@ impl GraphicsSystem {
     // The payload source depends on where the world came from: a disk-backed
     // `cn run` world re-reads each payload from its blob file (no RAM copy), an
     // in-memory `cn debug` world keeps the payloads RAM-resident.
-    //
-    // Honoured by Metal, Vulkan, and DirectX.
 }
 
 // Quality-toggle plumbing shared by init (value-label sync + initial overlay)

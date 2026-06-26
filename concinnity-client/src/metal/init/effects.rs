@@ -153,6 +153,10 @@ pub(crate) fn build_quality_effects(
     ssr_settings: &Option<SsrSettings>,
     ssgi_settings: &Option<SsgiSettings>,
     rt_reflection_settings: &Option<RtReflectionSettings>,
+    // Per-axis divisor for the roughness-aware reflection blur target, resolved
+    // from the world's `reflection_blur_resolution`. Sizes the blur target at
+    // render / this; stored on `SsrState` so resize reuses it.
+    reflection_blur_scale: u32,
     auto_exposure_settings: &Option<AutoExposureSettings>,
     auto_exposure_bias_ev: f32,
     hot_reload: bool,
@@ -228,7 +232,12 @@ pub(crate) fn build_quality_effects(
                 (None, None)
             };
             (
-                Some(create_ssr_targets(device, render_w, render_h)?),
+                Some(create_ssr_targets(
+                    device,
+                    render_w,
+                    render_h,
+                    reflection_blur_scale,
+                )?),
                 ssr_resolve,
                 composite,
                 blur,
@@ -301,6 +310,7 @@ pub(crate) fn build_quality_effects(
         resolve_pipeline: ssr_resolve_pipeline,
         composite_pipeline: ssr_composite_pipeline,
         blur_pipeline: ssr_blur_pipeline,
+        blur_scale: reflection_blur_scale.max(1),
     };
     let gbuffer = GBufferState {
         targets: gbuffer_targets,
@@ -416,6 +426,10 @@ pub(crate) fn build_effects(
     ssr_settings: &Option<SsrSettings>,
     ssgi_settings: &Option<SsgiSettings>,
     rt_reflection_settings: &Option<RtReflectionSettings>,
+    // Per-axis divisor for the roughness-aware reflection blur target, resolved
+    // from the world's `reflection_blur_resolution` (forwarded to
+    // `build_quality_effects`).
+    reflection_blur_scale: u32,
     decals: &[DecalRecord],
     particles: &[ParticleEmitterRecord],
     fog_settings: &Option<FogSettings>,
@@ -464,6 +478,7 @@ pub(crate) fn build_effects(
         ssr_settings,
         ssgi_settings,
         rt_reflection_settings,
+        reflection_blur_scale,
         auto_exposure_settings,
         auto_exposure_bias_ev,
         hot_reload,

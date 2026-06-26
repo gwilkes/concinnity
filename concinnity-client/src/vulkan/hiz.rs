@@ -290,6 +290,16 @@ fn create_compute_pipeline(
 }
 
 impl HiZResources {
+    // The pyramid's all-mips sampled view + its sampler, the two resources a
+    // cull set-1 ("read set") binds at binding 0. Exposed so the reflection-probe
+    // bake can build a one-off read set (with `hiz_enabled = 0`) from its OWN
+    // descriptor pool -- the probe cull binds a valid set 1 without sampling the
+    // pyramid, and without taking a slot in this struct's pool. `read_set_layout`
+    // is already `pub(super)`.
+    pub(super) fn read_set_sources(&self) -> (vk::ImageView, vk::Sampler) {
+        (self.sampled_view, self.sampler)
+    }
+
     // Build every Hi-Z resource sized to the render (depth) resolution. Called
     // from the init path when the GPU-cull pipeline is active. `depth_views`
     // are the per-frame main-depth views the init kernel reduces.

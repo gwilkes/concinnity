@@ -1226,6 +1226,7 @@ impl MtlContext {
                 &self.device,
                 render_w,
                 render_h,
+                self.ssr.blur_scale,
             )?);
         }
         // The unified G-buffer targets (normal+depth / roughness / velocity /

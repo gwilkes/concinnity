@@ -542,8 +542,8 @@ pub struct FogParams {
 // the matching fragment-shader sample path. Carries the view matrix (so the
 // compute kernel + the fragment sampler can map between world-space froxel
 // positions and the volume's Z axis) and the discrete volume dimensions. Used
-// by the froxel-volume fog path on all three backends (Metal, DirectX,
-// Vulkan); only worlds that declare a `VolumetricFog` bind it.
+// by the froxel-volume fog path; only worlds that declare a `VolumetricFog`
+// bind it.
 //
 // Bound at the fog fragment shader + the froxel kernel. Layout must stay in
 // sync with `FogFroxelParams` in `metal/shaders/fog.metal`,
@@ -630,7 +630,6 @@ pub struct TextDrawCall {
     // Optional clip rectangle in window pixels `[x, y, width, height]`. When
     // set, the backend scissors this call to the rect so a scrollable UI panel's
     // off-band rows do not bleed over its chrome. `None` draws unclipped.
-    // Honoured by the Metal backend; DirectX / Vulkan ignore it for now.
     pub clip_rect: Option<[f32; 4]>,
 }
 
@@ -688,7 +687,7 @@ pub struct DrawObject {
     // and the object is skipped in every pass. Always true unless the asset-
     // streaming subsystem is active; the mesh streamer flips it to true once
     // the geometry region is resident.
-    // Read by all three backends' shadow/main/velocity passes.
+    // Read by the shadow/main/velocity passes.
     pub resident: bool,
     // World-space axis-aligned bounding box used for frustum culling.
     // Baked from the mesh's local bounds and the prop's initial model matrix
@@ -1209,8 +1208,6 @@ impl InstancedCluster {
 // BVH and drawn unconditionally (after the visibility flag). The joint
 // matrices live in a separate per-object GPU buffer the renderer rewrites
 // each frame from `AnimationSystem`'s output.
-//
-// Consumed by the Metal, DirectX, and Vulkan skinned pipelines.
 pub struct SkinnedDrawObject {
     // Vertex offset (in vertex units, not bytes) of this slot's first
     // vertex in the shared skinned vertex buffer. The shared index buffer

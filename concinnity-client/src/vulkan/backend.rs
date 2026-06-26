@@ -62,6 +62,7 @@ impl RenderBackend for VkContext {
         fn update_post_process(&mut self, params: crate::gfx::render_types::PostProcessParams);
         fn set_ambient_intensity(&mut self, value: f32);
         fn set_keymap(&mut self, keymap: &crate::gfx::keymap::KeyMap);
+        fn set_reflection_probes(&mut self, probes: &[crate::gfx::reflection_probe::ProbePlacement]);
         fn apply_quality_settings(&mut self, settings: crate::gfx::backend::QualitySettings);
         fn take_input(&mut self) -> RenderInput;
         fn wait_idle(&self);

@@ -301,7 +301,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "bistro"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "concinnity-toolchain",
  "example-common",
@@ -586,7 +586,7 @@ dependencies = [
 
 [[package]]
 name = "concinnity-client"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "ash",
  "bitflags 2.11.1",
@@ -631,7 +631,7 @@ dependencies = [
 
 [[package]]
 name = "concinnity-cook"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "concinnity-core",
  "fbxcel",
@@ -655,7 +655,7 @@ dependencies = [
 
 [[package]]
 name = "concinnity-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "postcard",
  "rayon",
@@ -670,14 +670,14 @@ dependencies = [
 
 [[package]]
 name = "concinnity-docs"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "syn",
 ]
 
 [[package]]
 name = "concinnity-editor"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "argon2",
  "ash",
@@ -733,7 +733,7 @@ dependencies = [
 
 [[package]]
 name = "concinnity-toolchain"
-version = "0.3.0"
+version = "0.4.0"
 
 [[package]]
 name = "cookie"
@@ -1070,7 +1070,7 @@ dependencies = [
 
 [[package]]
 name = "example-common"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "concinnity-client",
  "concinnity-cook",

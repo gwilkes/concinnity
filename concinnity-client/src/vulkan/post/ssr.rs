@@ -71,6 +71,22 @@ pub(in crate::vulkan) struct SsrShaders {
 // through [`crate::vulkan::pipeline::shader_source`].
 pub(in crate::vulkan) fn compile_ssr_shaders(hot_reload: bool) -> Result<SsrShaders, String> {
     use super::super::pipeline::shader_source;
+    // Inject the shared reflection-probe sampling at the resolve's PROBE_COMMON
+    // marker; its {MAX_PROBES} + the global-set index {PROBE_DESC_SET} = 1 (the
+    // global set carrying the probe set/cubes is bound as set 1 here) are
+    // substituted in the same pass. Mirrors `compile_rt_shaders`.
+    let probe_common = shader_source(
+        hot_reload,
+        "probe_common.glsl",
+        super::super::pipeline::PROBE_COMMON_GLSL,
+    );
+    let resolve_src = shader_source(hot_reload, "ssr_resolve.frag", SSR_RESOLVE_FRAG_GLSL)
+        .replace("{PROBE_COMMON}", &probe_common)
+        .replace(
+            "{MAX_PROBES}",
+            &crate::vulkan::probe_uniforms::MAX_PROBES.to_string(),
+        )
+        .replace("{PROBE_DESC_SET}", "1");
     Ok(SsrShaders {
         fullscreen_vs: compile_glsl(
             &shader_source(hot_reload, "ssr_fullscreen.vert", SSR_FULLSCREEN_VERT_GLSL),
@@ -78,7 +94,7 @@ pub(in crate::vulkan) fn compile_ssr_shaders(hot_reload: bool) -> Result<SsrShad
             "ssr_fullscreen.vert",
         )?,
         resolve_fs: compile_glsl(
-            &shader_source(hot_reload, "ssr_resolve.frag", SSR_RESOLVE_FRAG_GLSL),
+            &resolve_src,
             shaderc::ShaderKind::Fragment,
             "ssr_resolve.frag",
         )?,
@@ -318,6 +334,9 @@ impl SsrResources {
         hdr_resolve_views: &[vk::ImageView],
         prefilter_view: vk::ImageView,
         cube_sampler: vk::Sampler,
+        // The forward global set's layout, bound as set 1 so the resolve can sample
+        // the reflection-probe set + cube array (binding 7/8) on a missed ray.
+        global_set_layout: vk::DescriptorSetLayout,
         hot_reload: bool,
     ) -> Result<Self, String> {
         let resolve_render_pass = create_resolve_render_pass(device)?;
@@ -353,7 +372,9 @@ impl SsrResources {
             .stage_flags(vk::ShaderStageFlags::FRAGMENT)
             .offset(0)
             .size(std::mem::size_of::<SsrParams>() as u32);
-        let resolve_set_layouts = [resolve_set_layout];
+        // set 0 = the resolve set (scene/gbuffer/roughness/prefilter); set 1 = the
+        // global set (probe set/cubes) for the missed-ray probe fallback.
+        let resolve_set_layouts = [resolve_set_layout, global_set_layout];
         let resolve_layout = unsafe {
             device.create_pipeline_layout(
                 &vk::PipelineLayoutCreateInfo::default()
@@ -644,6 +665,10 @@ impl VkContext {
             },
             &cmd,
         );
+        // Blur the resolve's radiance+weight by roughness and composite it over the
+        // scene into the reflection composite's output (the scene image the post
+        // stack consumes). No-op when the composite is absent.
+        self.encode_reflection_composite(cmd, ssr.output.view, frame_idx);
     }
 }
 
@@ -701,6 +726,15 @@ impl FullscreenPass for SsrResolvePass<'_> {
                 std::slice::from_ref(&self.ssr.resolve_sets[self.frame_idx]),
                 &[],
             );
+            // set 1: the global set, for the reflection-probe miss fallback.
+            device.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.ssr.resolve_layout,
+                1,
+                std::slice::from_ref(&self.ctx.descriptors.global_sets[self.frame_idx]),
+                &[],
+            );
             device.cmd_push_constants(
                 cmd,
                 self.ssr.resolve_layout,
@@ -717,5 +751,21 @@ impl FullscreenPass for SsrResolvePass<'_> {
 
     fn end(&self, cmd: &Self::Rec) {
         self.ctx.end_fullscreen_pass(*cmd);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // The SSR fullscreen vert + resolve fragment compile to SPIR-V. Guards the
+    // shared probe sampling injected at the resolve's PROBE_COMMON marker: the
+    // {MAX_PROBES} / {PROBE_DESC_SET} substitution and the comment-token trap (a
+    // brace token left in a comment would be substituted and break the GLSL). The
+    // CPU<->GPU `SsrParams` layout is guarded by the `ssr_params_*` tests in
+    // gfx::render_types.
+    #[test]
+    fn ssr_shaders_compile() {
+        let shaders = super::compile_ssr_shaders(false).expect("ssr shaders compile");
+        assert!(super::is_spirv(&shaders.fullscreen_vs));
+        assert!(super::is_spirv(&shaders.resolve_fs));
     }
 }

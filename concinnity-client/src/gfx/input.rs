@@ -22,7 +22,7 @@ pub struct RenderInput {
     pub mouse_dx: f32,
     pub mouse_dy: f32,
     // Accumulated vertical scroll-wheel delta since the last take_input().
-    // Wired on all three backends (free cursor only).
+    // Only delivered while the cursor is free.
     pub scroll_delta: f32,
     // Absolute cursor position in window pixels (origin top-left).
     // Only meaningful when the cursor is not captured.
@@ -34,8 +34,7 @@ pub struct RenderInput {
     // True while the left mouse button is held (cursor not captured). Persists
     // across frames until release so a UI drag can track the cursor.
     pub left_button_down: bool,
-    // True for exactly one frame when the HUD-toggle key is pressed.
-    // Wired on all three backends (F1).
+    // True for exactly one frame when the HUD-toggle key is pressed (F1).
     pub hud_toggle: bool,
     // True for exactly one frame when Escape is pressed while the cursor is
     // not captured. (In captured-cursor worlds Escape continues to release

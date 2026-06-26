@@ -86,7 +86,7 @@ impl GraphicsSystem {
     // second TextureStreamer drives it, and streamed item `i` is pool slot
     // `i + 1` (slot 0 is the never-streamed flat-normal fallback). Reuses the
     // shared texture_budget / texture_cap, and the same disk-backed vs
-    // RAM-backed payload source choice. Honoured by Metal, Vulkan, and DirectX.
+    // RAM-backed payload source choice.
     pub(super) fn setup_normal_map_streaming(
         &mut self,
         config: Option<StreamingConfig>,
@@ -151,9 +151,8 @@ impl GraphicsSystem {
     // re-reads it from there (no persistent RAM copy), an in-memory `cn debug`
     // world keeps the geometry RAM-resident.
     //
-    // Supported on Metal, DirectX, and Vulkan. The args are consumed
-    // unconditionally so they never warn as unused on a backend that does not
-    // yet stream.
+    // The args are consumed unconditionally so they never warn as unused on a
+    // backend that does not yet stream.
     pub(super) fn setup_mesh_streaming(
         &mut self,
         config: Option<StreamingConfig>,
@@ -230,10 +229,9 @@ impl GraphicsSystem {
     // was declared. Resolves the block palette and shared material, grows the
     // GPU buffers by a chunk-headroom region, and builds the ChunkStreamer;
     // `step` then generates and uploads chunks around the camera each frame.
-    // Supported on Metal, DirectX, and Vulkan. The buffer-growth + SRV/descriptor
-    // setup differs per backend (the `setup_chunk_streaming` match below); the
-    // palette/material resolution, headroom sizing, and streamer build are
-    // backend-agnostic.
+    // The buffer-growth + SRV/descriptor setup differs per backend (the
+    // `setup_chunk_streaming` match below); the palette/material resolution,
+    // headroom sizing, and streamer build are backend-agnostic.
     pub(super) fn setup_voxel_world_streaming(
         &mut self,
         voxel_world: Option<VoxelWorld>,

@@ -37,6 +37,10 @@ pub(crate) struct SsrState {
     // First half of the composite: the roughness blur, run at reduced resolution
     // into `SsrTargets::blur`. Built alongside `composite_pipeline`.
     pub blur_pipeline: Option<Retained<ProtocolObject<dyn MTLRenderPipelineState>>>,
+    // Per-axis divisor the reflection blur target is sized by, resolved from the
+    // world's `reflection_blur_resolution`. Held so a resize / live rebuild
+    // recreates the blur target at the same reduced resolution.
+    pub blur_scale: u32,
 }
 
 // Pipelines
@@ -120,21 +124,20 @@ pub(crate) struct SsrTargets {
     pub blur: Retained<ProtocolObject<dyn MTLTexture>>,
 }
 
-// Per-axis render-resolution divisor for the roughness blur pass. The blur is
-// low-frequency (a widening glossy cone), so running it at half resolution and
-// bilinear-upsampling in the composite is visually free while quartering the
-// blur's pixel count. Mirrors stay sharp: the composite lerps in the FULL-RES
-// reflection for low roughness (see reflection_composite.metal). Matches the
-// `SsgiResolution::Half` default the SSGI gather uses.
-const REFLECTION_BLUR_SCALE: u32 = 2;
-
 // Create or recreate the reflection + resolve-output targets at `width`x`height`,
-// plus the reduced-resolution blur target.
+// plus the reduced-resolution blur target. `blur_scale` is the per-axis
+// render-resolution divisor for the roughness blur pass (resolved from the
+// world's `reflection_blur_resolution`): the blur is low-frequency (a widening
+// glossy cone), so running it reduced and bilinear-upsampling in the composite
+// is visually free; mirrors stay sharp because the composite lerps in the
+// FULL-RES reflection for low roughness (see reflection_composite.metal).
 pub(crate) fn create_ssr_targets(
     device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
     width: u32,
     height: u32,
+    blur_scale: u32,
 ) -> Result<SsrTargets, String> {
+    let blur_scale = blur_scale.max(1);
     let make_at = |w: usize, h: usize| -> Option<Retained<ProtocolObject<dyn MTLTexture>>> {
         let desc = MTLTextureDescriptor::new();
         unsafe {
@@ -151,8 +154,8 @@ pub(crate) fn create_ssr_targets(
     };
     let w = width.max(1) as usize;
     let h = height.max(1) as usize;
-    let bw = (width / REFLECTION_BLUR_SCALE).max(1) as usize;
-    let bh = (height / REFLECTION_BLUR_SCALE).max(1) as usize;
+    let bw = (width / blur_scale).max(1) as usize;
+    let bh = (height / blur_scale).max(1) as usize;
     let reflection = make_at(w, h).ok_or("failed to create reflection texture")?;
     let output = make_at(w, h).ok_or("failed to create SSR output texture")?;
     let blur = make_at(bw, bh).ok_or("failed to create reflection blur texture")?;

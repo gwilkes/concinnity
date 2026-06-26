@@ -15,10 +15,17 @@ layout(std140, set = 0, binding = 0) uniform ViewBlock {
     mat4  vp;
     mat4  view_mat;
     float elapsed;
-    float _pad0;
+    // 1.0 when an SSR / RT reflection composite owns the sharp specular this frame
+    // (fade the glossy-dielectric forward probe specular); 0.0 keeps it all.
+    float reflections_enabled;
     float cam_x; float cam_y; float cam_z;
     float prefilter_mip_count; float _ep0; float _ep1;
 } view;
+
+// Surfaces rougher than this get no SSR / RT reflection; the forward fade ramps in
+// below it. Matches the resolve gloss gate (SSR_ROUGH_CUT / RT_ROUGH_CUT); keep in
+// sync (the shared-prelude single-sourcing is a deferred cleanup).
+const float REFLECTION_ROUGHNESS_CUT = 0.6;
 
 struct DirLight  { vec4 dir_i; vec4 col; };
 struct PointLight{ vec4 pos_r; vec4 col_i; };
@@ -43,6 +50,12 @@ layout(set = 0, binding = 4) uniform samplerCube irradiance_cube;
 layout(set = 0, binding = 5) uniform samplerCube prefilter_cube;
 // Blurred SSAO occlusion (1×1 white when SSAO is disabled).
 layout(set = 0, binding = 6) uniform sampler2D ssao_tex;
+
+// Reflection-probe sampling: the ProbeSet UBO (binding 7), the probe cube array
+// (binding 8), and the box-parallax partition-of-unity helpers, substituted in
+// from probe_common.glsl at compile time (shaderc has no #include). With the set
+// empty (count 0) the forward specular below keeps the sky prefilter path.
+{PROBE_COMMON}
 
 // Layout must match the #[repr(C)] GpuObjectData in gfx::render_types.
 struct GpuObjectData {
@@ -327,8 +340,24 @@ void main() {
         // environment into sparkle on near mirrors; flat close-up pixels have a
         // near-zero footprint, so they keep the plain roughness mip.
         float lod = roughness * (view.prefilter_mip_count - 1.0);
-        vec3 prefiltered  = texture(prefilter_cube, R, lod).rgb;
+        // Local reflection probes when any are baked (box-parallax partition of
+        // unity), else the imported environment prefilter cube. With no probe
+        // baked `probe_set.count` is 0, so this is the sky path unchanged.
+        vec3 prefiltered  = (probe_set.count > 0u)
+            ? probe_set_specular(frag_world_pos, R, lod)
+            : texture(prefilter_cube, R, lod).rgb;
         vec3 specular_ibl = prefiltered * (F0 * ab.x + ab.y);
+
+        // When an SSR / RT reflection composite owns the sharp specular for glossy
+        // surfaces this frame, fade the forward probe specular for glossy
+        // dielectrics so the two do not double-count. Metals keep their full
+        // albedo-tinted forward specular (the resolve adds only a faint dielectric
+        // term), and surfaces rougher than the cut (which the resolve skips) keep
+        // theirs too.
+        if (view.reflections_enabled > 0.5) {
+            float fade = smoothstep(REFLECTION_ROUGHNESS_CUT * 0.7, REFLECTION_ROUGHNESS_CUT, roughness);
+            specular_ibl *= mix(1.0, fade, 1.0 - metallic);
+        }
 
         ambient = diffuse_ibl + specular_ibl;
     } else {

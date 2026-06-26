@@ -135,12 +135,11 @@ impl GraphicsSystem {
         }
         // Per-feature settings, derived from the overlaid config. Each is the
         // init-time gate the backend builds against; the same derivation feeds a
-        // live rebuild (`derive_quality_settings`). SSAO/SSR/SSGI/auto-exposure
-        // are honoured by the Metal backend (DirectX/Vulkan accept for parity);
-        // RT reflections by every RT-capable backend, falling back to SSR where
-        // ray tracing is unavailable. RT takes precedence over SSR where both
-        // are on (the graph builder picks `RtReflections`), reusing the same SSR
-        // pre-pass G-buffer + resolve target.
+        // live rebuild (`derive_quality_settings`). RT reflections need an
+        // RT-capable GPU, falling back to SSR where ray tracing is unavailable.
+        // RT takes precedence over SSR where both are on (the graph builder picks
+        // `RtReflections`), reusing the same SSR pre-pass G-buffer + resolve
+        // target.
         let taa_enabled = self.post_config.taa;
         let ssao_settings = self.post_config.ssao_settings();
         let ssr_settings = self.post_config.ssr_settings();
@@ -152,14 +151,13 @@ impl GraphicsSystem {
         // `post_process.exposure` (resolve()) and the bias here is unused.
         let auto_exposure_settings = self.post_config.auto_exposure_settings();
         let auto_exposure_bias_ev = self.post_config.exposure_ev;
-        // HDR display output toggle: honoured only by the Metal backend, and
-        // even there only when the active panel reports EDR headroom. With
-        // the flag off the renderer takes the standard SDR composite path.
+        // HDR display output toggle, gated on the platform advertising an
+        // HDR-capable surface (else it warns and falls back to the SDR composite
+        // path).
         let hdr_display = post_config.as_ref().map(|c| c.hdr_display).unwrap_or(false);
         let hdr_pq = post_config.as_ref().map(|c| c.hdr_pq).unwrap_or(false);
         // Temporal upscaling toggle + per-axis render scale, resolved from
-        // `PostProcessConfig.upscale_quality`. Honoured only by the Metal
-        // backend today; DirectX / Vulkan accept and ignore for parity.
+        // `PostProcessConfig.upscale_quality`.
         let temporal_upscaling = post_config
             .as_ref()
             .map(|c| c.temporal_upscaling)
@@ -231,15 +229,14 @@ impl GraphicsSystem {
         // before UiInputSystem drains the panels (init order: graphics first).
         self.init_clip_rects(ctx);
         // Upscaler backend selector from `PostProcessConfig.upscale_backend`.
-        // Honoured by DirectX (FSR3 / DLSS / XeSS); Metal / Vulkan ignore it.
+        // Honoured by the DirectX and Vulkan backends (FSR3 / DLSS / XeSS);
+        // Metal always uses MetalFX, so it ignores the selector.
         let upscale_backend = post_config
             .as_ref()
             .map(|c| c.upscale_backend)
             .unwrap_or_default();
-        // Two-pass Hi-Z occlusion toggle. Honoured only by the Metal backend,
-        // and even there only when the bindless GPU-cull path is active (the
-        // backend gates it on the phase-2 cull pipeline existing). DirectX /
-        // Vulkan accept and ignore it for parity.
+        // Two-pass Hi-Z occlusion toggle, gated on the bindless GPU-cull path
+        // being active (the phase-2 cull pipeline must exist).
         let occlusion_two_pass = post_config
             .as_ref()
             .map(|c| c.occlusion_two_pass)
@@ -1441,12 +1438,10 @@ impl GraphicsSystem {
         let glass_panels: Vec<GlassPanel> = ctx.drain::<GlassPanel>();
 
         // Drain raymarched SDF volumes and pull the compiled-payload
-        // fragment-shader source bytes for each. The Metal backend
-        // wraps the bytes with the engine-shipped helpers + template
-        // and compiles a per-volume PSO at init; DirectX / Vulkan
-        // accept the slice for signature parity. Volumes whose
-        // payload read fails are dropped with a logged warning rather
-        // than failing the whole world build.
+        // fragment-shader source bytes for each. Each backend wraps the bytes
+        // with the engine-shipped helpers + template and compiles a per-volume
+        // pipeline at init. Volumes whose payload read fails are dropped with a
+        // logged warning rather than failing the whole world build.
         let sdf_volumes: Vec<(SdfVolume, Vec<u8>, String)> = {
             let raw: Vec<SdfVolume> = ctx.drain::<SdfVolume>();
             let name_table = crate::ecs::asset_id::name_table();
@@ -1727,9 +1722,8 @@ impl GraphicsSystem {
         }
 
         // Upload skinned geometry to the backend and publish one SkeletonPose
-        // per skinned mesh for AnimationSystem to drive. Skinned rendering is
-        // live on Metal, DirectX, and Vulkan; the poses are published on every
-        // platform so the system graph is identical regardless of backend.
+        // per skinned mesh for AnimationSystem to drive. The poses are published
+        // regardless of backend so the system graph is identical.
         if !skinned_skeletons.is_empty() {
             if let Some(backend) = self.backend.as_deref_mut() {
                 // Metal uses `vert_bytes` + `frag_bytes` and sources the shadow

@@ -15,6 +15,16 @@ pub(super) struct GpuImage {
 }
 
 impl GpuImage {
+    // A null-handle placeholder, replaced by a real allocation before first use.
+    pub(super) fn null() -> Self {
+        Self {
+            image: vk::Image::null(),
+            memory: vk::DeviceMemory::null(),
+            view: vk::ImageView::null(),
+            aux_views: Vec::new(),
+        }
+    }
+
     pub(super) fn destroy(&self, device: &Device) {
         unsafe {
             for &v in &self.aux_views {
@@ -1370,6 +1380,39 @@ pub(super) fn upload_environment_map(
         prefilter,
         prefilter_mip_count: mip_bytes.len() as u32,
     })
+}
+
+// Upload one baked reflection-probe's prefiltered radiance cube. A probe is
+// sampled only by the specular reflection term (never as a skybox + no diffuse
+// irradiance), so just the multi-mip prefilter cube is uploaded, not the
+// irradiance cube `upload_environment_map` also builds. `mip_bytes[m]` holds
+// `6 * (face >> m)² * 16` bytes in face-major order (the serialised `ENVM`
+// prefilter chain from `reflection_probe::build_probe_payload`). The returned
+// `GpuImage` carries a `CUBE` view spanning every mip, sampled through the
+// shared `cube_sampler`. Mirrors `directx::texture::upload_probe_prefilter_cube`.
+#[allow(dead_code)] // installed by the probe capture pass (next slice).
+pub(super) fn upload_probe_prefilter_cube(
+    instance: &ash::Instance,
+    device: &Device,
+    physical_device: vk::PhysicalDevice,
+    command_pool: vk::CommandPool,
+    queue: vk::Queue,
+    prefilter_face: u32,
+    mip_bytes: &[&[u8]],
+) -> Result<GpuImage, String> {
+    if mip_bytes.is_empty() {
+        return Err("probe prefilter upload: mip_bytes must not be empty".into());
+    }
+    create_cube_image(
+        instance,
+        device,
+        physical_device,
+        command_pool,
+        queue,
+        prefilter_face,
+        mip_bytes,
+    )
+    .map_err(|e| format!("probe prefilter: {e}"))
 }
 
 // Linear-clamp sampler with full mipmap support, used by the IBL prefilter

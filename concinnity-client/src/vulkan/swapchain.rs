@@ -298,20 +298,8 @@ impl VkContext {
                 self.env_map.prefilter.view,
                 self.cube_sampler,
             )?;
-            // Bloom prefilter samples SSR output only when the SSR resolve is
-            // active (TAA overrides this below if TAA is also on). A SSGI-only
-            // build rebuilt the pre-pass G-buffer above but leaves the bloom
-            // prefilter on the raw HDR resolve.
-            if self.ssr_resolve_active {
-                for frame_sets in &self.bloom_input_sets {
-                    rebind_bloom_input0(
-                        &self.device,
-                        frame_sets[0],
-                        ssr.output.view,
-                        self.composite_sampler,
-                    );
-                }
-            }
+            // The bloom prefilter samples the reflection composite output (re-pointed
+            // in the composite rebuild below), not the raw resolve output.
             self.ssr = Some(ssr);
         }
 
@@ -372,15 +360,45 @@ impl VkContext {
                 self.env_map.prefilter.view,
                 self.cube_sampler,
             )?;
+            // The bloom prefilter samples the reflection composite output (re-pointed
+            // in the composite rebuild below), not the raw RT output.
+            self.rt_reflections = Some(rt);
+        }
+
+        // Rebuild the reflection composite's output + blur targets at the new
+        // resolution + re-wire its static bindings (the rebuilt HDR resolves +
+        // G-buffer views moved), then re-point the bloom prefilter input 0 at its
+        // output (the scene image; TAA / upscale override below). The reflection
+        // binding is re-pointed per encode, so the resolve rebuilds need no extra
+        // wiring here.
+        if let Some(mut rc) = self.reflection_composite.take() {
+            let hdr_views: Vec<vk::ImageView> =
+                self.hdr_resolve_images.iter().map(|img| img.view).collect();
+            let (nd_views, rough_views) = match self.gbuffer.as_ref() {
+                Some(gb) => (gb.normal_depth_views(), gb.roughness_views()),
+                None => (Vec::new(), Vec::new()),
+            };
+            rc.rebuild(
+                &self.instance,
+                &self.device,
+                self.physical_device,
+                self.commands.command_pool,
+                self.graphics_queue,
+                render_ext.width,
+                render_ext.height,
+                &hdr_views,
+                &nd_views,
+                &rough_views,
+            )?;
             for frame_sets in &self.bloom_input_sets {
                 rebind_bloom_input0(
                     &self.device,
                     frame_sets[0],
-                    rt.output.view,
+                    rc.output.view,
                     self.composite_sampler,
                 );
             }
-            self.rt_reflections = Some(rt);
+            self.reflection_composite = Some(rc);
         }
 
         // Rebuild the TAA velocity + history targets at the new resolution.
@@ -400,13 +418,11 @@ impl VkContext {
                 &self.hdr_resolve_images,
                 self.composite_sampler,
             )?;
-            // When RT reflections or the SSR resolve owns the scene image, TAA
-            // samples that (HDR + reflections) instead of the raw HDR resolve. RT
-            // takes precedence; a SSGI-only build leaves TAA on the raw HDR resolve.
-            if let Some(rt) = self.rt_reflections.as_ref() {
-                taa.rewire_scene(&self.device, rt.output.view, self.composite_sampler);
-            } else if let Some(ssr) = self.ssr.as_ref().filter(|_| self.ssr_resolve_active) {
-                taa.rewire_scene(&self.device, ssr.output.view, self.composite_sampler);
+            // When a reflection path owns the scene image, TAA samples the reflection
+            // composite output (HDR + reflections) instead of the raw HDR resolve. A
+            // SSGI-only build leaves TAA on the raw HDR resolve.
+            if let Some(rc) = self.reflection_composite.as_ref() {
+                taa.rewire_scene(&self.device, rc.output.view, self.composite_sampler);
             }
             // The TAA resolve's velocity input is the unified G-buffer's per-frame
             // velocity channel (rebuilt above), replacing TAA's own velocity
@@ -486,23 +502,39 @@ impl VkContext {
 
         // Rebuild the glass scene snapshot + per-frame framebuffers at the new
         // resolution + re-point the snapshot / depth bindings. The scene target
-        // moved with the rebuilt SSR output / HDR resolve, so resolve it again
-        // here (SSR output when SSR is on, else this slot's HDR resolve). The
-        // SSR + HDR resolve rebuilds above already ran, so the handles are
-        // current. The pipeline, layouts, panel buffers, view UBOs, and render
-        // pass all survive.
+        // moved with the rebuilt reflection composite output / HDR resolve, so
+        // resolve it again here (composite output when a reflection path is active,
+        // else this slot's HDR resolve). The composite + HDR resolve rebuilds above
+        // already ran, so the handles are current. The pipeline, layouts, panel
+        // buffers, view UBOs, and render pass all survive.
+        // Planar reflection mirror targets follow the render resolution; rebuild
+        // them before glass so the per-pane planar binding re-point below picks up
+        // the new target views.
+        if let Some(mut planar) = self.planar_reflection.take() {
+            planar.rebuild(
+                &self.instance,
+                &self.device,
+                self.physical_device,
+                render_ext.width,
+                render_ext.height,
+            )?;
+            self.planar_reflection = Some(planar);
+        }
+        let planar_target_views: Vec<vk::ImageView> = self
+            .planar_reflection
+            .as_ref()
+            .map(|s| (0..s.plane_count()).map(|i| s.target_view(i)).collect())
+            .unwrap_or_default();
         if let Some(mut glass) = self.glass.take() {
             let (scene_views, scene_images): (Vec<vk::ImageView>, Vec<vk::Image>) = (0..self
                 .frames_in_flight)
-                .map(
-                    |i| match self.ssr.as_ref().filter(|_| self.ssr_resolve_active) {
-                        Some(s) => (s.output.view, s.output.image),
-                        None => (
-                            self.hdr_resolve_images[i].view,
-                            self.hdr_resolve_images[i].image,
-                        ),
-                    },
-                )
+                .map(|i| match self.reflection_composite.as_ref() {
+                    Some(rc) => (rc.output.view, rc.output.image),
+                    None => (
+                        self.hdr_resolve_images[i].view,
+                        self.hdr_resolve_images[i].image,
+                    ),
+                })
                 .unzip();
             let depth_views: Vec<vk::ImageView> =
                 self.depth_images.iter().map(|img| img.view).collect();
@@ -517,6 +549,7 @@ impl VkContext {
                 &scene_views,
                 &scene_images,
                 &depth_views,
+                &planar_target_views,
             )?;
             self.glass = Some(glass);
         }
@@ -541,6 +574,17 @@ impl VkContext {
             )?;
             self.cull.hiz = Some(hiz);
             self.cull.hiz_valid = false;
+        }
+
+        // Re-point the planar reflected-frustum cull's Hi-Z set at the freshly
+        // rebuilt pyramid view. The Hi-Z resize above destroyed the view the planar
+        // set captured at init; the persistent planar set must follow or its set 1
+        // dangles a freed image view (bound every frame even though hiz_enabled = 0
+        // keeps it unsampled). A no-op when there's no planar set or no Hi-Z.
+        if let (Some(planar), Some(hiz)) = (self.planar_reflection.as_ref(), self.cull.hiz.as_ref())
+        {
+            let (view, sampler) = hiz.read_set_sources();
+            planar.rewrite_hiz_view(&self.device, view, sampler);
         }
 
         // Rebuild the particle framebuffers at the new resolution. The
@@ -612,19 +656,16 @@ impl VkContext {
         }
 
         // Re-point the composite descriptor sets at the rebuilt scene-input
-        // image (FSR upscale output > TAA output > RT reflection output > SSR
-        // output > HDR resolve) + bloom mip 0. The 3D colour LUT is
-        // resolution-independent, so it survives the resize untouched and is just
-        // re-bound at binding 2.
+        // image (FSR upscale output > TAA output > reflection composite output >
+        // HDR resolve) + bloom mip 0. The 3D colour LUT is resolution-independent,
+        // so it survives the resize untouched and is just re-bound at binding 2.
         for (i, &set) in self.composite_sets.iter().enumerate() {
             let scene_view = if let Some(up) = &self.upscale {
                 up.output_image().view
             } else if let Some(taa) = &self.taa {
                 taa.output_view(i)
-            } else if let Some(rt) = self.rt_reflections.as_ref() {
-                rt.output.view
-            } else if let Some(ssr) = self.ssr.as_ref().filter(|_| self.ssr_resolve_active) {
-                ssr.output.view
+            } else if let Some(rc) = self.reflection_composite.as_ref() {
+                rc.output.view
             } else {
                 self.hdr_resolve_images[i].view
             };

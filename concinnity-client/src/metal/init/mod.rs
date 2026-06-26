@@ -129,6 +129,11 @@ impl MtlContext {
         // picks `RtReflections` over `SsrResolve` (RT takes precedence; SSR
         // stays the cross-backend fallback if the world authored both).
         rt_reflection_settings: Option<RtReflectionSettings>,
+        // Per-axis divisor for the roughness-aware reflection blur target,
+        // resolved from `PostProcessConfig.reflection_blur_resolution`. Sizes
+        // the reflection composite's reduced-resolution blur target at
+        // render / this; stored on `SsrState` so resize reuses it.
+        reflection_blur_scale: u32,
         // Projected-decal records resolved from the world's `Decal` components.
         // Empty → the decal pass is skipped entirely.
         decals: Vec<DecalRecord>,
@@ -672,6 +677,7 @@ impl MtlContext {
             &ssr_settings,
             &ssgi_settings,
             &rt_reflection_settings,
+            reflection_blur_scale,
             &decals,
             &particles,
             &fog_settings,

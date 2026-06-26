@@ -24,7 +24,11 @@ pub(super) struct ViewUniforms {
     pub vp: [[f32; 4]; 4],
     pub view_mat: [[f32; 4]; 4],
     pub elapsed: f32,
-    pub _pad0: f32,
+    // 1.0 when an SSR / RT reflection composite owns the sharp specular this frame,
+    // so the forward bindless shader fades its glossy-dielectric probe specular to
+    // avoid double-counting; 0.0 keeps the full forward reflection (and at probe
+    // bakes, where no resolve runs). Repurposes the former offset-132 pad.
+    pub reflections_enabled: f32,
     pub cam_x: f32,
     pub cam_y: f32,
     pub cam_z: f32,
@@ -58,10 +62,20 @@ impl VkContext {
     // both clamped to the pool. Rebuilt every frame so `update_model` /
     // `update_visibility` edits are reflected; a no-op when bindless is off.
     fn build_object_buffer(&self, frame_idx: usize) {
-        use crate::gfx::render_types::{GpuObjectData, pack_object_record, pack_skinned_record};
         let Some(&ptr) = self.cull.object_buffer_ptrs.get(frame_idx) else {
             return;
         };
+        self.build_object_records_into(ptr);
+    }
+
+    // Write the bindless `GpuObjectData` records (static + streamed-chunk +
+    // skinned-tail) into a mapped buffer at `ptr`. Factored out of
+    // `build_object_buffer` so the reflection-probe capture can build the same
+    // records into its own bake-owned buffer (the instance tail is left untouched,
+    // so a bake buffer must be zeroed first -- a zero record is a disabled draw the
+    // cull kernel skips, which is how the probe omits instanced geometry in V1).
+    pub(in crate::vulkan) fn build_object_records_into(&self, ptr: *mut u8) {
+        use crate::gfx::render_types::{GpuObjectData, pack_object_record, pack_skinned_record};
         let albedo_count = self.textures.len();
         let last_tex = albedo_count.saturating_sub(1);
         let last_nm = self.normal_map_textures.len().saturating_sub(1);
@@ -144,10 +158,20 @@ impl VkContext {
     // picked by camera distance, so the bindless main pass renders the
     // chosen LOD with no shader-side change. Mirrors `directx/cull.rs`.
     fn build_draw_args_buffer(&self, frame_idx: usize, cam_pos: [f32; 3]) {
-        use crate::gfx::render_types::{GpuDrawArgs, draw_args_flags};
         let Some(&ptr) = self.cull.draw_args_buffer_ptrs.get(frame_idx) else {
             return;
         };
+        self.build_draw_args_records_into(ptr, cam_pos);
+    }
+
+    // Write the GPU-cull `GpuDrawArgs` records (static + streamed-chunk +
+    // skinned-tail, the per-object active-LOD slice picked by distance from
+    // `cam_pos`) into a mapped buffer at `ptr`. Factored out of
+    // `build_draw_args_buffer` so the reflection-probe capture can build the same
+    // args into its own bake-owned buffer against the probe eye. The instance tail
+    // is left untouched (a zeroed bake buffer keeps it disabled = skipped).
+    pub(in crate::vulkan) fn build_draw_args_records_into(&self, ptr: *mut u8, cam_pos: [f32; 3]) {
+        use crate::gfx::render_types::{GpuDrawArgs, draw_args_flags};
         let stride = std::mem::size_of::<GpuDrawArgs>();
         for (i, obj) in self.draw_objects.iter().take(self.n_objects).enumerate() {
             // Per-frame active LOD pick. Objects with no alternates fall
@@ -513,7 +537,14 @@ impl VkContext {
             vp: vp_mat,
             view_mat: self.view_matrix,
             elapsed,
-            _pad0: 0.0,
+            // Hand glossy dielectric specular to the SSR / RT resolve when its
+            // composite owns the scene image this frame (the composite is present
+            // iff a resolve is active), else the forward shader keeps it all.
+            reflections_enabled: if self.reflection_composite.is_some() {
+                1.0
+            } else {
+                0.0
+            },
             cam_x: cam_pos[0],
             cam_y: cam_pos[1],
             cam_z: cam_pos[2],
@@ -526,6 +557,17 @@ impl VkContext {
                 &view_uni as *const ViewUniforms as *const u8,
                 self.uniforms.view_ubo_ptrs[frame_idx],
                 std::mem::size_of::<ViewUniforms>(),
+            );
+        }
+
+        // Reflection-probe set (global set 0 binding 7): EMPTY (count 0 = sky
+        // reflection) until a probe bakes, so the forward shader keeps the sky
+        // path. Uploaded every frame so a later install is picked up immediately.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                &self.probe_set as *const super::probe_uniforms::ProbeSet as *const u8,
+                self.uniforms.probe_set_ubo_ptrs[frame_idx],
+                std::mem::size_of::<super::probe_uniforms::ProbeSet>(),
             );
         }
 
@@ -746,7 +788,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(ViewUniforms, vp), 0);
         assert_eq!(std::mem::offset_of!(ViewUniforms, view_mat), 64);
         assert_eq!(std::mem::offset_of!(ViewUniforms, elapsed), 128);
-        assert_eq!(std::mem::offset_of!(ViewUniforms, _pad0), 132);
+        assert_eq!(std::mem::offset_of!(ViewUniforms, reflections_enabled), 132);
         assert_eq!(std::mem::offset_of!(ViewUniforms, cam_x), 136);
         assert_eq!(std::mem::offset_of!(ViewUniforms, cam_y), 140);
         assert_eq!(std::mem::offset_of!(ViewUniforms, cam_z), 144);

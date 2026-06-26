@@ -40,6 +40,12 @@ const VERT_BINDLESS_GLSL: &str = include_str!("shaders/main_bindless.vert");
 
 const FRAG_BINDLESS_GLSL: &str = include_str!("shaders/main_bindless.frag");
 
+// Shared reflection-probe sampling (box-parallax partition-of-unity blend),
+// substituted into the bindless fragment shader at its `{PROBE_COMMON}` marker
+// (shaderc has no #include). `{MAX_PROBES}` inside it is replaced with the bind
+// count so the GLSL array sizes stay locked to `probe_uniforms::MAX_PROBES`.
+pub(in crate::vulkan) const PROBE_COMMON_GLSL: &str = include_str!("shaders/probe_common.glsl");
+
 // GPU-instanced sibling of VERT_GLSL. Reads per-instance world matrices from a
 // storage buffer at set=2,binding=0 indexed by gl_InstanceIndex instead of the
 // push-constant model field (which is ignored here). Paired with FRAG_GLSL.
@@ -123,7 +129,20 @@ pub(super) fn compile_bindless_shaders(
     let vert_src = shader_source(hot_reload, "main_bindless.vert", VERT_BINDLESS_GLSL);
     let vert = compile_glsl(&vert_src, shaderc::ShaderKind::Vertex, "vert_bindless.glsl")?;
     let frag_src_template = shader_source(hot_reload, "main_bindless.frag", FRAG_BINDLESS_GLSL);
-    let frag_src = frag_src_template.replace("{POOL_SIZE}", &pool_size.to_string());
+    // Inject the shared probe sampling first (it contains its own {MAX_PROBES}),
+    // then substitute the bind counts. `{MAX_PROBES}` is locked to the Rust
+    // `probe_uniforms::MAX_PROBES` so the GLSL array sizes match the descriptor
+    // layout's probe cube array + the ProbeSet UBO byte layout.
+    let probe_common = shader_source(hot_reload, "probe_common.glsl", PROBE_COMMON_GLSL);
+    let frag_src = frag_src_template
+        .replace("{PROBE_COMMON}", &probe_common)
+        .replace(
+            "{MAX_PROBES}",
+            &super::probe_uniforms::MAX_PROBES.to_string(),
+        )
+        // The global set IS set 0 in the forward bindless pass.
+        .replace("{PROBE_DESC_SET}", "0")
+        .replace("{POOL_SIZE}", &pool_size.to_string());
     let frag = compile_glsl(
         &frag_src,
         shaderc::ShaderKind::Fragment,
@@ -1172,9 +1191,10 @@ pub(super) fn create_composite_pipeline(
 #[cfg(test)]
 mod tests {
     use super::{
-        FRAG_GLSL, VERT_GLSL, compile_cull_shader, compile_cull_shader_phase2,
-        compile_shadow_bindless_vs, compile_shadow_cull_shader, compile_skinned_shaders, is_spirv,
-        resolve_instanced_shader, resolve_main_shaders,
+        FRAG_BINDLESS_GLSL, FRAG_GLSL, PROBE_COMMON_GLSL, VERT_GLSL, compile_bindless_shaders,
+        compile_cull_shader, compile_cull_shader_phase2, compile_shadow_bindless_vs,
+        compile_shadow_cull_shader, compile_skinned_shaders, is_spirv, resolve_instanced_shader,
+        resolve_main_shaders,
     };
 
     // The phase-1 cull kernel, its two-pass `CULL_PHASE2` variant, and the
@@ -1200,6 +1220,32 @@ mod tests {
     fn shadow_bindless_vs_compiles() {
         let vs = compile_shadow_bindless_vs(false).expect("shadow bindless VS compiles");
         assert!(is_spirv(&vs), "shadow bindless VS is valid SPIR-V");
+    }
+
+    // The bindless main shaders compile to valid SPIR-V from the embedded source,
+    // including the reflection-probe sampling injected from `probe_common.glsl` at
+    // the `{PROBE_COMMON}` marker + the `{MAX_PROBES}` / `{POOL_SIZE}` substitutions.
+    // Guards the probe forward path (the box-parallax partition-of-unity blend +
+    // the ProbeSet UBO / probe cube array declarations) offline: a GLSL error in
+    // the injection fails here without needing a GPU.
+    #[test]
+    fn bindless_shaders_compile() {
+        let (vs, fs) = compile_bindless_shaders(false, 4).expect("bindless shaders compile");
+        assert!(is_spirv(&vs), "bindless vertex is valid SPIR-V");
+        assert!(is_spirv(&fs), "bindless fragment is valid SPIR-V");
+        // The probe markers must be fully substituted (no literal token survives).
+        let frag_src = FRAG_BINDLESS_GLSL
+            .replace("{PROBE_COMMON}", PROBE_COMMON_GLSL)
+            .replace(
+                "{MAX_PROBES}",
+                &crate::vulkan::probe_uniforms::MAX_PROBES.to_string(),
+            )
+            .replace("{PROBE_DESC_SET}", "0")
+            .replace("{POOL_SIZE}", "4");
+        assert!(!frag_src.contains("{PROBE_COMMON}"));
+        assert!(!frag_src.contains("{MAX_PROBES}"));
+        assert!(!frag_src.contains("{PROBE_DESC_SET}"));
+        assert!(!frag_src.contains("{POOL_SIZE}"));
     }
 
     // The shader-resolution helpers that `update_world_shader_pipelines`

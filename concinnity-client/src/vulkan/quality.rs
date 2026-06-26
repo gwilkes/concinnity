@@ -143,6 +143,7 @@ impl VkContext {
                 &hdr_views,
                 self.env_map.prefilter.view,
                 self.cube_sampler,
+                self.descriptors.global_set_layout,
                 self.hot_reload,
             )?;
             self.ssr = Some(ssr);
@@ -270,11 +271,45 @@ impl VkContext {
         // init `ssr_resolve_on`.
         self.ssr_resolve_active = desired_ssr && self.rt_reflections.is_none();
 
+        // Reflection composite: present whenever a reflection path owns the scene
+        // image. Build it on a turn-on, tear it down on a turn-off; `rebuild_swapchain`
+        // below then rebuilds its targets + routes the scene image through its output.
+        let reflection_active = self.rt_reflections.is_some() || self.ssr_resolve_active;
+        if reflection_active && self.reflection_composite.is_none() {
+            let hdr_views: Vec<vk::ImageView> =
+                self.hdr_resolve_images.iter().map(|i| i.view).collect();
+            let gb = self
+                .gbuffer
+                .as_ref()
+                .expect("a reflection path forces the unified G-buffer pre-pass");
+            let nd_views = gb.normal_depth_views();
+            let rough_views = gb.roughness_views();
+            let rc = super::post::reflection_composite::ReflectionCompositeResources::new(
+                &self.instance,
+                &self.device,
+                self.physical_device,
+                self.commands.command_pool,
+                self.graphics_queue,
+                self.render_extent.width,
+                self.render_extent.height,
+                self.frames_in_flight,
+                q.reflection_blur_scale,
+                &hdr_views,
+                &nd_views,
+                &rough_views,
+                self.hot_reload,
+            )?;
+            self.reflection_composite = Some(rc);
+        } else if !reflection_active && self.reflection_composite.is_some() {
+            let mut rc = self.reflection_composite.take().expect("checked is_some");
+            rc.destroy(&self.device);
+        }
+
         // Rebuild every target + rewire every reader / the composite chain via
         // the resize path. It rebuilds the transient pool + bloom from the
         // reconciled `self.ssao`, rebuilds each `Some` feature's targets, and
         // re-points the bloom prefilter + composite scene input down the
-        // upscale > TAA > RT > SSR-resolve > HDR priority chain.
+        // upscale > TAA > reflection-composite > HDR priority chain.
         self.rebuild_swapchain()?;
 
         // `rebuild_swapchain` only re-points set-0 binding 6 inside its
@@ -364,6 +399,7 @@ impl VkContext {
             self.env_map.prefilter.view,
             self.cube_sampler,
             self.cull.bindless_set_layout,
+            self.descriptors.global_set_layout,
             bindless_pool_size,
             self.hot_reload,
         ) {

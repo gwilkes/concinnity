@@ -271,8 +271,9 @@ fn decode_a2b10g10r10(raw: &[u8]) -> Vec<u8> {
 }
 
 // Decode an IEEE 754 half (binary16) to f32. Handles zero, subnormals,
-// normals, and inf/NaN.
-fn f16_to_f32(h: u16) -> f32 {
+// normals, and inf/NaN. Shared with the reflection-probe cube readback
+// (`probe.rs`), which decodes its `R16G16B16A16_SFLOAT` faces the same way.
+pub(in crate::vulkan) fn f16_to_f32(h: u16) -> f32 {
     let sign = if (h >> 15) & 1 == 1 { -1.0 } else { 1.0 };
     let exp = (h >> 10) & 0x1f;
     let mant = (h & 0x3ff) as f32;

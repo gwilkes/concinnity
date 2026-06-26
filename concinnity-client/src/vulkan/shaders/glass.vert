@@ -13,7 +13,7 @@ layout(std140, set = 0, binding = 0) uniform TransparentViewBlock {
     vec4  camera_pos;  // world-space camera, .w unused
     vec2  viewport;    // attachment dimensions in pixels
     float time;        // seconds since startup
-    float _pad;
+    float prefilter_mip_count;  // mips in the sky prefilter cube (0 = no env)
 } view;
 
 // Only the position is fetched (location 0); the rest of the engine `Vertex`

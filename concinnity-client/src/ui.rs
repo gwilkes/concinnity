@@ -151,6 +151,10 @@ pub struct UiInputSystem {
     // While set, the menu consumes the frame for capture: the next pressed key
     // binds it and Escape cancels.
     capturing: Option<Capture>,
+    // Cursor into the Events<ViewCommand> queue. This system both sends (when a
+    // `view:*` action fires) and reads ViewCommands, so a command fired this
+    // frame is applied on the next, the same one-frame lag the old drain had.
+    view_cmd_cursor: crate::ecs::EventCursor,
 }
 
 impl UiInputSystem {
@@ -167,6 +171,7 @@ impl UiInputSystem {
             panels: Vec::new(),
             thumb_drag: None,
             capturing: None,
+            view_cmd_cursor: crate::ecs::EventCursor::default(),
         }
     }
 }
@@ -284,9 +289,19 @@ impl System for UiInputSystem {
     }
 
     fn step(&mut self, ctx: &mut PipelineContext) -> StepResult {
-        // Drain accumulated ViewCommands first so a click last frame takes
-        // effect before this frame's hit-testing reads `active`.
-        for cmd in ctx.drain::<ViewCommand>() {
+        // Apply ViewCommands sent last frame first, so a click last frame takes
+        // effect before this frame's hit-testing reads `active`. Clone them out
+        // of the queue to release the ctx borrow before apply_view_command,
+        // which needs &mut ctx.
+        let view_cmds: Vec<ViewCommand> = match ctx.events::<ViewCommand>() {
+            Some(events) => events
+                .read(&mut self.view_cmd_cursor)
+                .into_iter()
+                .cloned()
+                .collect(),
+            None => Vec::new(),
+        };
+        for cmd in view_cmds {
             self.apply_view_command(cmd, ctx);
         }
 
@@ -307,14 +322,14 @@ impl System for UiInputSystem {
                 self.cancel_capture(ctx);
             } else if let Some(key) = input.captured_key {
                 let cap = self.capturing.take().expect("capturing is some");
-                ctx.push(SettingCommand {
+                ctx.events_mut::<SettingCommand>().send(SettingCommand {
                     setting: cap.setting_key,
                     op: SettingOp::Rebind(key),
                     value_label: cap.value_label,
                     persist: true,
                 });
                 // GraphicsSystem rewrites the value label to the bound key when
-                // it drains the command next tick; the prompt shows until then.
+                // it reads the command next tick; the prompt shows until then.
             }
             return StepResult::Continue;
         }
@@ -370,7 +385,7 @@ impl System for UiInputSystem {
                 let r = &self.regions[i].region;
                 let frac = ((qx - r.x) / r.width).clamp(0.0, 1.0);
                 let label = r.label;
-                ctx.push(SettingCommand {
+                ctx.events_mut::<SettingCommand>().send(SettingCommand {
                     setting: key,
                     op: SettingOp::SetFraction(frac),
                     value_label: label,
@@ -399,7 +414,7 @@ impl System for UiInputSystem {
                     let frac = ((qx - rx) / rw).clamp(0.0, 1.0);
                     // In-progress: apply live but skip the disk write (persist
                     // only on release, above).
-                    ctx.push(SettingCommand {
+                    ctx.events_mut::<SettingCommand>().send(SettingCommand {
                         setting: key,
                         op: SettingOp::SetFraction(frac),
                         value_label: label,
@@ -960,32 +975,36 @@ fn fire_action(
                 });
                 // Hide any active view on a scene change: the user has
                 // chosen a new context, so the overlay is dismissed.
-                ctx.push(ViewCommand::Hide);
+                ctx.events_mut::<ViewCommand>().send(ViewCommand::Hide);
             }
             Err(_) => tracing::warn!("UiInputSystem: unresolved scene action '{}'", action),
         }
         return None;
     }
     if action == "view:hide" {
-        ctx.push(ViewCommand::Hide);
+        ctx.events_mut::<ViewCommand>().send(ViewCommand::Hide);
         return None;
     }
     if let Some(view_ref) = action.strip_prefix("view:show:") {
         match view_ref.parse::<u32>() {
-            Ok(id) => ctx.push(ViewCommand::Show(AssetId(id))),
+            Ok(id) => ctx
+                .events_mut::<ViewCommand>()
+                .send(ViewCommand::Show(AssetId(id))),
             Err(_) => tracing::warn!("UiInputSystem: unresolved view action '{}'", action),
         }
         return None;
     }
     if let Some(view_ref) = action.strip_prefix("view:toggle:") {
         match view_ref.parse::<u32>() {
-            Ok(id) => ctx.push(ViewCommand::Toggle(AssetId(id))),
+            Ok(id) => ctx
+                .events_mut::<ViewCommand>()
+                .send(ViewCommand::Toggle(AssetId(id))),
             Err(_) => tracing::warn!("UiInputSystem: unresolved view action '{}'", action),
         }
         return None;
     }
     // setting:<key>:next|prev -- cycle a graphics setting. GraphicsSystem
-    // drains the SettingCommand to apply, persist, and refresh the value label.
+    // reads the SettingCommand to apply, persist, and refresh the value label.
     if let Some(rest) = action.strip_prefix("setting:") {
         match rest.rsplit_once(':') {
             Some((key, "next")) | Some((key, "prev")) if !key.is_empty() => {
@@ -994,7 +1013,7 @@ fn fire_action(
                 } else {
                     SettingOp::Next
                 };
-                ctx.push(SettingCommand {
+                ctx.events_mut::<SettingCommand>().send(SettingCommand {
                     setting: key.to_string(),
                     op,
                     value_label: label,
@@ -1031,6 +1050,27 @@ mod tests {
             left_click: clicked,
             ..Default::default()
         }
+    }
+
+    // The ViewCommand UiInputSystem sent this step, read with a fresh cursor so
+    // the system's own cursor (which applies them a frame later) is untouched.
+    // Returns the first if several were sent.
+    fn produced_view_command(world: &World) -> Option<ViewCommand> {
+        let mut cursor = crate::ecs::EventCursor::default();
+        world
+            .events::<ViewCommand>()
+            .and_then(|e| e.read(&mut cursor).into_iter().next().cloned())
+    }
+
+    // Every SettingCommand the system sent, read with a fresh cursor (in send
+    // order). GraphicsSystem applies these, but these tests run UiInputSystem
+    // alone, so they inspect the queue directly via .first()/.last()/.is_empty().
+    fn produced_setting_commands(world: &World) -> Vec<SettingCommand> {
+        let mut cursor = crate::ecs::EventCursor::default();
+        world
+            .events::<SettingCommand>()
+            .map(|e| e.read(&mut cursor).into_iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     // A view-owned TextLabel used as a scroll-panel element.
@@ -1252,7 +1292,9 @@ mod tests {
         assert!(!visible_after_init, "view starts hidden after init");
 
         // Show the view.
-        world.add_component(ViewCommand::Show(view_id));
+        world
+            .events_mut::<ViewCommand>()
+            .send(ViewCommand::Show(view_id));
         world.add_component(FrameInput::default());
         world.step();
 
@@ -1264,7 +1306,7 @@ mod tests {
         assert!(visible_after_show, "view sprite is visible after Show");
 
         // Hide it again.
-        world.add_component(ViewCommand::Hide);
+        world.events_mut::<ViewCommand>().send(ViewCommand::Hide);
         world.add_component(FrameInput::default());
         world.step();
 
@@ -1370,7 +1412,9 @@ mod tests {
         world.start().unwrap();
 
         // Show the view, then click where the scene-region is.
-        world.add_component(ViewCommand::Show(view_id));
+        world
+            .events_mut::<ViewCommand>()
+            .send(ViewCommand::Show(view_id));
         world.add_component(make_frame_input(50.0, 50.0, true));
         world.step();
 
@@ -1404,7 +1448,7 @@ mod tests {
         world.add_component(make_frame_input(50.0, 50.0, true));
         world.step();
         assert!(matches!(
-            world.query::<ViewCommand>().next(),
+            produced_view_command(&world),
             Some(ViewCommand::Hide)
         ));
 
@@ -1426,7 +1470,7 @@ mod tests {
         world.start().unwrap();
         world.add_component(make_frame_input(50.0, 50.0, true));
         world.step();
-        let cmd = world.query::<ViewCommand>().next().cloned();
+        let cmd = produced_view_command(&world);
         assert!(matches!(cmd, Some(ViewCommand::Show(AssetId(42)))));
 
         // view:toggle:43 → ViewCommand::Toggle(43)
@@ -1447,7 +1491,7 @@ mod tests {
         world.start().unwrap();
         world.add_component(make_frame_input(50.0, 50.0, true));
         world.step();
-        let cmd = world.query::<ViewCommand>().next().cloned();
+        let cmd = produced_view_command(&world);
         assert!(matches!(cmd, Some(ViewCommand::Toggle(AssetId(43)))));
     }
 
@@ -1473,7 +1517,10 @@ mod tests {
         world.start().unwrap();
         world.add_component(make_frame_input(50.0, 50.0, true));
         world.step();
-        let cmd = world.query::<SettingCommand>().next().cloned().unwrap();
+        let cmd = produced_setting_commands(&world)
+            .into_iter()
+            .next()
+            .unwrap();
         assert_eq!(cmd.setting, "vsync");
         assert_eq!(cmd.op, SettingOp::Next);
         assert_eq!(cmd.value_label, Some(value_label));
@@ -1488,7 +1535,10 @@ mod tests {
         world.start().unwrap();
         world.add_component(make_frame_input(50.0, 20.0, true));
         world.step();
-        let cmd = world.query::<SettingCommand>().next().cloned().unwrap();
+        let cmd = produced_setting_commands(&world)
+            .into_iter()
+            .next()
+            .unwrap();
         assert_eq!(cmd.op, SettingOp::Prev);
     }
 
@@ -1515,7 +1565,7 @@ mod tests {
         world.add_component(make_frame_input(50.0, 50.0, true));
         world.step();
         assert!(
-            world.query::<SettingCommand>().next().is_none(),
+            produced_setting_commands(&world).is_empty(),
             "a disabled region must not fire its action"
         );
     }
@@ -1549,7 +1599,10 @@ mod tests {
             ..Default::default()
         });
         world.step();
-        let cmd = world.query::<SettingCommand>().last().cloned().unwrap();
+        let cmd = produced_setting_commands(&world)
+            .into_iter()
+            .last()
+            .unwrap();
         assert_eq!(cmd.setting, "exposure");
         assert!(matches!(cmd.op, SettingOp::SetFraction(f) if (f - 0.25).abs() < 1.0e-5));
         assert_eq!(cmd.value_label, Some(value_label));
@@ -1567,7 +1620,10 @@ mod tests {
             ..Default::default()
         });
         world.step();
-        let cmd = world.query::<SettingCommand>().last().cloned().unwrap();
+        let cmd = produced_setting_commands(&world)
+            .into_iter()
+            .last()
+            .unwrap();
         assert!(matches!(cmd.op, SettingOp::SetFraction(f) if (f - 0.75).abs() < 1.0e-5));
         assert!(cmd.persist, "release commits and persists the final value");
     }
@@ -1664,7 +1720,7 @@ mod tests {
         world.add_component(make_frame_input(10.0, 160.0, true));
         world.step();
         assert!(
-            world.query::<SettingCommand>().next().is_none(),
+            produced_setting_commands(&world).is_empty(),
             "a collapsed row's region does not fire"
         );
     }
@@ -1794,7 +1850,7 @@ mod tests {
             REBIND_PROMPT
         );
         assert!(
-            world.query::<SettingCommand>().next().is_none(),
+            produced_setting_commands(&world).is_empty(),
             "no command until a key is pressed"
         );
 
@@ -1804,7 +1860,10 @@ mod tests {
             ..Default::default()
         });
         world.step();
-        let cmd = world.query::<SettingCommand>().next().cloned().unwrap();
+        let cmd = produced_setting_commands(&world)
+            .into_iter()
+            .next()
+            .unwrap();
         assert_eq!(cmd.setting, "key_forward");
         assert_eq!(cmd.value_label, Some(value));
         assert!(matches!(cmd.op, SettingOp::Rebind(Key::Q)));
@@ -1829,7 +1888,7 @@ mod tests {
         });
         world.step();
         assert_eq!(label_field(&world, value, |l| l.content.clone()), "W");
-        assert!(world.query::<SettingCommand>().next().is_none());
+        assert!(produced_setting_commands(&world).is_empty());
     }
 
     // A captured key with no active capture binds nothing.
@@ -1842,7 +1901,7 @@ mod tests {
             ..Default::default()
         });
         world.step();
-        assert!(world.query::<SettingCommand>().next().is_none());
+        assert!(produced_setting_commands(&world).is_empty());
     }
 
     #[test]
@@ -1868,7 +1927,7 @@ mod tests {
         });
         world.step();
 
-        let cmd = world.query::<ViewCommand>().next().cloned();
+        let cmd = produced_view_command(&world);
         assert!(matches!(cmd, Some(ViewCommand::Toggle(AssetId(50)))));
     }
 

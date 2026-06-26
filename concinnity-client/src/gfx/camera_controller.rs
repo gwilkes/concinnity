@@ -376,7 +376,10 @@ mod tests {
         });
         world.step();
 
-        let cmd = world.query::<ViewCommand>().next().cloned();
+        let mut cursor = crate::ecs::EventCursor::default();
+        let cmd = world
+            .events::<ViewCommand>()
+            .and_then(|e| e.read(&mut cursor).into_iter().next().cloned());
         assert!(
             matches!(cmd, Some(ViewCommand::Toggle(AssetId(50)))),
             "UiInputSystem must still process Escape when a camera is present"

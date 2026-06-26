@@ -281,10 +281,21 @@ impl GraphicsSystem {
                     );
                 }
 
-                // apply graphics settings changes pushed by UiInputSystem this
-                // tick: cycle the setting, apply it to the backend, refresh the
-                // value label, and persist the new value.
-                for cmd in ctx.drain::<SettingCommand>() {
+                // apply graphics settings changes UiInputSystem sent last tick:
+                // cycle the setting, apply it to the backend, refresh the value
+                // label, and persist the new value. Clone the commands out of
+                // the queue so the ctx borrow is released before the loop body,
+                // which needs &mut ctx (label/sprite updates, ControlsCommand /
+                // AudioCommand sends).
+                let setting_cmds: Vec<SettingCommand> = match ctx.events::<SettingCommand>() {
+                    Some(events) => events
+                        .read(&mut self.setting_cmd_cursor)
+                        .into_iter()
+                        .cloned()
+                        .collect(),
+                    None => Vec::new(),
+                };
+                for cmd in setting_cmds {
                     // Key-rebind settings (Controls tab) take a Rebind op: bind
                     // the named action to the captured key, swapping with whatever
                     // action held it, push the map to the backend, persist, and

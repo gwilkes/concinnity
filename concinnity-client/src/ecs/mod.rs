@@ -413,6 +413,8 @@ impl World {
     // Each migrated event type is listed here explicitly.
     fn update_events(&mut self) {
         self.update_event_queue::<crate::assets::SceneCommand>();
+        self.update_event_queue::<crate::assets::ViewCommand>();
+        self.update_event_queue::<crate::assets::SettingCommand>();
         self.update_event_queue::<crate::assets::ControlsCommand>();
         self.update_event_queue::<crate::assets::AudioCommand>();
     }

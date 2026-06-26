@@ -90,6 +90,9 @@ pub struct GraphicsSystem {
     // Cursor into the Events<SceneCommand> queue, tracking which scene jumps
     // this system has already applied.
     scene_cmd_cursor: crate::ecs::EventCursor,
+    // Cursor into the Events<SettingCommand> queue (settings-menu changes:
+    // graphics toggles, sliders, key rebinds, volume).
+    setting_cmd_cursor: crate::ecs::EventCursor,
     // Font atlas data, keyed by asset id, built during init().
     loaded_fonts: std::collections::HashMap<AssetId, text::LoadedFont>,
     // Asset-streaming subsystem for the albedo texture pool. Some only when a
@@ -340,6 +343,7 @@ impl GraphicsSystem {
             prop_scene: Vec::new(),
             reel: None,
             scene_cmd_cursor: crate::ecs::EventCursor::default(),
+            setting_cmd_cursor: crate::ecs::EventCursor::default(),
             loaded_fonts: std::collections::HashMap::new(),
             texture_streamer: None,
             normal_map_streamer: None,

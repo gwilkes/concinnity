@@ -68,7 +68,6 @@ crate::define_components! {
         Sprite            => assets::Sprite,            42,
         KeyBinding        => assets::KeyBinding,        43,
         View              => assets::View,              44,
-        ViewCommand       => assets::ViewCommand,       45,
         Decal             => assets::Decal,             46,
         VolumetricFog     => assets::VolumetricFog,     47,
         Joint             => assets::Joint,             48,
@@ -83,7 +82,6 @@ crate::define_components! {
         SceneImport       => assets::SceneImport,       57,
         MainMenu          => assets::MainMenu,          58,
         OptionSelect      => assets::OptionSelect,      59,
-        SettingCommand    => assets::SettingCommand,    60,
         Slider            => assets::Slider,            61,
         ScrollPanel       => assets::ScrollPanel,       62,
         ReflectionProbe   => assets::ReflectionProbe,   65,
@@ -126,7 +124,8 @@ mod tests {
 // Retired component discriminants (0..128), stable on disk; never reuse. Each
 // is now an Events<T> queue, not a component; all were RuntimeOnly (never
 // serialized), so no blob references the gaps:
-//   26 SceneCommand, 63 ControlsCommand, 64 AudioCommand
+//   26 SceneCommand, 45 ViewCommand, 60 SettingCommand, 63 ControlsCommand,
+//   64 AudioCommand
 //
 // Retired system discriminants (128..255), stable on disk; never reuse:
 //   130 GraphicsSystem, 131 FpsCounter, 141 Camera3DSystem, 142 PhysicsSystem,

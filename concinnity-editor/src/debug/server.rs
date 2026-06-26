@@ -197,7 +197,7 @@ impl DebugServer {
         // free-fly from drifting it. camera-move / camera-stop install or clear
         // the motion slot; the actual per-frame advance happens just below so a
         // freshly installed motion also steps this same frame. quality-set
-        // pushes a `SettingCommand` the GraphicsSystem drains on its next step.
+        // sends a `SettingCommand` the GraphicsSystem reads on its next step.
         for cmd in deferred_ecs_cmds {
             match cmd {
                 runtime_spawn::RuntimeCommand::CameraSet { .. } => {

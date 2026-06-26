@@ -439,9 +439,9 @@ pub(crate) fn dispatch_camera_set(cmd: RuntimeCommand, world: &mut crate::ecs::W
     let _ = reply.send(apply_camera_set(&args, world));
 }
 
-// Apply a drained `QualitySet` command by pushing a `SettingCommand` into the
+// Apply a drained `QualitySet` command by sending a `SettingCommand` into the
 // ECS, exactly as `UiInputSystem` does for a settings-menu toggle. The
-// `GraphicsSystem` drains it on its next step and applies the change live
+// `GraphicsSystem` reads it on its next step and applies the change live
 // (`apply_quality_settings`), so this exercises the real toggle path rather
 // than a duplicate. Routed here (like `CameraSet`) because it mutates the ECS,
 // not the backend. `cn debug` only.
@@ -449,18 +449,20 @@ pub(crate) fn dispatch_quality_set(cmd: RuntimeCommand, world: &mut crate::ecs::
     let RuntimeCommand::QualitySet { setting, op, reply } = cmd else {
         return;
     };
-    world.push(crate::assets::SettingCommand {
-        setting,
-        op,
-        value_label: None,
-        persist: true,
-    });
+    world
+        .events_mut::<crate::assets::SettingCommand>()
+        .send(crate::assets::SettingCommand {
+            setting,
+            op,
+            value_label: None,
+            persist: true,
+        });
     let _ = reply.send(Ok(()));
 }
 
-// Apply a drained `Rebind` command by pushing a `Rebind` `SettingCommand` into
+// Apply a drained `Rebind` command by sending a `Rebind` `SettingCommand` into
 // the ECS, exactly as `UiInputSystem` does after a capture. `GraphicsSystem`
-// drains it on its next step and applies the rebind live (swap + `set_keymap` +
+// reads it on its next step and applies the rebind live (swap + `set_keymap` +
 // persist + label refresh via its registry, which is why `value_label` is left
 // `None` here). Routed here (like `QualitySet`) because it mutates the ECS.
 pub(crate) fn dispatch_rebind(cmd: RuntimeCommand, world: &mut crate::ecs::World) {
@@ -472,12 +474,14 @@ pub(crate) fn dispatch_rebind(cmd: RuntimeCommand, world: &mut crate::ecs::World
     else {
         return;
     };
-    world.push(crate::assets::SettingCommand {
-        setting,
-        op: crate::assets::SettingOp::Rebind(key),
-        value_label: None,
-        persist: true,
-    });
+    world
+        .events_mut::<crate::assets::SettingCommand>()
+        .send(crate::assets::SettingCommand {
+            setting,
+            op: crate::assets::SettingOp::Rebind(key),
+            value_label: None,
+            persist: true,
+        });
     let _ = reply.send(Ok(()));
 }
 

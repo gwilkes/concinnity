@@ -169,6 +169,22 @@ macro_rules! define_component_storage {
                 C::slot_mut(self).values_mut(tick)
             }
 
+            // Borrow one entity's component C, if it has one.
+            #[allow(dead_code)]
+            pub fn get<C: $slot>(&self, entity: $crate::Entity) -> Option<&C> {
+                let row = self.join.row(entity, $crate::ComponentId::new(C::DISCRIMINANT))?;
+                C::slot(self).get(row as usize)
+            }
+
+            // Mutably borrow one entity's component C, stamping the change tick.
+            #[allow(dead_code)]
+            pub fn get_mut<C: $slot>(&mut self, entity: $crate::Entity) -> Option<&mut C> {
+                let id = $crate::ComponentId::new(C::DISCRIMINANT);
+                let row = self.join.row(entity, id)? as usize;
+                let tick = self.change_tick.bump();
+                C::slot_mut(self).values_mut(tick).get_mut(row)
+            }
+
             // Read-only join over two component types. Iterates the first type's
             // rows and, for each owning entity that also has the second type,
             // yields both component refs. This is the multi-component query for
@@ -517,6 +533,27 @@ mod tests {
         // Second despawn of the same (now stale) handle does nothing.
         s.despawn(e);
         assert_eq!(s.len(), 0);
+    }
+
+    #[test]
+    fn get_and_get_mut_address_one_entity() {
+        let mut s = TestStorage::default();
+        let a = s.push_typed(Position(1));
+        let b = s.push_typed(Position(2));
+        s.insert_typed(a, Velocity(10));
+
+        assert_eq!(s.get::<Position>(a), Some(&Position(1)));
+        assert_eq!(s.get::<Position>(b), Some(&Position(2)));
+        assert_eq!(s.get::<Velocity>(a), Some(&Velocity(10)));
+        // b has no Velocity.
+        assert_eq!(s.get::<Velocity>(b), None);
+
+        if let Some(p) = s.get_mut::<Position>(b) {
+            p.0 = 99;
+        }
+        assert_eq!(s.get::<Position>(b), Some(&Position(99)));
+        // The other entity's row is untouched by the targeted write.
+        assert_eq!(s.get::<Position>(a), Some(&Position(1)));
     }
 
     #[test]

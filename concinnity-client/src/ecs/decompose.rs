@@ -29,6 +29,9 @@ use crate::ecs::{Entity, PipelineContext};
 pub struct EntityByName(pub HashMap<AssetId, Entity>);
 
 impl EntityByName {
+    // No caller yet. Remove the allow once physics resolves a PropBody owner and
+    // audio resolves an emitter target through this index instead of scanning
+    // Props.
     #[allow(dead_code)]
     pub fn get(&self, name: AssetId) -> Option<Entity> {
         self.0.get(&name).copied()

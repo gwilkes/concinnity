@@ -215,55 +215,14 @@ impl World {
         self.components.push_typed(c);
     }
 
-    // Allocate a bare entity that owns no components yet. Mirror of
-    // `PipelineContext::spawn`, for code holding a `World` directly.
-    #[allow(dead_code)]
-    pub fn spawn(&mut self) -> Entity {
-        self.components.spawn()
-    }
-
-    // Whether a handle refers to a currently-live entity.
-    #[allow(dead_code)]
-    pub fn is_alive(&self, entity: Entity) -> bool {
-        self.components.is_alive(entity)
-    }
-
-    // Add a component to an existing entity. Mirror of `PipelineContext::insert`.
-    #[allow(dead_code)]
-    pub fn insert<C: ComponentSlot>(&mut self, entity: Entity, c: C) {
-        self.components.insert_typed(entity, c);
-    }
-
-    // Remove component C from an entity, returning it if present. Mirror of
-    // `PipelineContext::remove`.
-    #[allow(dead_code)]
-    pub fn remove<C: ComponentSlot>(&mut self, entity: Entity) -> Option<C> {
-        self.components.remove_typed::<C>(entity)
-    }
-
-    // Despawn an entity, removing it from every column. Mirror of
-    // `PipelineContext::despawn`.
-    #[allow(dead_code)]
-    pub fn despawn(&mut self, entity: Entity) {
-        self.components.despawn(entity);
-    }
-
-    // Read-only join over two component types. Mirror of
+    // Read-only join over two component types, for code holding a `World`
+    // directly (the decomposition round-trip tests). Mirror of
     // `PipelineContext::join2`.
     #[allow(dead_code)]
     pub fn join2<A: ComponentSlot, B: ComponentSlot>(
         &self,
     ) -> impl Iterator<Item = (Entity, &A, &B)> {
         self.components.join2::<A, B>()
-    }
-
-    // Read-only join over three component types. Mirror of
-    // `PipelineContext::join3`.
-    #[allow(dead_code)]
-    pub fn join3<A: ComponentSlot, B: ComponentSlot, C: ComponentSlot>(
-        &self,
-    ) -> impl Iterator<Item = (Entity, &A, &B, &C)> {
-        self.components.join3::<A, B, C>()
     }
 
     // Borrow the event queue for event type E, if any have been sent. Mirror of

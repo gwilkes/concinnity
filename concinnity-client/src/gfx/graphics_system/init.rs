@@ -1138,6 +1138,17 @@ impl GraphicsSystem {
         // query rather than drain so Props remain in the world for Camera3DSystem
         let props: Vec<_> = ctx.query::<Prop>().collect();
 
+        // Entities owning each Prop, in the same column order as `props`, so the
+        // decomposed render path can attach RenderHandle + GlobalTransform to
+        // them below. Empty unless the decomposed path is enabled.
+        let prop_entities: Vec<crate::ecs::Entity> = if self.decomposed_render {
+            ctx.query_with_entity::<Prop>()
+                .map(|(entity, _)| entity)
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         // Snapshot the Props now (as owned clones) for the world.jsonl
         // hot-reload pass; we need a same-order `Vec<Prop>` later, but the
         // `props: Vec<&Prop>` borrow above must not survive into the next
@@ -1189,6 +1200,21 @@ impl GraphicsSystem {
             }
         };
         self.prop_draw_indices = prop_draw_indices;
+
+        // Decomposed render path: give each prop entity a RenderHandle (its GPU
+        // draw slots) and a GlobalTransform (seeded to its init world matrix), so
+        // the per-frame push reads these instead of the positional side-tables.
+        // prop_entities is column-aligned with prop_draw_indices and world_mats.
+        if self.decomposed_render {
+            for (i, &entity) in prop_entities.iter().enumerate() {
+                let draws: Vec<u32> = self.prop_draw_indices[i]
+                    .iter()
+                    .map(|&slot| slot as u32)
+                    .collect();
+                ctx.insert(entity, crate::assets::RenderHandle { draws });
+                ctx.insert(entity, crate::assets::GlobalTransform(world_mats[i]));
+            }
+        }
 
         // Asset hot-reload mesh map: cross-reference the file-backed source
         // metadata captured at drain time with the per-Mesh draw indices

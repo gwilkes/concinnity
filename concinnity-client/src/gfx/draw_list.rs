@@ -144,6 +144,59 @@ pub fn compute_world_matrices(props: &[&Prop], parents: &[Option<usize>]) -> Vec
         .collect()
 }
 
+// Resolve and write each entity's GlobalTransform from its Transform and parent
+// chain. The entity-keyed analogue of compute_world_matrices: roots use their
+// local matrix, children compose parent-world * local, and cyclic parents fall
+// back to their local matrix. Reads Transform and Parent, writes GlobalTransform
+// (seeded on every transform entity at init).
+pub(crate) fn propagate_transforms(ctx: &mut crate::ecs::PipelineContext) {
+    use crate::assets::{GlobalTransform, Parent, Transform};
+    use crate::ecs::Entity;
+    use std::collections::HashMap;
+
+    let parents: HashMap<Entity, Entity> = ctx
+        .query_with_entity::<Parent>()
+        .map(|(entity, parent)| (entity, parent.0))
+        .collect();
+    let locals: Vec<(Entity, [[f32; 4]; 4])> = ctx
+        .query_with_entity::<Transform>()
+        .map(|(entity, transform)| (entity, transform.model_matrix()))
+        .collect();
+
+    // Fixed-point resolution: keep a pass running while any entity newly
+    // resolves; stop on a pass with no progress (a cycle) or once all are done.
+    let mut world: HashMap<Entity, [[f32; 4]; 4]> = HashMap::with_capacity(locals.len());
+    loop {
+        let mut progressed = false;
+        for (entity, local) in &locals {
+            if world.contains_key(entity) {
+                continue;
+            }
+            let resolved = match parents.get(entity) {
+                None => Some(*local),
+                Some(parent) => world.get(parent).map(|pw| mat_mul4(*pw, *local)),
+            };
+            if let Some(matrix) = resolved {
+                world.insert(*entity, matrix);
+                progressed = true;
+            }
+        }
+        if !progressed || world.len() == locals.len() {
+            break;
+        }
+    }
+    // Cyclic entities fall back to their local matrix.
+    for (entity, local) in &locals {
+        world.entry(*entity).or_insert(*local);
+    }
+
+    for (entity, matrix) in world {
+        if let Some(global) = ctx.get_mut::<GlobalTransform>(entity) {
+            global.0 = matrix;
+        }
+    }
+}
+
 // Decoded mesh geometry plus its optional LOD trailer. Returned by
 // `load_mesh_geometry` and consumed by `build_draw_list`. The `vertices`
 // slice is shared across LOD0 and every alternate; vertex-clustering
@@ -808,6 +861,70 @@ mod tests {
             cull_distance: 0.0,
             is_held: false,
         }
+    }
+
+    fn prop_with_transform(t: &crate::assets::Transform) -> Prop {
+        Prop {
+            position: t.position,
+            rotation_deg: t.rotation_deg,
+            scale: t.scale,
+            ..make_prop([0.0; 3])
+        }
+    }
+
+    // The decomposed transform path must produce matrices bit-identical to the
+    // legacy positional path, so the per-frame model-matrix push is unchanged.
+    #[test]
+    fn propagate_transforms_matches_compute_world_matrices() {
+        use crate::assets::{GlobalTransform, Parent, Transform};
+        use crate::blob::BlobData;
+        use crate::ecs::{ComponentStorage, PipelineContext, Resources};
+        use crate::gfx::profile::FrameProfile;
+
+        let parent_t = Transform {
+            position: [1.0, 2.0, 3.0],
+            rotation_deg: [0.0, 30.0, 0.0],
+            scale: [1.0, 1.0, 1.0],
+        };
+        let child_t = Transform {
+            position: [0.0, 0.0, 1.0],
+            rotation_deg: [10.0, 0.0, 5.0],
+            scale: [2.0, 2.0, 2.0],
+        };
+
+        let mut components = ComponentStorage::default();
+        let mut blob = BlobData::empty();
+        let mut profile = FrameProfile::default();
+        let mut resources = Resources::new();
+        let mut ctx = PipelineContext {
+            components: &mut components,
+            blob: &mut blob,
+            profile: &mut profile,
+            resources: &mut resources,
+        };
+
+        // A child parented to a root, each with its own GlobalTransform to write.
+        let parent_e = ctx.components.spawn();
+        ctx.insert(parent_e, parent_t);
+        ctx.insert(parent_e, GlobalTransform::default());
+        let child_e = ctx.components.spawn();
+        ctx.insert(child_e, child_t);
+        ctx.insert(child_e, Parent(parent_e));
+        ctx.insert(child_e, GlobalTransform::default());
+
+        propagate_transforms(&mut ctx);
+
+        // Reference: the legacy positional path over the same two transforms,
+        // child (index 1) parented to parent (index 0).
+        let parent_prop = prop_with_transform(&parent_t);
+        let child_prop = prop_with_transform(&child_t);
+        let refs = vec![&parent_prop, &child_prop];
+        let ref_mats = compute_world_matrices(&refs, &[None, Some(0)]);
+
+        let parent_g = ctx.components.get::<GlobalTransform>(parent_e).unwrap().0;
+        let child_g = ctx.components.get::<GlobalTransform>(child_e).unwrap().0;
+        assert_eq!(parent_g, ref_mats[0], "root GlobalTransform matches legacy");
+        assert_eq!(child_g, ref_mats[1], "child GlobalTransform matches legacy");
     }
 
     #[test]

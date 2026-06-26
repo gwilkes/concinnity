@@ -85,6 +85,12 @@ pub struct GraphicsSystem {
     prop_parents: Vec<Option<usize>>,
     // scene each prop belongs to (resolved at build time), or None = always visible.
     prop_scene: Vec<Option<AssetId>>,
+    // Temporary toggle (set via the CN_DECOMPOSED_RENDER env var): when on, the
+    // per-frame model-matrix push is driven from per-entity GlobalTransform +
+    // RenderHandle components instead of the positional prop side-tables. Both
+    // paths must render identically; this field and the prop side-tables are
+    // removed once the decomposed path becomes the only one.
+    decomposed_render: bool,
     // active SceneReel bookkeeping; None when no SceneReel was declared.
     reel: Option<scene_reel::ReelState>,
     // Cursor into the Events<SceneCommand> queue, tracking which scene jumps
@@ -341,6 +347,7 @@ impl GraphicsSystem {
             prop_draw_indices: Vec::new(),
             prop_parents: Vec::new(),
             prop_scene: Vec::new(),
+            decomposed_render: std::env::var("CN_DECOMPOSED_RENDER").is_ok(),
             reel: None,
             scene_cmd_cursor: crate::ecs::EventCursor::default(),
             setting_cmd_cursor: crate::ecs::EventCursor::default(),

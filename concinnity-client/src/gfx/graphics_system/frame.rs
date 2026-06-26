@@ -238,7 +238,18 @@ impl GraphicsSystem {
                 // since the last frame (e.g. by Camera3DSystem on interact).
                 // World matrices are resolved top-down so parent transforms
                 // propagate correctly to all children.
-                {
+                if self.decomposed_render {
+                    // Resolve each entity's GlobalTransform from Transform +
+                    // Parent, then push it to the entity's GPU draw slots.
+                    draw_list::propagate_transforms(ctx);
+                    for (_entity, global, handle) in
+                        ctx.join2::<crate::assets::GlobalTransform, crate::assets::RenderHandle>()
+                    {
+                        for &slot in &handle.draws {
+                            backend.update_model(slot as usize, global.0);
+                        }
+                    }
+                } else {
                     let props: Vec<_> = ctx.query::<Prop>().collect();
                     let world_mats =
                         draw_list::compute_world_matrices(props.as_slice(), &self.prop_parents);

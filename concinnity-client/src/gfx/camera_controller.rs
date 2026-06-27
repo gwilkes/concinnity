@@ -491,10 +491,12 @@ mod tests {
             transform_yaw, 45.0,
             "decomposed interact rotates the Transform"
         );
-        let prop_yaw = world.query::<Prop>().next().unwrap().rotation_deg[1];
+        // The decomposed default drains the Prop column, so the rotation can only
+        // have gone to the Transform.
         assert_eq!(
-            prop_yaw, 0.0,
-            "decomposed interact leaves the Prop untouched"
+            world.query::<Prop>().count(),
+            0,
+            "decomposed default drains the Prop column"
         );
     }
 

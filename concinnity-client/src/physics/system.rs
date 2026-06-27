@@ -950,14 +950,16 @@ mod tests {
         }
 
         let transform_y = world.query::<Transform>().next().unwrap().position[1];
-        let prop_y = world.query::<Prop>().next().unwrap().position[1];
         assert!(
             transform_y < 5.0,
             "decomposed path falls the Transform (y={transform_y})"
         );
+        // The decomposed default drains the Prop column, so the simulated pose
+        // can only have gone to the Transform.
         assert_eq!(
-            prop_y, 5.0,
-            "decomposed path leaves the Prop position untouched"
+            world.query::<Prop>().count(),
+            0,
+            "decomposed default drains the Prop column"
         );
     }
 
@@ -988,8 +990,8 @@ mod tests {
         );
     }
 
-    // Flag on: picking up a carriable prop tags its entity with Held and leaves
-    // the Prop's is_held false.
+    // Flag on: picking up a carriable prop tags its entity with Held; the Prop
+    // column is drained, so the carried state lives only on the Held tag.
     #[test]
     fn pickup_sets_held_tag_when_decomposed() {
         use std::{thread, time::Duration};
@@ -1010,9 +1012,10 @@ mod tests {
             1,
             "pickup inserts the Held tag on the entity"
         );
-        assert!(
-            !world.query::<Prop>().next().unwrap().is_held,
-            "decomposed pickup leaves Prop.is_held false"
+        assert_eq!(
+            world.query::<Prop>().count(),
+            0,
+            "decomposed default drains the Prop column"
         );
     }
 

@@ -1135,14 +1135,19 @@ impl GraphicsSystem {
         // taking Prop references because drain shifts the underlying Vec.
         let instanced_props = ctx.drain::<crate::assets::InstancedProp>();
 
-        // query rather than drain so Props remain in the world for Camera3DSystem
+        // Query (not drain) the Props. Under the decomposed default the column is
+        // already drained by the decomposition pass, so this is empty and only the
+        // entity-sourced path below runs; under the legacy opt-out the Props remain
+        // and feed the legacy draw-list build.
         let props: Vec<_> = ctx.query::<Prop>().collect();
 
-        // Entities owning each Prop, in the same column order as `props`, so the
-        // decomposed render path can attach RenderHandle + GlobalTransform to
-        // them below. Empty unless the decomposed path is enabled.
+        // Entities to render, in Prop-column order, so the decomposed path can
+        // attach RenderHandle + GlobalTransform to them below. Enumerated through
+        // the Transform column (the decomposition gives every prop a Transform in
+        // Prop order), so this works whether or not the Prop column was drained.
+        // Empty unless the decomposed path is enabled.
         let prop_entities: Vec<crate::ecs::Entity> = if self.decomposed_render {
-            ctx.query_with_entity::<Prop>()
+            ctx.query_with_entity::<crate::assets::Transform>()
                 .map(|(entity, _)| entity)
                 .collect()
         } else {
@@ -1751,8 +1756,15 @@ impl GraphicsSystem {
             // pass can rebuild a same-order `Vec<Prop>` with the new
             // transforms. The clone was taken earlier (before the
             // `ctx.drain` mutations) so it doesn't tangle the borrow
-            // checker here.
-            self.init_props = Some(init_props_snapshot);
+            // checker here. None under the decomposed default, whose drained
+            // Prop column makes Prop-based world.jsonl reload a no-op until the
+            // reload pass is reworked onto the components; the legacy opt-out
+            // keeps the Props and the existing reload path.
+            self.init_props = if self.decomposed_render {
+                None
+            } else {
+                Some(init_props_snapshot)
+            };
             // Auxiliary asset-resolution tables for the world.jsonl reload
             // pass, populated only when hot-reload is on, so a `cn run` does
             // not pay the clone cost. `mesh_id_to_draw` keeps one example

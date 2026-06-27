@@ -21,11 +21,13 @@ use crate::assets::{
 use crate::ecs::asset_id::AssetId;
 use crate::ecs::{Entity, PipelineContext};
 
-// Single source of truth for the decomposed-render flag, published once at
-// world start (from the CN_DECOMPOSED_RENDER env var) and read by every system
-// that has a flagged decomposed path: GraphicsSystem, PhysicsSystem,
-// Camera3DSystem, AudioSystem. Removed when the decomposed path becomes the
-// default and the legacy Prop paths are retired.
+// Single source of truth for the decomposed path flag, published once at world
+// start and read by every system that has a decomposed path: GraphicsSystem,
+// PhysicsSystem, Camera3DSystem, AudioSystem. Decomposed is the default; the
+// CN_LEGACY_PROPS env var opts back into the legacy Prop path (which keeps the
+// Prop column instead of draining it). The legacy path and this flag are removed
+// once the decomposed path is verified on every backend and the editor's
+// Prop-based hot-reload is reworked.
 #[derive(Debug, Clone, Copy)]
 pub struct DecomposedRender(pub bool);
 
@@ -52,11 +54,12 @@ impl EntityByName {
 
 // Decompose every loaded Prop into per-instance components on its own entity.
 pub(crate) fn run(ctx: &mut PipelineContext) {
-    // Publish the decomposed-render flag once, unless a caller (a test) already
-    // installed one to force a path. Done before the empty-world early return so
-    // every system sees a consistent flag.
+    // Publish the decomposed flag once, unless a caller (a test) already
+    // installed one to force a path. Decomposed is the default; CN_LEGACY_PROPS
+    // opts out. Done before the empty-world early return so every system sees a
+    // consistent flag.
     if ctx.resource::<DecomposedRender>().is_none() {
-        let on = std::env::var("CN_DECOMPOSED_RENDER").is_ok();
+        let on = std::env::var("CN_LEGACY_PROPS").is_err();
         ctx.insert_resource(DecomposedRender(on));
     }
 
@@ -140,6 +143,14 @@ pub(crate) fn run(ctx: &mut PipelineContext) {
     }
 
     ctx.insert_resource(EntityByName(by_name));
+
+    // Decomposed default: drop the Prop column now that every consumer reads the
+    // decomposed components. drain<Prop> clears only the Prop component, so each
+    // entity survives on its Transform/renderer/tag components. The legacy opt-out
+    // keeps the Prop column as a shadow for the legacy systems and hot-reload.
+    if decomposed_render_enabled(ctx) {
+        ctx.drain::<Prop>();
+    }
 }
 
 #[cfg(test)]
@@ -158,6 +169,9 @@ mod tests {
     #[test]
     fn decomposes_props_onto_their_entities() {
         let mut world = World::new_empty();
+        // Legacy opt-out: keep the Prop column so this test can cross-check the
+        // decomposed components against the source Props (shadow mode).
+        world.insert_resource(DecomposedRender(false));
 
         // A model-backed parent placement.
         let mut frame = prop(1);
@@ -255,5 +269,27 @@ mod tests {
             .find(|(e, _, _)| *e == parent_e)
             .map(|(_, m, _)| m.mesh);
         assert_eq!(parent_mesh, Some(Some(AssetId(11))));
+    }
+
+    // Under the decomposed default (no flag override), the pass drains the Prop
+    // column but keeps each entity on its decomposed components.
+    #[test]
+    fn decomposed_default_drains_prop_keeping_components() {
+        let mut world = World::new_empty();
+        let mut a = prop(1);
+        a.mesh = Some(AssetId(10));
+        world.add_component(a);
+        let mut b = prop(2);
+        b.model = Some(AssetId(20));
+        world.add_component(b);
+
+        world.start().expect("start");
+
+        // The Prop column is gone, but both entities survive on their renderers
+        // and Transforms.
+        assert_eq!(world.query::<Prop>().count(), 0, "Prop column drained");
+        assert_eq!(world.query::<Transform>().count(), 2, "Transforms survive");
+        assert_eq!(world.query::<MeshRenderer>().count(), 1);
+        assert_eq!(world.query::<ModelRenderer>().count(), 1);
     }
 }

@@ -172,6 +172,13 @@ pub trait RenderBackend: SceneControl + Send {
     fn update_view(&mut self, matrix: [[f32; 4]; 4]);
     fn update_model(&mut self, index: usize, model: [[f32; 4]; 4]);
 
+    // Retire a draw object: hide it from every pass (main, shadow, velocity)
+    // and exclude it from the ray-tracing acceleration structure, so a
+    // despawned entity's slot leaves no ghost. The slot stays allocated (its
+    // geometry buffers are untouched); reclaiming it for reuse is a later step.
+    // A no-op if the index is out of range.
+    fn retire_draw_object(&mut self, draw_idx: usize);
+
     // Skinning. `vert_bytes` and `shadow_bytes` are Metal-only payloads;
     // DX/VK ignore them.
     fn upload_skinned(

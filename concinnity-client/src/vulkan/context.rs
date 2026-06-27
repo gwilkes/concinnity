@@ -1605,6 +1605,16 @@ impl VkContext {
         }
     }
 
+    // Retire a draw object for a despawned entity: drop it from every pass and
+    // the ray-tracing acceleration structure. The slot stays allocated; it is
+    // not yet recycled. No-op if the index is out of range.
+    pub fn retire_draw_object(&mut self, index: usize) {
+        if let Some(obj) = self.draw_objects.get_mut(index) {
+            obj.visible = false;
+            obj.resident = false;
+        }
+    }
+
     pub fn update_clear_color(&mut self, color: [f32; 4]) {
         self.clear_color = color;
     }

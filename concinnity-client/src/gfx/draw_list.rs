@@ -272,6 +272,47 @@ pub(crate) fn propagate_transforms(ctx: &mut crate::ecs::PipelineContext) {
     }
 }
 
+// Re-parent an entity at runtime: detach it from its current parent (if any),
+// attach it under `new_parent` (or leave it a root when `None`), keep both
+// parents' Children lists in sync, and recompose world matrices so the new
+// chain shows up immediately. Entity-keyed throughout, so it is invariant to
+// component-column order.
+//
+// Allowed dead until a runtime trigger calls it (the gameplay / editor reparent
+// path); the behavior is covered now by reparent_recomposes_child_world_matrix_
+// and_relists. Remove the allow once a caller lands.
+#[allow(dead_code)]
+pub(crate) fn reparent(
+    ctx: &mut crate::ecs::PipelineContext,
+    child: crate::ecs::Entity,
+    new_parent: Option<crate::ecs::Entity>,
+) {
+    use crate::assets::{Children, Parent};
+
+    // Drop the old parent edge and unlist the child from that parent.
+    if let Some(old) = ctx.remove::<Parent>(child)
+        && let Some(siblings) = ctx.get_mut::<Children>(old.0)
+    {
+        siblings.0.retain(|&e| e != child);
+    }
+
+    // Attach under the new parent (None leaves it a root). The Parent column is
+    // free of `child` here (just removed), so the insert never duplicates.
+    if let Some(parent) = new_parent {
+        ctx.insert(child, Parent(parent));
+        match ctx.get_mut::<Children>(parent) {
+            Some(kids) => {
+                if !kids.0.contains(&child) {
+                    kids.0.push(child);
+                }
+            }
+            None => ctx.insert(parent, Children(vec![child])),
+        }
+    }
+
+    propagate_transforms(ctx);
+}
+
 // Decoded mesh geometry plus its optional LOD trailer. Returned by
 // `load_mesh_geometry` and consumed by `build_draw_list`. The `vertices`
 // slice is shared across LOD0 and every alternate; vertex-clustering
@@ -999,6 +1040,83 @@ mod tests {
         let child_g = ctx.components.get::<GlobalTransform>(child_e).unwrap().0;
         assert_eq!(parent_g, ref_mats[0], "root GlobalTransform matches legacy");
         assert_eq!(child_g, ref_mats[1], "child GlobalTransform matches legacy");
+    }
+
+    #[test]
+    fn reparent_recomposes_child_world_matrix_and_relists() {
+        use crate::assets::{Children, GlobalTransform, Parent, Transform};
+        use crate::blob::BlobData;
+        use crate::ecs::{ComponentStorage, PipelineContext, Resources};
+        use crate::gfx::profile::FrameProfile;
+
+        let translate = |x: f32| Transform {
+            position: [x, 0.0, 0.0],
+            rotation_deg: [0.0; 3],
+            scale: [1.0; 3],
+        };
+        let (a_t, b_t, child_t) = (translate(10.0), translate(-5.0), translate(1.0));
+
+        let mut components = ComponentStorage::default();
+        let mut blob = BlobData::empty();
+        let mut profile = FrameProfile::default();
+        let mut resources = Resources::new();
+        let mut ctx = PipelineContext {
+            components: &mut components,
+            blob: &mut blob,
+            profile: &mut profile,
+            resources: &mut resources,
+        };
+
+        // Two candidate parents and a child, each with a GlobalTransform slot.
+        let a = ctx.components.spawn();
+        ctx.insert(a, a_t);
+        ctx.insert(a, GlobalTransform::default());
+        let b = ctx.components.spawn();
+        ctx.insert(b, b_t);
+        ctx.insert(b, GlobalTransform::default());
+        let child = ctx.components.spawn();
+        ctx.insert(child, child_t);
+        ctx.insert(child, GlobalTransform::default());
+
+        // Attach under A: the child's world matrix composes A x local, and A
+        // lists it.
+        reparent(&mut ctx, child, Some(a));
+        let under_a = ctx.components.get::<GlobalTransform>(child).unwrap().0;
+        assert_eq!(
+            under_a,
+            mat_mul4(a_t.model_matrix(), child_t.model_matrix())
+        );
+        assert_eq!(ctx.components.get::<Children>(a).unwrap().0, vec![child]);
+
+        // Move under B: world matrix recomposes against B, A unlists it.
+        reparent(&mut ctx, child, Some(b));
+        let under_b = ctx.components.get::<GlobalTransform>(child).unwrap().0;
+        assert_eq!(
+            under_b,
+            mat_mul4(b_t.model_matrix(), child_t.model_matrix())
+        );
+        assert_ne!(under_a, under_b, "the child actually moved");
+        assert!(
+            ctx.components.get::<Children>(a).unwrap().0.is_empty(),
+            "A unlisted the child"
+        );
+        assert_eq!(ctx.components.get::<Children>(b).unwrap().0, vec![child]);
+        assert_eq!(ctx.components.get::<Parent>(child).unwrap().0, b);
+
+        // Detach to a root: no Parent, world matrix is its own local.
+        reparent(&mut ctx, child, None);
+        assert_eq!(
+            ctx.components.get::<GlobalTransform>(child).unwrap().0,
+            child_t.model_matrix()
+        );
+        assert!(
+            ctx.components.get::<Parent>(child).is_none(),
+            "child is now a root"
+        );
+        assert!(
+            ctx.components.get::<Children>(b).unwrap().0.is_empty(),
+            "B unlisted the child"
+        );
     }
 
     #[test]

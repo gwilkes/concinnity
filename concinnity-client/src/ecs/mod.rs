@@ -440,6 +440,7 @@ impl World {
         self.update_event_queue::<crate::assets::SettingCommand>();
         self.update_event_queue::<crate::assets::ControlsCommand>();
         self.update_event_queue::<crate::assets::AudioCommand>();
+        self.update_event_queue::<crate::assets::DespawnRequest>();
     }
 
     // Tick -- systems run in order, Done systems are removed.

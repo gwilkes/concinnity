@@ -415,6 +415,42 @@ pub(super) fn handle_rebind(text: &str) -> String {
     }
 }
 
+// Despawn an authored placement by its declared name.
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct DespawnCmdRequest {
+    #[serde(skip)]
+    _cmd: String,
+    name: String,
+}
+
+// Remove an authored placement (and its descendants) live by name: enqueue a
+// Despawn command the per-frame drive forwards to `dispatch_despawn`, which
+// sends a `DespawnRequest` the GraphicsSystem applies on its next step (hide the
+// draw slots + despawn the entity, cascading to children). `cn debug` only; lets
+// a headless harness remove an entity and screenshot it gone. The reply fires
+// once the command is queued; applies on the decomposed render path (the
+// default).
+pub(super) fn handle_despawn(text: &str) -> String {
+    let req: DespawnCmdRequest = match serde_json::from_str(text) {
+        Ok(r) => r,
+        Err(e) => return error_reply(&format!("despawn: {e}")),
+    };
+    if req.name.trim().is_empty() {
+        return error_reply("despawn: missing 'name'");
+    }
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    super::runtime_spawn::enqueue(super::runtime_spawn::RuntimeCommand::Despawn {
+        name: req.name,
+        reply: tx,
+    });
+    match rx.recv_timeout(SPAWN_REPLY_TIMEOUT) {
+        Ok(Ok(())) => serde_json::json!({ "ok": true, "queued": true }).to_string(),
+        Ok(Err(e)) => error_reply(&e),
+        Err(_) => error_reply("despawn: timed out waiting for engine"),
+    }
+}
+
 // Move the active camera by a per-frame delta over a span of frames. All delta
 // fields default to 0 and `frames` to 0 (an indefinite hold cleared by
 // `camera-stop`); a profiling harness can then sustain motion mid-screenshot to
@@ -565,5 +601,19 @@ mod tests {
             serde_json::from_str::<CameraMoveRequest>(r#"{"cmd":"camera-move","frames":"lots"}"#)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn despawn_request_parses_name() {
+        let req: DespawnCmdRequest =
+            serde_json::from_str(r#"{"cmd":"despawn","name":"crate_a"}"#).expect("valid parses");
+        assert_eq!(req.name, "crate_a");
+    }
+
+    #[test]
+    fn despawn_request_defaults_to_empty_name() {
+        let req: DespawnCmdRequest =
+            serde_json::from_str(r#"{"cmd":"despawn"}"#).expect("bare command parses");
+        assert!(req.name.is_empty());
     }
 }

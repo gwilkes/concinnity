@@ -240,6 +240,16 @@ impl<'a> PipelineContext<'a> {
         self.components.remove_typed::<C>(entity)
     }
 
+    // Remove an entity entirely: swap-remove its row from every component
+    // column and recycle its id (a stale handle to it then reads as dead). A
+    // no-op on an already-dead or unknown entity. Allowed dead for the same
+    // cross-crate reason as `insert` (the client despawns entities at runtime
+    // from the GraphicsSystem).
+    #[allow(dead_code)]
+    pub fn despawn(&mut self, entity: Entity) {
+        self.components.despawn(entity);
+    }
+
     // Borrow one entity's component C read-only. Allowed dead for the same
     // cross-crate reason as `insert` (the client reads Transform / Held by
     // entity in the physics, camera, and audio systems).

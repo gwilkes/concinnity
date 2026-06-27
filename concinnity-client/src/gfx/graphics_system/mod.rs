@@ -99,6 +99,9 @@ pub struct GraphicsSystem {
     // Cursor into the Events<SettingCommand> queue (settings-menu changes:
     // graphics toggles, sliders, key rebinds, volume).
     setting_cmd_cursor: crate::ecs::EventCursor,
+    // Cursor into the Events<DespawnRequest> queue (runtime entity despawn:
+    // cn debug `despawn`, and gameplay-driven removal once that path exists).
+    despawn_cmd_cursor: crate::ecs::EventCursor,
     // Font atlas data, keyed by asset id, built during init().
     loaded_fonts: std::collections::HashMap<AssetId, text::LoadedFont>,
     // Asset-streaming subsystem for the albedo texture pool. Some only when a
@@ -351,6 +354,7 @@ impl GraphicsSystem {
             reel: None,
             scene_cmd_cursor: crate::ecs::EventCursor::default(),
             setting_cmd_cursor: crate::ecs::EventCursor::default(),
+            despawn_cmd_cursor: crate::ecs::EventCursor::default(),
             loaded_fonts: std::collections::HashMap::new(),
             texture_streamer: None,
             normal_map_streamer: None,
@@ -505,6 +509,7 @@ pub(super) fn derive_quality_settings(
     }
 }
 
+mod despawn;
 mod frame;
 mod helpers;
 pub mod hot_reload_sources;

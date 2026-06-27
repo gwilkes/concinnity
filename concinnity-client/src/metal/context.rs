@@ -993,6 +993,18 @@ impl MtlContext {
         }
     }
 
+    // Retire a draw object for a despawned entity: clear `visible` (drops it
+    // from the main / shadow / velocity passes) and `resident` (drops it from
+    // the ray-tracing BLAS / geometry-table rebuild), so it leaves no ghost in
+    // any pass. The geometry buffers stay allocated; the slot is not yet
+    // recycled. Has no effect if the index is out of range.
+    pub fn retire_draw_object(&mut self, index: usize) {
+        if let Some(obj) = self.draw_objects.get_mut(index) {
+            obj.visible = false;
+            obj.resident = false;
+        }
+    }
+
     // Replace the framebuffer clear colour for the next draw_frame call.
     // Used by SceneReel to lerp toward black during FadeBlack transitions.
     pub fn update_clear_color(&mut self, color: [f32; 4]) {

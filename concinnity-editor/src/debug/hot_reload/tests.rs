@@ -795,6 +795,7 @@ fn reload_shader_stages_on_empty_map_is_a_no_op() {
         }
         fn update_view(&mut self, _: [[f32; 4]; 4]) {}
         fn update_model(&mut self, _: usize, _: [[f32; 4]; 4]) {}
+        fn retire_draw_object(&mut self, _: usize) {}
         fn upload_skinned(
             &mut self,
             _: &[crate::gfx::mesh_payload::SkinnedVertex],

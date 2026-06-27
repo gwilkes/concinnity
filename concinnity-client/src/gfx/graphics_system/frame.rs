@@ -2,8 +2,8 @@
 // ticking, and the backend draw call.
 
 use crate::assets::{
-    Camera3D, FrameInput, HitRegion, LabelBox, LayoutContainer, Prop, SceneCommand, SettingCommand,
-    SettingOp, Sprite, TextLabel, WindowMode,
+    Camera3D, DespawnRequest, FrameInput, HitRegion, LabelBox, LayoutContainer, Prop, SceneCommand,
+    SettingCommand, SettingOp, Sprite, TextLabel, WindowMode,
 };
 use crate::ecs::asset_id::AssetId;
 use crate::ecs::{PipelineContext, StepResult};
@@ -232,6 +232,36 @@ impl GraphicsSystem {
                     tracing::info!("GraphicsSystem: window closed");
                     backend.wait_idle();
                     return StepResult::Stop;
+                }
+
+                // Runtime entity despawn (decomposed path only): drain
+                // DespawnRequest events, resolve each name to its entity, hide
+                // that entity's draw slots, and remove it (and its descendants)
+                // from the ECS. Done before the transform push so a despawned
+                // entity is already gone from the GlobalTransform x RenderHandle
+                // join this frame and contributes nothing to any pass.
+                if self.decomposed_render {
+                    let despawn_names: Vec<AssetId> = match ctx.events::<DespawnRequest>() {
+                        Some(events) => events
+                            .read(&mut self.despawn_cmd_cursor)
+                            .into_iter()
+                            .map(|r| r.name)
+                            .collect(),
+                        None => Vec::new(),
+                    };
+                    if !despawn_names.is_empty() {
+                        // Clone the name index out so the ctx borrow ends before
+                        // the despawns, which take &mut ctx.
+                        let by_name = ctx
+                            .resource::<crate::ecs::decompose::EntityByName>()
+                            .map(|n| n.0.clone())
+                            .unwrap_or_default();
+                        for name in despawn_names {
+                            if let Some(&entity) = by_name.get(&name) {
+                                super::despawn::despawn_subtree(ctx, backend, entity);
+                            }
+                        }
+                    }
                 }
 
                 // push updated model matrices for any props that were mutated

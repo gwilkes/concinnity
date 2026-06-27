@@ -286,6 +286,15 @@ pub(crate) enum RuntimeCommand {
         key: crate::assets::Key,
         reply: std::sync::mpsc::SyncSender<Result<(), String>>,
     },
+    // Despawn an authored placement (and its descendants) by name. ECS-side: it
+    // sends a `DespawnRequest` event the GraphicsSystem drains on its next step
+    // (resolving the name to its entity, hiding the draw slots, removing the
+    // entity), so the per-frame drive routes it to `dispatch_despawn` once the
+    // `systems_mut` borrow ends, like `CameraSet` / `QualitySet`.
+    Despawn {
+        name: String,
+        reply: std::sync::mpsc::SyncSender<Result<(), String>>,
+    },
 }
 
 static QUEUE: Mutex<Vec<RuntimeCommand>> = Mutex::new(Vec::new());
@@ -425,6 +434,10 @@ pub(crate) fn dispatch_runtime_spawn(
             // ECS-side like QualitySet; routed to `dispatch_rebind`.
             let _ = reply.send(Err("rebind: misrouted to backend dispatch".to_string()));
         }
+        RuntimeCommand::Despawn { reply, .. } => {
+            // ECS-side like CameraSet; routed to `dispatch_despawn`.
+            let _ = reply.send(Err("despawn: misrouted to backend dispatch".to_string()));
+        }
     }
 }
 
@@ -482,6 +495,33 @@ pub(crate) fn dispatch_rebind(cmd: RuntimeCommand, world: &mut crate::ecs::World
             value_label: None,
             persist: true,
         });
+    let _ = reply.send(Ok(()));
+}
+
+// Apply a drained `Despawn` command by resolving the placement name to its
+// AssetId and sending a `DespawnRequest` event into the ECS. GraphicsSystem
+// reads it on its next step, resolves the name to its entity, hides the entity's
+// draw slots, and despawns it and its descendants. Routed here (like
+// `CameraSet` / `QualitySet`) because it mutates the ECS, not the backend. The
+// reply fires once the event is queued; an unknown name is a clean error. The
+// despawn applies only on the decomposed render path (the default); under the
+// legacy opt-out the GraphicsSystem ignores the event.
+pub(crate) fn dispatch_despawn(cmd: RuntimeCommand, world: &mut crate::ecs::World) {
+    let RuntimeCommand::Despawn { name, reply } = cmd else {
+        return;
+    };
+    let table = crate::ecs::asset_id::name_table();
+    let Some(id) = table
+        .iter()
+        .position(|n| n == &name)
+        .map(|i| crate::ecs::asset_id::AssetId(i as u32))
+    else {
+        let _ = reply.send(Err(format!("despawn: name '{name}' not found")));
+        return;
+    };
+    world
+        .events_mut::<crate::assets::DespawnRequest>()
+        .send(crate::assets::DespawnRequest { name: id });
     let _ = reply.send(Ok(()));
 }
 
@@ -588,6 +628,23 @@ mod tests {
             _ => panic!("wrong variant"),
         }
         // Second drain is empty.
+        assert!(drain().is_empty());
+    }
+
+    #[test]
+    fn despawn_enqueue_drain_round_trip() {
+        let _ = drain();
+        let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+        enqueue(RuntimeCommand::Despawn {
+            name: "crate_a".to_string(),
+            reply: tx,
+        });
+        let cmds = drain();
+        assert_eq!(cmds.len(), 1);
+        match cmds.into_iter().next().unwrap() {
+            RuntimeCommand::Despawn { name, .. } => assert_eq!(name, "crate_a"),
+            _ => panic!("wrong variant"),
+        }
         assert!(drain().is_empty());
     }
 

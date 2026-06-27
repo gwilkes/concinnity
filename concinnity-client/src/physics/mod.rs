@@ -407,6 +407,27 @@ impl PhysicsWorld {
         }
     }
 
+    // Remove a body and its colliders from the world (used when its owning
+    // entity is despawned). Rapier purges any joints incident on the body as
+    // part of the removal, so no separate joint cleanup is needed.
+    pub fn remove_body(&mut self, handle: BodyHandle) {
+        self.bodies.remove(
+            handle.0,
+            &mut self.islands,
+            &mut self.colliders,
+            &mut self.impulse_joints,
+            &mut self.multibody_joints,
+            true,
+        );
+    }
+
+    // Number of rigid bodies currently in the world (player, props, anchors).
+    // Test-only observable for the body-reaping path.
+    #[cfg(test)]
+    pub fn body_count(&self) -> usize {
+        self.bodies.len()
+    }
+
     // Read a body's current world-space position and Euler rotation.
     pub fn body_pose(&self, handle: BodyHandle) -> ([f32; 3], [f32; 3]) {
         match self.bodies.get(handle.0) {

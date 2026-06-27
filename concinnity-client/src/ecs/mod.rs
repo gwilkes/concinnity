@@ -258,6 +258,14 @@ impl World {
         self.resources.insert(value);
     }
 
+    // Despawn an entity (all its components, recycling its id). Stands in for the
+    // GraphicsSystem-mediated despawn in system tests that need an entity gone
+    // before a later system step (e.g. physics-body reaping).
+    #[cfg(test)]
+    pub fn despawn(&mut self, entity: Entity) {
+        self.components.despawn(entity);
+    }
+
     // Mutable view of the active systems. Mirror of `systems()`; lets the
     // `DebugHook::tick` drive match out a `&mut GraphicsSystem` /
     // `&mut AnimationSystem` (the same enum-match `systems()` already serves
@@ -441,6 +449,7 @@ impl World {
         self.update_event_queue::<crate::assets::ControlsCommand>();
         self.update_event_queue::<crate::assets::AudioCommand>();
         self.update_event_queue::<crate::assets::DespawnRequest>();
+        self.update_event_queue::<crate::assets::ReparentRequest>();
     }
 
     // Tick -- systems run in order, Done systems are removed.

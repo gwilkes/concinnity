@@ -276,12 +276,8 @@ pub(crate) fn propagate_transforms(ctx: &mut crate::ecs::PipelineContext) {
 // attach it under `new_parent` (or leave it a root when `None`), keep both
 // parents' Children lists in sync, and recompose world matrices so the new
 // chain shows up immediately. Entity-keyed throughout, so it is invariant to
-// component-column order.
-//
-// Allowed dead until a runtime trigger calls it (the gameplay / editor reparent
-// path); the behavior is covered now by reparent_recomposes_child_world_matrix_
-// and_relists. Remove the allow once a caller lands.
-#[allow(dead_code)]
+// component-column order. Driven by ReparentRequest events the GraphicsSystem
+// drains each step.
 pub(crate) fn reparent(
     ctx: &mut crate::ecs::PipelineContext,
     child: crate::ecs::Entity,

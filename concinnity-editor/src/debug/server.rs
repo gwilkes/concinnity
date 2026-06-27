@@ -18,7 +18,7 @@ use tokio_tungstenite::tungstenite::{Message, accept};
 use super::commands::{
     error_reply, handle_anim_crossfade, handle_camera_move, handle_camera_set, handle_camera_stop,
     handle_decal_add, handle_decal_remove, handle_despawn, handle_emitter_add,
-    handle_emitter_remove, handle_quality_set, handle_rebind, handle_screenshot,
+    handle_emitter_remove, handle_quality_set, handle_rebind, handle_reparent, handle_screenshot,
 };
 use super::{hot_reload, runtime_spawn};
 // The world snapshot rebuilt by `tick`. The asset/system lists are not cheap
@@ -167,6 +167,7 @@ impl DebugServer {
                                     | runtime_spawn::RuntimeCommand::QualitySet { .. }
                                     | runtime_spawn::RuntimeCommand::Rebind { .. }
                                     | runtime_spawn::RuntimeCommand::Despawn { .. }
+                                    | runtime_spawn::RuntimeCommand::Reparent { .. }
                             ) {
                                 deferred_ecs_cmds.push(cmd);
                             } else {
@@ -212,6 +213,9 @@ impl DebugServer {
                 }
                 runtime_spawn::RuntimeCommand::Despawn { .. } => {
                     runtime_spawn::dispatch_despawn(cmd, world);
+                }
+                runtime_spawn::RuntimeCommand::Reparent { .. } => {
+                    runtime_spawn::dispatch_reparent(cmd, world);
                 }
                 runtime_spawn::RuntimeCommand::CameraMove { args, reply } => {
                     // Accept the motion only when a camera exists, so the client
@@ -659,6 +663,12 @@ fn handle_request(text: &str, shared: &Arc<Mutex<DebugState>>) -> String {
             // commands above.
             drop(state);
             return handle_despawn(text);
+        }
+        "reparent" => {
+            // Runtime mutation (move an authored placement under a new parent):
+            // drop the snapshot lock before blocking, like `despawn` above.
+            drop(state);
+            return handle_reparent(text);
         }
         other => return error_reply(&format!("unknown cmd '{other}'")),
     };

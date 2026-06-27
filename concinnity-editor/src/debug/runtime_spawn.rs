@@ -295,6 +295,15 @@ pub(crate) enum RuntimeCommand {
         name: String,
         reply: std::sync::mpsc::SyncSender<Result<(), String>>,
     },
+    // Re-parent an authored placement by name (parent `None` detaches it to a
+    // root). ECS-side like `Despawn`: it sends a `ReparentRequest` event the
+    // GraphicsSystem drains on its next step, so the per-frame drive routes it to
+    // `dispatch_reparent` once the `systems_mut` borrow ends.
+    Reparent {
+        child: String,
+        parent: Option<String>,
+        reply: std::sync::mpsc::SyncSender<Result<(), String>>,
+    },
 }
 
 static QUEUE: Mutex<Vec<RuntimeCommand>> = Mutex::new(Vec::new());
@@ -438,6 +447,10 @@ pub(crate) fn dispatch_runtime_spawn(
             // ECS-side like CameraSet; routed to `dispatch_despawn`.
             let _ = reply.send(Err("despawn: misrouted to backend dispatch".to_string()));
         }
+        RuntimeCommand::Reparent { reply, .. } => {
+            // ECS-side like CameraSet; routed to `dispatch_reparent`.
+            let _ = reply.send(Err("reparent: misrouted to backend dispatch".to_string()));
+        }
     }
 }
 
@@ -522,6 +535,51 @@ pub(crate) fn dispatch_despawn(cmd: RuntimeCommand, world: &mut crate::ecs::Worl
     world
         .events_mut::<crate::assets::DespawnRequest>()
         .send(crate::assets::DespawnRequest { name: id });
+    let _ = reply.send(Ok(()));
+}
+
+// Apply a drained `Reparent` command by resolving the child + parent names to
+// AssetIds and sending a `ReparentRequest` event into the ECS. GraphicsSystem
+// reads it on its next step, resolves the names to entities, and re-points the
+// child's Parent edge. Routed here (like `Despawn`) because it mutates the ECS,
+// not the backend. The reply fires once the event is queued; an unknown name is
+// a clean error. Applies only on the decomposed render path (the default).
+pub(crate) fn dispatch_reparent(cmd: RuntimeCommand, world: &mut crate::ecs::World) {
+    let RuntimeCommand::Reparent {
+        child,
+        parent,
+        reply,
+    } = cmd
+    else {
+        return;
+    };
+    let table = crate::ecs::asset_id::name_table();
+    let resolve = |name: &str| {
+        table
+            .iter()
+            .position(|n| n == name)
+            .map(|i| crate::ecs::asset_id::AssetId(i as u32))
+    };
+    let Some(child_id) = resolve(&child) else {
+        let _ = reply.send(Err(format!("reparent: child '{child}' not found")));
+        return;
+    };
+    let parent_id = match &parent {
+        Some(p) => match resolve(p) {
+            Some(id) => Some(id),
+            None => {
+                let _ = reply.send(Err(format!("reparent: parent '{p}' not found")));
+                return;
+            }
+        },
+        None => None,
+    };
+    world
+        .events_mut::<crate::assets::ReparentRequest>()
+        .send(crate::assets::ReparentRequest {
+            child: child_id,
+            parent: parent_id,
+        });
     let _ = reply.send(Ok(()));
 }
 
@@ -643,6 +701,27 @@ mod tests {
         assert_eq!(cmds.len(), 1);
         match cmds.into_iter().next().unwrap() {
             RuntimeCommand::Despawn { name, .. } => assert_eq!(name, "crate_a"),
+            _ => panic!("wrong variant"),
+        }
+        assert!(drain().is_empty());
+    }
+
+    #[test]
+    fn reparent_enqueue_drain_round_trip() {
+        let _ = drain();
+        let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+        enqueue(RuntimeCommand::Reparent {
+            child: "box_a".to_string(),
+            parent: Some("frame".to_string()),
+            reply: tx,
+        });
+        let cmds = drain();
+        assert_eq!(cmds.len(), 1);
+        match cmds.into_iter().next().unwrap() {
+            RuntimeCommand::Reparent { child, parent, .. } => {
+                assert_eq!(child, "box_a");
+                assert_eq!(parent.as_deref(), Some("frame"));
+            }
             _ => panic!("wrong variant"),
         }
         assert!(drain().is_empty());

@@ -112,6 +112,13 @@ struct PropPhysics {
 }
 
 impl PhysicsSystem {
+    // Number of rigid bodies the physics world holds. Test-only observable for
+    // the body-reaping path.
+    #[cfg(test)]
+    fn physics_body_count(&self) -> usize {
+        self.world.as_ref().map_or(0, |w| w.body_count())
+    }
+
     // Build the simulation from the world's `PhysicsConfig` (floor / terrain).
     // Bodies and colliders are added from the ECS in [`System::init`].
     pub fn new(config: PhysicsConfig) -> Self {
@@ -506,10 +513,37 @@ impl System for PhysicsSystem {
 
         let world = self.world.as_mut().expect("world checked above");
 
+        let decomposed = self.decomposed;
+
+        // Reap bodies whose entity was despawned (decomposed path): GraphicsSystem
+        // runs before PhysicsSystem and removes the entity from the ECS, so a body
+        // left behind would keep simulating - and colliding with live bodies -
+        // invisibly. Remove it from Rapier and drop its record before the step,
+        // keeping self.held a valid index into the compacted list.
+        if decomposed {
+            let dead: Vec<BodyHandle> = self
+                .prop_bodies
+                .iter()
+                .filter(|p| !ctx.is_alive(p.entity))
+                .map(|p| p.handle)
+                .collect();
+            if !dead.is_empty() {
+                let held_entity = self
+                    .held
+                    .and_then(|i| self.prop_bodies.get(i))
+                    .map(|p| p.entity);
+                for handle in dead {
+                    world.remove_body(handle);
+                }
+                self.prop_bodies.retain(|p| ctx.is_alive(p.entity));
+                self.held =
+                    held_entity.and_then(|e| self.prop_bodies.iter().position(|p| p.entity == e));
+            }
+        }
+
         // pickup / drop on the interact edge. held_changed carries both keys so
         // the write-back can target the Prop (legacy) or the Held tag
         // (decomposed): (prop_index, entity, is_held).
-        let decomposed = self.decomposed;
         let mut held_changed: Option<(usize, Entity, bool)> = None;
         if interact_req {
             if let Some(held_idx) = self.held.take() {
@@ -961,6 +995,57 @@ mod tests {
             0,
             "decomposed default drains the Prop column"
         );
+    }
+
+    // Bodies held by the active PhysicsSystem's world (test observable).
+    fn body_count(world: &World) -> usize {
+        world
+            .systems()
+            .iter()
+            .find_map(|s| match s {
+                crate::ecs::SystemAsset::PhysicsSystem(p) => Some(p.physics_body_count()),
+                _ => None,
+            })
+            .expect("physics system present")
+    }
+
+    // Despawning a decomposed prop reaps its Rapier body, so it stops simulating
+    // (and colliding) once its entity is gone.
+    #[test]
+    fn despawning_a_prop_reaps_its_physics_body() {
+        use std::{thread, time::Duration};
+        let id = AssetId(1);
+        let mut world = World::new_empty();
+        world.insert_resource(DecomposedRender(true));
+        world.add_component(PhysicsConfig::default());
+        world.add_component(ball_prop(id, [0.0, 5.0, 0.0], false));
+        world.add_component(ball_body(id));
+        world.start().unwrap();
+
+        // Settle so the body is live and falling.
+        for _ in 0..2 {
+            thread::sleep(Duration::from_millis(20));
+            world.step();
+        }
+        let before = body_count(&world);
+        let ball = world
+            .join2::<crate::assets::Collider, Transform>()
+            .next()
+            .map(|(e, _, _)| e)
+            .expect("ball entity");
+
+        // Despawn the ball (stand-in for GraphicsSystem) and step: PhysicsSystem
+        // reaps the orphaned body.
+        world.despawn(ball);
+        thread::sleep(Duration::from_millis(20));
+        world.step();
+        let after = body_count(&world);
+        assert_eq!(after, before - 1, "the despawned prop's body was removed");
+
+        // The sim keeps running cleanly with the body gone (no further removals).
+        thread::sleep(Duration::from_millis(20));
+        world.step();
+        assert_eq!(body_count(&world), after, "no further bodies removed");
     }
 
     // Flag off: the simulated pose is written to the Prop, and the Transform

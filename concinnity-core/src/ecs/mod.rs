@@ -250,6 +250,14 @@ impl<'a> PipelineContext<'a> {
         self.components.despawn(entity);
     }
 
+    // Whether an entity is still live (not despawned, matching generation).
+    // Allowed dead for the same cross-crate reason as `insert` (the client
+    // reaps a despawned entity's physics body in PhysicsSystem).
+    #[allow(dead_code)]
+    pub fn is_alive(&self, entity: Entity) -> bool {
+        self.components.is_alive(entity)
+    }
+
     // Borrow one entity's component C read-only. Allowed dead for the same
     // cross-crate reason as `insert` (the client reads Transform / Held by
     // entity in the physics, camera, and audio systems).

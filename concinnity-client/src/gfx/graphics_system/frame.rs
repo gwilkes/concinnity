@@ -2,8 +2,8 @@
 // ticking, and the backend draw call.
 
 use crate::assets::{
-    Camera3D, DespawnRequest, FrameInput, HitRegion, LabelBox, LayoutContainer, Prop, SceneCommand,
-    SettingCommand, SettingOp, Sprite, TextLabel, WindowMode,
+    Camera3D, DespawnRequest, FrameInput, HitRegion, LabelBox, LayoutContainer, Prop,
+    ReparentRequest, SceneCommand, SettingCommand, SettingOp, Sprite, TextLabel, WindowMode,
 };
 use crate::ecs::asset_id::AssetId;
 use crate::ecs::{PipelineContext, StepResult};
@@ -260,6 +260,40 @@ impl GraphicsSystem {
                             if let Some(&entity) = by_name.get(&name) {
                                 super::despawn::despawn_subtree(ctx, backend, entity);
                             }
+                        }
+                    }
+                }
+
+                // Runtime re-parenting (decomposed path only): drain
+                // ReparentRequest events, resolve the child + parent names to
+                // entities, and re-point the child's Parent edge (recomposing
+                // world matrices). After the despawn drain so a reparent naming a
+                // just-removed entity simply finds nothing to move.
+                if self.decomposed_render {
+                    let reparents: Vec<ReparentRequest> = match ctx.events::<ReparentRequest>() {
+                        Some(events) => events
+                            .read(&mut self.reparent_cmd_cursor)
+                            .into_iter()
+                            .copied()
+                            .collect(),
+                        None => Vec::new(),
+                    };
+                    if !reparents.is_empty() {
+                        let by_name = ctx
+                            .resource::<crate::ecs::decompose::EntityByName>()
+                            .map(|n| n.0.clone())
+                            .unwrap_or_default();
+                        for req in reparents {
+                            let Some(&child) = by_name.get(&req.child) else {
+                                continue;
+                            };
+                            let parent = req.parent.and_then(|p| by_name.get(&p).copied());
+                            // A named-but-unresolved parent skips, so a typo never
+                            // silently detaches the child to a root.
+                            if req.parent.is_some() && parent.is_none() {
+                                continue;
+                            }
+                            draw_list::reparent(ctx, child, parent);
                         }
                     }
                 }

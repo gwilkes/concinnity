@@ -232,6 +232,22 @@ impl<'a> PipelineContext<'a> {
         self.components.insert_typed(entity, c);
     }
 
+    // Remove a component from an entity, returning it if present. The entity
+    // keeps its other components. Allowed dead for the same cross-crate reason
+    // as `insert` (the client toggles the Held tag on pickup/drop).
+    #[allow(dead_code)]
+    pub fn remove<C: ComponentSlot>(&mut self, entity: Entity) -> Option<C> {
+        self.components.remove_typed::<C>(entity)
+    }
+
+    // Borrow one entity's component C read-only. Allowed dead for the same
+    // cross-crate reason as `insert` (the client reads Transform / Held by
+    // entity in the physics, camera, and audio systems).
+    #[allow(dead_code)]
+    pub fn get<C: ComponentSlot>(&self, entity: Entity) -> Option<&C> {
+        self.components.get::<C>(entity)
+    }
+
     // Read-only join over two component types: iterate the first type's rows
     // and yield both refs for every entity that also has the second. Allowed
     // dead for the same cross-crate reason as `insert`.

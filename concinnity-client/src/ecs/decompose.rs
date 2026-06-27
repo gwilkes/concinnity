@@ -21,6 +21,22 @@ use crate::assets::{
 use crate::ecs::asset_id::AssetId;
 use crate::ecs::{Entity, PipelineContext};
 
+// Single source of truth for the decomposed-render flag, published once at
+// world start (from the CN_DECOMPOSED_RENDER env var) and read by every system
+// that has a flagged decomposed path: GraphicsSystem, PhysicsSystem,
+// Camera3DSystem, AudioSystem. Removed when the decomposed path becomes the
+// default and the legacy Prop paths are retired.
+#[derive(Debug, Clone, Copy)]
+pub struct DecomposedRender(pub bool);
+
+// Whether the decomposed component paths are active. False when the resource is
+// absent (e.g. a world that never ran the decomposition pass).
+pub fn decomposed_render_enabled(ctx: &PipelineContext) -> bool {
+    ctx.resource::<DecomposedRender>()
+        .map(|d| d.0)
+        .unwrap_or(false)
+}
+
 // Maps a placement's asset identity (its declared name) to the live Entity it
 // was loaded into. Built by the decomposition pass so later passes can resolve
 // a name reference (a Prop parent, a PropBody owner, an audio emitter target)
@@ -29,10 +45,6 @@ use crate::ecs::{Entity, PipelineContext};
 pub struct EntityByName(pub HashMap<AssetId, Entity>);
 
 impl EntityByName {
-    // No caller yet. Remove the allow once physics resolves a PropBody owner and
-    // audio resolves an emitter target through this index instead of scanning
-    // Props.
-    #[allow(dead_code)]
     pub fn get(&self, name: AssetId) -> Option<Entity> {
         self.0.get(&name).copied()
     }
@@ -40,6 +52,14 @@ impl EntityByName {
 
 // Decompose every loaded Prop into per-instance components on its own entity.
 pub(crate) fn run(ctx: &mut PipelineContext) {
+    // Publish the decomposed-render flag once, unless a caller (a test) already
+    // installed one to force a path. Done before the empty-world early return so
+    // every system sees a consistent flag.
+    if ctx.resource::<DecomposedRender>().is_none() {
+        let on = std::env::var("CN_DECOMPOSED_RENDER").is_ok();
+        ctx.insert_resource(DecomposedRender(on));
+    }
+
     // Snapshot each Prop with its entity before mutating storage: inserting
     // components while iterating the Prop column would alias the borrow.
     let props: Vec<(Entity, Prop)> = ctx

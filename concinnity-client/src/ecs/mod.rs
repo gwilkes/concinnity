@@ -13,7 +13,7 @@
 // (`define_system_assets!`), and add a gated entry to the
 // `World::build_internal_systems` schedule below.
 
-mod decompose;
+pub(crate) mod decompose;
 mod registry;
 
 // Renderer-free metadata, registry types, the asset-construction API, and the
@@ -248,6 +248,14 @@ impl World {
     #[allow(dead_code)]
     pub fn systems(&self) -> &[SystemAsset] {
         &self.systems
+    }
+
+    // Install a singleton resource before `start`. Used by system tests to force
+    // the decomposed-render flag (DecomposedRender) so the flagged path runs
+    // without touching the process-global env var.
+    #[cfg(test)]
+    pub fn insert_resource<T: std::any::Any>(&mut self, value: T) {
+        self.resources.insert(value);
     }
 
     // Mutable view of the active systems. Mirror of `systems()`; lets the

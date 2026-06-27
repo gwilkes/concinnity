@@ -6,8 +6,11 @@
 // turns mouse/keyboard input into a `Camera3D` orientation and a movement
 // intent for the player's `RigidBody`.
 
-use crate::assets::{Camera3D, CameraController, ControlsCommand, FrameInput, Prop};
-use crate::ecs::{PipelineContext, StepResult, System};
+use crate::assets::{
+    Camera3D, CameraController, ControlsCommand, FrameInput, Interactable, Prop, Transform,
+};
+use crate::ecs::decompose::decomposed_render_enabled;
+use crate::ecs::{Entity, PipelineContext, StepResult, System};
 use std::time::Instant;
 
 // Reach distance for interacting with a Prop, in world units.
@@ -32,8 +35,13 @@ pub struct Camera3DSystem {
     // WASD movement accelerates and decelerates instead of snapping
     velocity: [f32; 3],
     // indices into the Prop list for props that have interactable=true,
-    // collected at init() so step() can query_mut only those props
+    // collected at init() so step() can query_mut only those props (legacy path)
     interactable_indices: Vec<usize>,
+    // interactable props by entity, for the decomposed path; empty in legacy.
+    interactable_entities: Vec<Entity>,
+    // When on, the interact target is read from / rotated through its Transform
+    // component instead of the Prop. Read once at init from DecomposedRender.
+    decomposed: bool,
     // Cursor into the Events<ControlsCommand> queue (live settings changes).
     controls_cursor: crate::ecs::EventCursor,
 }
@@ -52,6 +60,8 @@ impl Camera3DSystem {
             last_step: None,
             velocity: [0.0; 3],
             interactable_indices: Vec::new(),
+            interactable_entities: Vec::new(),
+            decomposed: false,
             controls_cursor: crate::ecs::EventCursor::default(),
         }
     }
@@ -76,19 +86,34 @@ impl System for Camera3DSystem {
             self.mouse_sensitivity = s;
         }
 
+        self.decomposed = decomposed_render_enabled(ctx);
+
         // GraphicsSystem runs first (it is prepended ahead of every other
         // system) and queries Props without draining them, so they are still
-        // present here.
-        for (i, prop) in ctx.query::<Prop>().enumerate() {
-            if prop.interactable {
-                self.interactable_indices.push(i);
+        // present here. Collect interact targets by entity (decomposed) or by
+        // Prop-column index (legacy).
+        if self.decomposed {
+            self.interactable_entities = ctx
+                .query_with_entity::<Interactable>()
+                .map(|(entity, _)| entity)
+                .collect();
+        } else {
+            for (i, prop) in ctx.query::<Prop>().enumerate() {
+                if prop.interactable {
+                    self.interactable_indices.push(i);
+                }
             }
         }
 
-        if !self.interactable_indices.is_empty() {
+        let registered = if self.decomposed {
+            self.interactable_entities.len()
+        } else {
+            self.interactable_indices.len()
+        };
+        if registered > 0 {
             tracing::debug!(
                 "Camera3DSystem: registered {} interactable prop(s)",
-                self.interactable_indices.len()
+                registered
             );
         }
     }
@@ -221,8 +246,14 @@ impl System for Camera3DSystem {
         }
 
         // interactable props: press the interact key while facing one to
-        // rotate it 45 degrees. Pickup/drop is handled by PhysicsSystem.
-        if input.interact && !self.interactable_indices.is_empty() {
+        // rotate it 45 degrees. Pickup/drop is handled by PhysicsSystem. The
+        // target rotation lives on the Transform (decomposed) or the Prop.
+        let has_targets = if self.decomposed {
+            !self.interactable_entities.is_empty()
+        } else {
+            !self.interactable_indices.is_empty()
+        };
+        if input.interact && has_targets {
             let (cam_pos, cam_yaw) = ctx
                 .query::<Camera3D>()
                 .next()
@@ -230,34 +261,61 @@ impl System for Camera3DSystem {
                 .unwrap_or(([0.0; 3], 0.0));
             let fwd = [-cam_yaw.sin(), 0.0_f32, -cam_yaw.cos()];
 
-            // nearest interactable prop within reach the player is facing
-            let mut best: Option<(f32, usize)> = None;
-            {
-                let props: Vec<&Prop> = ctx.query::<Prop>().collect();
-                for &prop_idx in &self.interactable_indices {
-                    if let Some(prop) = props.get(prop_idx) {
-                        let dx = prop.position[0] - cam_pos[0];
-                        let dz = prop.position[2] - cam_pos[2];
+            if self.decomposed {
+                // nearest interactable entity within reach the player faces
+                let mut best: Option<(f32, Entity)> = None;
+                for &entity in &self.interactable_entities {
+                    if let Some(t) = ctx.get::<Transform>(entity) {
+                        let dx = t.position[0] - cam_pos[0];
+                        let dz = t.position[2] - cam_pos[2];
                         let dist = (dx * dx + dz * dz).sqrt();
                         if dist < INTERACT_REACH && dist > 0.0 {
                             let dot = (fwd[0] * dx + fwd[2] * dz) / dist;
                             if dot > INTERACT_MIN_DOT && best.is_none_or(|(d, _)| dist < d) {
-                                best = Some((dist, prop_idx));
+                                best = Some((dist, entity));
                             }
                         }
                     }
                 }
-            }
-
-            if let Some((_, prop_idx)) = best {
-                let mut props: Vec<&mut Prop> = ctx.query_mut::<Prop>().collect();
-                if let Some(prop) = props.get_mut(prop_idx) {
-                    prop.rotation_deg[1] = (prop.rotation_deg[1] + 45.0) % 360.0;
+                if let Some((_, entity)) = best
+                    && let Some(t) = ctx.get_mut::<Transform>(entity)
+                {
+                    t.rotation_deg[1] = (t.rotation_deg[1] + 45.0) % 360.0;
                     tracing::info!(
-                        "interacted with prop {}, yaw now {:.0}\u{00b0}",
-                        prop.asset_id,
-                        prop.rotation_deg[1],
+                        "interacted with prop, yaw now {:.0}\u{00b0}",
+                        t.rotation_deg[1]
                     );
+                }
+            } else {
+                // nearest interactable prop within reach the player is facing
+                let mut best: Option<(f32, usize)> = None;
+                {
+                    let props: Vec<&Prop> = ctx.query::<Prop>().collect();
+                    for &prop_idx in &self.interactable_indices {
+                        if let Some(prop) = props.get(prop_idx) {
+                            let dx = prop.position[0] - cam_pos[0];
+                            let dz = prop.position[2] - cam_pos[2];
+                            let dist = (dx * dx + dz * dz).sqrt();
+                            if dist < INTERACT_REACH && dist > 0.0 {
+                                let dot = (fwd[0] * dx + fwd[2] * dz) / dist;
+                                if dot > INTERACT_MIN_DOT && best.is_none_or(|(d, _)| dist < d) {
+                                    best = Some((dist, prop_idx));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if let Some((_, prop_idx)) = best {
+                    let mut props: Vec<&mut Prop> = ctx.query_mut::<Prop>().collect();
+                    if let Some(prop) = props.get_mut(prop_idx) {
+                        prop.rotation_deg[1] = (prop.rotation_deg[1] + 45.0) % 360.0;
+                        tracing::info!(
+                            "interacted with prop {}, yaw now {:.0}\u{00b0}",
+                            prop.asset_id,
+                            prop.rotation_deg[1],
+                        );
+                    }
                 }
             }
         }
@@ -383,6 +441,86 @@ mod tests {
         assert!(
             matches!(cmd, Some(ViewCommand::Toggle(AssetId(50)))),
             "UiInputSystem must still process Escape when a camera is present"
+        );
+    }
+
+    // Build a free-fly camera at the origin facing -Z, plus an interactable prop
+    // two units ahead (within reach and inside the facing cone), and a latched
+    // interact input. Shared by the interact decomposition tests.
+    fn interact_world(decomposed: bool) -> World {
+        use crate::assets::Prop;
+        use crate::ecs::asset_id::AssetId;
+        use crate::ecs::decompose::DecomposedRender;
+
+        let mut world = World::new_empty();
+        world.insert_resource(DecomposedRender(decomposed));
+        let ctrl = CameraController {
+            free_fly: true,
+            ..CameraController::default()
+        };
+        world.add_component(camera(Some(ctrl)));
+        world.add_component(Prop {
+            asset_id: AssetId(1),
+            position: [0.0, 0.0, -2.0],
+            interactable: true,
+            ..Default::default()
+        });
+        world
+    }
+
+    // Flag on: pressing interact rotates the target's Transform 45 degrees and
+    // leaves the source Prop untouched.
+    #[test]
+    fn interact_rotates_transform_when_decomposed() {
+        use crate::assets::{FrameInput, Interactable, Prop, Transform};
+
+        let mut world = interact_world(true);
+        world.start().unwrap();
+        world.add_component(FrameInput {
+            interact: true,
+            ..Default::default()
+        });
+        world.step();
+
+        let transform_yaw = world
+            .join2::<Interactable, Transform>()
+            .map(|(_, _, t)| t.rotation_deg[1])
+            .next()
+            .expect("interactable entity has a Transform");
+        assert_eq!(
+            transform_yaw, 45.0,
+            "decomposed interact rotates the Transform"
+        );
+        let prop_yaw = world.query::<Prop>().next().unwrap().rotation_deg[1];
+        assert_eq!(
+            prop_yaw, 0.0,
+            "decomposed interact leaves the Prop untouched"
+        );
+    }
+
+    // Flag off: interact rotates the Prop and leaves the Transform shadow alone.
+    #[test]
+    fn interact_rotates_prop_when_legacy() {
+        use crate::assets::{FrameInput, Interactable, Prop, Transform};
+
+        let mut world = interact_world(false);
+        world.start().unwrap();
+        world.add_component(FrameInput {
+            interact: true,
+            ..Default::default()
+        });
+        world.step();
+
+        let prop_yaw = world.query::<Prop>().next().unwrap().rotation_deg[1];
+        assert_eq!(prop_yaw, 45.0, "legacy interact rotates the Prop");
+        let transform_yaw = world
+            .join2::<Interactable, Transform>()
+            .map(|(_, _, t)| t.rotation_deg[1])
+            .next()
+            .expect("interactable entity has a Transform");
+        assert_eq!(
+            transform_yaw, 0.0,
+            "legacy interact leaves the Transform shadow alone"
         );
     }
 }

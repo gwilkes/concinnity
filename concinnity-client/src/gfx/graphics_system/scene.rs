@@ -1,19 +1,17 @@
 // GraphicsSystem scene-reel wiring and per-frame scene visibility application.
 
-use crate::assets::{Prop, RenderHandle, Scene, SceneMember, SceneReel};
+use crate::assets::{RenderHandle, Scene, SceneMember, SceneReel};
 use crate::ecs::PipelineContext;
 use crate::ecs::asset_id::AssetId;
 use crate::gfx::scene_reel;
 
 use super::*;
 
-// Build the (draw-slots, scene) visibility pairs from the decomposed
+// Build the (draw-slots, scene) visibility pairs from the per-entity
 // components: every entity with a RenderHandle contributes its GPU draw slots,
-// tagged with the SceneMember scene it belongs to (None = always visible). This
-// is the entity-sourced equivalent of the positional prop_draw_indices /
-// prop_scene side-tables, consumed identically by the scene_reel visibility
-// functions. The two returned vectors are index-aligned: pair i is one entity's
-// draws and its scene.
+// tagged with the SceneMember scene it belongs to (None = always visible),
+// consumed by the scene_reel visibility functions. The two returned vectors are
+// index-aligned: pair i is one entity's draws and its scene.
 pub(super) fn decomposed_visibility_snapshot(
     ctx: &PipelineContext,
 ) -> (Vec<Vec<usize>>, Vec<Option<AssetId>>) {
@@ -35,12 +33,6 @@ impl GraphicsSystem {
         let scenes: Vec<Scene> = ctx.drain::<Scene>();
         let scene_map: std::collections::HashMap<AssetId, Scene> =
             scenes.into_iter().map(|s| (s.asset_id, s)).collect();
-        {
-            // Each prop's scene is resolved at build time (build/pipeline.rs::
-            // resolve_scene_refs), so we just read the baked-in id here.
-            let props: Vec<_> = ctx.query::<Prop>().collect();
-            self.prop_scene = props.iter().map(|p| p.scene).collect();
-        }
         let reel_opt = ctx.drain::<SceneReel>().into_iter().next();
         if let Some(reel) = reel_opt {
             if reel.scenes.is_empty() {
@@ -76,21 +68,12 @@ impl GraphicsSystem {
     }
 
     pub(super) fn apply_scene_visibility(&mut self, ctx: &PipelineContext, active_scene: AssetId) {
-        // Source visibility from the decomposed components when active; otherwise
-        // from the positional side-tables. Snapshot before borrowing the backend
-        // so the ctx borrow is released by the time set_scene_visibility runs.
-        if self.decomposed_render {
-            let (draws, scenes) = decomposed_visibility_snapshot(ctx);
-            if let Some(backend) = self.backend.as_deref_mut() {
-                scene_reel::set_scene_visibility(&draws, &scenes, active_scene, backend);
-            }
-        } else if let Some(backend) = self.backend.as_deref_mut() {
-            scene_reel::set_scene_visibility(
-                &self.prop_draw_indices,
-                &self.prop_scene,
-                active_scene,
-                backend,
-            );
+        // Snapshot visibility from the per-entity components before borrowing the
+        // backend, so the ctx borrow is released by the time set_scene_visibility
+        // runs.
+        let (draws, scenes) = decomposed_visibility_snapshot(ctx);
+        if let Some(backend) = self.backend.as_deref_mut() {
+            scene_reel::set_scene_visibility(&draws, &scenes, active_scene, backend);
         }
     }
 }
@@ -102,8 +85,8 @@ mod tests {
     use crate::ecs::{ComponentStorage, Resources};
     use crate::gfx::profile::FrameProfile;
 
-    // The decomposed snapshot must reproduce the positional side-tables: each
-    // entity's draw slots paired with its scene, scene-less entities visible.
+    // The snapshot pairs each entity's draw slots with its scene; scene-less
+    // entities are always visible.
     #[test]
     fn snapshot_pairs_each_entity_draws_with_its_scene() {
         let mut components = ComponentStorage::default();

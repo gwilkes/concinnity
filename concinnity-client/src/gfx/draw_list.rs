@@ -4,7 +4,7 @@
 // None of these functions hold or borrow a backend handle.
 
 use crate::assets::{
-    File, FileKind, InstancedProp, Mesh, ProceduralMesh, Prop, Room, SubMeshRef, VoxelChunk,
+    File, FileKind, InstancedProp, Mesh, ProceduralMesh, Room, SubMeshRef, VoxelChunk,
 };
 use crate::ecs::PipelineContext;
 use crate::ecs::asset_id::AssetId;
@@ -80,24 +80,16 @@ fn local_bounds(verts: &[Vertex]) -> ([f32; 3], [f32; 3]) {
     (mn, mx)
 }
 
-// Props whose transform can change at runtime are pulled out of the BVH and
-// always drawn (after a per-object frustum test). The BVH is built once at
-// init and does not refit, so anything that moves would otherwise risk being
-// culled incorrectly: its model matrix updates but its init-time AABB
-// remains, so the wrong region of space is tested against the frustum.
-// `pickup` and `interactable` move via Camera3DSystem; `parent.is_some()` may
-// inherit a parent transform that changes; `collider.is_some()` rides a
-// PhysicsSystem rigid body that may translate / rotate every step (and even
-// a "static" collider is cheap to mark dynamic; the per-object frustum test
-// is O(1) and the BVH would not have refit it either way).
-fn is_dynamic_prop(prop: &Prop) -> bool {
-    prop.pickup || prop.interactable || prop.parent.is_some() || prop.collider.is_some()
-}
-
 // The renderer-relevant view of one placement that build_draw_list consumes:
 // the mesh/model/material/texture refs, the cull distance, whether it is dynamic
-// (skips frustum culling), and the asset id (error logging only). Sourced from a
-// Prop (legacy) or the decomposed MeshRenderer/ModelRenderer + tag components.
+// (skips frustum culling), and the asset id (error logging only). Built from an
+// entity's MeshRenderer/ModelRenderer + tag components by
+// `decomposed_renderable_item`.
+//
+// An entity is dynamic (pulled out of the BVH and always drawn after a per-object
+// frustum test) when it carries a Pickup, Interactable, Parent, or Collider tag.
+// The BVH is built once at init and does not refit, so a moving entity would
+// otherwise risk being culled against its stale init-time AABB.
 #[derive(Debug, PartialEq)]
 pub(crate) struct RenderableItem {
     pub asset_id: AssetId,
@@ -109,24 +101,10 @@ pub(crate) struct RenderableItem {
     pub is_dynamic: bool,
 }
 
-impl RenderableItem {
-    pub(crate) fn from_prop(prop: &Prop) -> Self {
-        Self {
-            asset_id: prop.asset_id,
-            model: prop.model,
-            mesh: prop.mesh,
-            material: prop.material,
-            texture: prop.texture,
-            cull_distance: prop.cull_distance,
-            is_dynamic: is_dynamic_prop(prop),
-        }
-    }
-}
-
-// The decomposed-path equivalent of from_prop: read one entity's renderer
-// fields from its MeshRenderer xor ModelRenderer and its dynamic flag from the
-// Pickup / Interactable / Parent / Collider tags. asset_id is for error
-// logging only (resolved from the name index by the caller).
+// Build one entity's RenderableItem: read its renderer fields from its
+// MeshRenderer xor ModelRenderer and its dynamic flag from the Pickup /
+// Interactable / Parent / Collider tags. asset_id is for error logging only
+// (resolved from the name index by the caller).
 pub(crate) fn decomposed_renderable_item(
     ctx: &crate::ecs::PipelineContext,
     entity: crate::ecs::Entity,
@@ -170,52 +148,11 @@ fn mat_mul4(a: [[f32; 4]; 4], b: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
     out
 }
 
-// Resolve world matrices for a flat list of Props that may form a parent-child
-// hierarchy. `parents[i]` is the index of prop i's parent, or None for roots.
-//
-// Iterates until all props are resolved or no further progress is possible
-// (which indicates a cycle; cyclic props fall back to their local matrix).
-pub fn compute_world_matrices(props: &[&Prop], parents: &[Option<usize>]) -> Vec<[[f32; 4]; 4]> {
-    let n = props.len();
-    let mut world: Vec<Option<[[f32; 4]; 4]>> = vec![None; n];
-
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for i in 0..n {
-            if world[i].is_some() {
-                continue;
-            }
-            let local = props[i].model_matrix();
-            let w = match parents.get(i).copied().flatten() {
-                None => local,
-                Some(pi) => match world.get(pi).copied().flatten() {
-                    Some(pw) => mat_mul4(pw, local),
-                    None => continue, // parent not yet resolved
-                },
-            };
-            world[i] = Some(w);
-            changed = true;
-        }
-    }
-
-    // Any unresolved props (from cycles) fall back to their local matrix.
-    world
-        .into_iter()
-        .enumerate()
-        .map(|(i, w)| w.unwrap_or_else(|| props[i].model_matrix()))
-        .collect()
-}
-
-// Resolve and write each entity's GlobalTransform from its Transform and parent
-// chain. The entity-keyed analogue of compute_world_matrices: roots use their
-// local matrix, children compose parent-world * local, and cyclic parents fall
-// back to their local matrix. Reads Transform and Parent, writes GlobalTransform
-// (seeded on every transform entity at init).
-// Resolve each entity's world matrix from its Transform and Parent chain, the
-// entity-keyed analogue of compute_world_matrices. Returns an entity -> world
-// matrix map (cyclic entities fall back to their local matrix). Shared by the
-// per-frame propagate_transforms and the render-init draw-list build.
+// Resolve each entity's world matrix from its Transform and Parent chain: roots
+// use their local matrix, children compose parent-world * local, and cyclic
+// parents fall back to their local matrix. Returns an entity -> world matrix map.
+// Shared by the per-frame propagate_transforms and the render-init draw-list
+// build.
 pub(crate) fn resolve_world_matrices(
     ctx: &crate::ecs::PipelineContext,
 ) -> std::collections::HashMap<crate::ecs::Entity, [[f32; 4]; 4]> {
@@ -974,19 +911,10 @@ mod tests {
         }
     }
 
-    fn prop_with_transform(t: &crate::assets::Transform) -> Prop {
-        Prop {
-            position: t.position,
-            rotation_deg: t.rotation_deg,
-            scale: t.scale,
-            ..make_prop([0.0; 3])
-        }
-    }
-
-    // The decomposed transform path must produce matrices bit-identical to the
-    // legacy positional path, so the per-frame model-matrix push is unchanged.
+    // propagate_transforms composes each entity's GlobalTransform from its parent
+    // chain: a root's world matrix is its local, a child's is parent_world * local.
     #[test]
-    fn propagate_transforms_matches_compute_world_matrices() {
+    fn propagate_transforms_composes_parent_then_child() {
         use crate::assets::{GlobalTransform, Parent, Transform};
         use crate::blob::BlobData;
         use crate::ecs::{ComponentStorage, PipelineContext, Resources};
@@ -1025,17 +953,14 @@ mod tests {
 
         propagate_transforms(&mut ctx);
 
-        // Reference: the legacy positional path over the same two transforms,
-        // child (index 1) parented to parent (index 0).
-        let parent_prop = prop_with_transform(&parent_t);
-        let child_prop = prop_with_transform(&child_t);
-        let refs = vec![&parent_prop, &child_prop];
-        let ref_mats = compute_world_matrices(&refs, &[None, Some(0)]);
-
         let parent_g = ctx.components.get::<GlobalTransform>(parent_e).unwrap().0;
         let child_g = ctx.components.get::<GlobalTransform>(child_e).unwrap().0;
-        assert_eq!(parent_g, ref_mats[0], "root GlobalTransform matches legacy");
-        assert_eq!(child_g, ref_mats[1], "child GlobalTransform matches legacy");
+        assert_eq!(parent_g, parent_t.model_matrix(), "root world = local");
+        assert_eq!(
+            child_g,
+            mat_mul4(parent_t.model_matrix(), child_t.model_matrix()),
+            "child world = parent_world * local"
+        );
     }
 
     #[test]
@@ -1116,37 +1041,6 @@ mod tests {
     }
 
     #[test]
-    fn is_dynamic_prop_flags_collider_bearing_props() {
-        // A plain static prop stays in the BVH.
-        let plain = make_prop([0.0; 3]);
-        assert!(!is_dynamic_prop(&plain));
-
-        // A prop with a collider rides a physics body that may translate /
-        // rotate every step; the init-time BVH AABB would stale out, so it
-        // must opt out of the BVH and pay the per-frame frustum test instead.
-        // Reproduces the "physics ball disappears when the camera gets close"
-        // bug: the ball rolled past its init AABB, so the BVH culled it even
-        // when it was right in front of the camera.
-        let mut with_collider = make_prop([0.0; 3]);
-        with_collider.collider = Some(crate::assets::PropCollider::default());
-        assert!(is_dynamic_prop(&with_collider));
-
-        // The pre-existing dynamic flags (pickup / interactable / parent)
-        // still mark a prop dynamic on their own.
-        let mut pickup = make_prop([0.0; 3]);
-        pickup.pickup = true;
-        assert!(is_dynamic_prop(&pickup));
-
-        let mut interactable = make_prop([0.0; 3]);
-        interactable.interactable = true;
-        assert!(is_dynamic_prop(&interactable));
-
-        let mut parented = make_prop([0.0; 3]);
-        parented.parent = Some(AssetId(1));
-        assert!(is_dynamic_prop(&parented));
-    }
-
-    #[test]
     fn mat_mul4_identity_is_no_op() {
         let m = [
             [1.0, 2.0, 3.0, 0.0],
@@ -1178,42 +1072,6 @@ mod tests {
         assert_eq!(result[3], [1.0, 1.0, 0.0, 1.0]);
         assert_eq!(result[0], [1.0, 0.0, 0.0, 0.0]);
         assert_eq!(result[1], [0.0, 1.0, 0.0, 0.0]);
-    }
-
-    #[test]
-    fn compute_world_matrices_flat_list() {
-        let a = make_prop([1.0, 0.0, 0.0]);
-        let b = make_prop([0.0, 2.0, 0.0]);
-        let props: Vec<&Prop> = vec![&a, &b];
-        let mats = compute_world_matrices(&props, &[None, None]);
-        assert_eq!(mats[0], a.model_matrix());
-        assert_eq!(mats[1], b.model_matrix());
-    }
-
-    #[test]
-    fn compute_world_matrices_child_inherits_parent_translation() {
-        let parent = make_prop([1.0, 0.0, 0.0]);
-        let child = make_prop([0.0, 1.0, 0.0]);
-        let props: Vec<&Prop> = vec![&parent, &child];
-        let mats = compute_world_matrices(&props, &[None, Some(0)]);
-        // parent unchanged
-        assert_eq!(mats[0], parent.model_matrix());
-        // child world translation = parent_pos + child_pos = (1,1,0)
-        // col 3 carries translation in column-major layout
-        assert!((mats[1][3][0] - 1.0).abs() < 1e-5);
-        assert!((mats[1][3][1] - 1.0).abs() < 1e-5);
-        assert!((mats[1][3][2]).abs() < 1e-5);
-    }
-
-    #[test]
-    fn compute_world_matrices_cycle_falls_back_to_local() {
-        let a = make_prop([1.0, 0.0, 0.0]);
-        let b = make_prop([0.0, 1.0, 0.0]);
-        let props: Vec<&Prop> = vec![&a, &b];
-        // Mutual cycle: a's parent is b, b's parent is a; neither can resolve.
-        let mats = compute_world_matrices(&props, &[Some(1), Some(0)]);
-        assert_eq!(mats[0], a.model_matrix());
-        assert_eq!(mats[1], b.model_matrix());
     }
 
     fn unit_quad_mesh() -> LoadedMesh {
@@ -1354,14 +1212,17 @@ mod tests {
         let mut mesh_geometry = std::collections::HashMap::new();
         mesh_geometry.insert(AssetId(0), unit_quad_mesh());
 
-        let mut prop = make_prop([0.0; 3]);
-        prop.mesh = Some(AssetId(0));
-        let props_refs: Vec<&Prop> = vec![&prop];
-        let world_mats = compute_world_matrices(&props_refs, &[None]);
-        let items: Vec<RenderableItem> = props_refs
-            .iter()
-            .map(|p| RenderableItem::from_prop(p))
-            .collect();
+        // A single static mesh-backed item referencing the always-resident mesh.
+        let items = vec![RenderableItem {
+            asset_id: AssetId(0),
+            model: None,
+            mesh: Some(AssetId(0)),
+            material: None,
+            texture: None,
+            cull_distance: 0.0,
+            is_dynamic: false,
+        }];
+        let world_mats = vec![IDENTITY4];
 
         let mut always_resident = std::collections::HashSet::new();
         always_resident.insert(AssetId(0));
@@ -1386,9 +1247,9 @@ mod tests {
         assert!(!draw_objects[0].cullable());
     }
 
-    // The decomposed item built from a mesh entity's components must equal the
-    // one from_prop builds from the source Prop, field for field, so the draw
-    // objects are identical.
+    // The item built from a mesh entity's components reads the renderer fields
+    // from MeshRenderer and marks the entity dynamic from its Pickup / Collider
+    // tags.
     #[test]
     fn decomposed_renderable_item_matches_a_mesh_prop() {
         use crate::assets::{Collider, MeshRenderer, Pickup, PropCollider};
@@ -1429,12 +1290,22 @@ mod tests {
         ctx.insert(e, Collider(prop.collider.clone().unwrap()));
 
         let item = decomposed_renderable_item(&ctx, e, prop.asset_id);
-        assert_eq!(item, RenderableItem::from_prop(&prop));
-        assert!(item.is_dynamic);
+        assert_eq!(
+            item,
+            RenderableItem {
+                asset_id: AssetId(7),
+                model: None,
+                mesh: Some(AssetId(10)),
+                material: Some(AssetId(20)),
+                texture: None,
+                cull_distance: 50.0,
+                is_dynamic: true,
+            }
+        );
     }
 
-    // Same for a model entity: ModelRenderer-sourced item equals from_prop, and
-    // with no dynamic tags the item is static.
+    // Same for a model entity: ModelRenderer fields, and with no dynamic tags the
+    // item is static.
     #[test]
     fn decomposed_renderable_item_matches_a_model_prop() {
         use crate::assets::ModelRenderer;
@@ -1468,7 +1339,17 @@ mod tests {
         );
 
         let item = decomposed_renderable_item(&ctx, e, prop.asset_id);
-        assert_eq!(item, RenderableItem::from_prop(&prop));
-        assert!(!item.is_dynamic);
+        assert_eq!(
+            item,
+            RenderableItem {
+                asset_id: AssetId(8),
+                model: Some(AssetId(100)),
+                mesh: None,
+                material: None,
+                texture: None,
+                cull_distance: 30.0,
+                is_dynamic: false,
+            }
+        );
     }
 }

@@ -6,10 +6,10 @@
 
 use std::collections::HashMap;
 
-use crate::assets::{AudioClip, AudioCommand, AudioEmitter, Camera3D, Prop, Transform};
+use crate::assets::{AudioClip, AudioCommand, AudioEmitter, Camera3D, Transform};
 use crate::audio::{AudioEngine, EmitterId};
 use crate::ecs::asset_id::AssetId;
-use crate::ecs::decompose::{EntityByName, decomposed_render_enabled};
+use crate::ecs::decompose::EntityByName;
 use crate::ecs::{PipelineContext, StepResult, System};
 
 // 3D positional audio behavior. Constructed internally by `World::start` when
@@ -21,9 +21,6 @@ pub struct AudioSystem {
     emitters: Vec<EmitterBinding>,
     // Cursor into the Events<AudioCommand> queue (live master-volume changes).
     audio_cmd_cursor: crate::ecs::EventCursor,
-    // When on, a followed prop's position is read from its Transform component
-    // via the name index instead of the Prop. Read once at init.
-    decomposed: bool,
 }
 
 // Links one engine emitter to the world data that positions it.
@@ -50,15 +47,12 @@ impl AudioSystem {
             engine: AudioEngine::new(),
             emitters: Vec::new(),
             audio_cmd_cursor: crate::ecs::EventCursor::default(),
-            decomposed: false,
         }
     }
 }
 
 impl System for AudioSystem {
     fn init(&mut self, ctx: &mut PipelineContext) {
-        self.decomposed = decomposed_render_enabled(ctx);
-
         // Snapshot the emitters, then resolve every clip's payload locator so
         // the borrow of `ctx` for the AudioClip query is released before the
         // `read_payload` calls below.
@@ -129,30 +123,16 @@ impl System for AudioSystem {
             self.engine.set_listener(pos, yaw, pitch);
         }
 
-        // Prop-bound emitters track their followed prop's current position,
-        // read from its Transform via the name index (decomposed) or the Prop.
+        // Prop-bound emitters track their followed prop's current position, read
+        // from its Transform via the name index.
         if self.emitters.iter().any(|b| b.follows.is_some()) {
-            if self.decomposed {
-                for binding in &self.emitters {
-                    if let Some(prop_id) = binding.follows
-                        && let Some(entity) =
-                            ctx.resource::<EntityByName>().and_then(|n| n.get(prop_id))
-                        && let Some(t) = ctx.get::<Transform>(entity)
-                    {
-                        self.engine.set_emitter_position(binding.id, t.position);
-                    }
-                }
-            } else {
-                let prop_positions: HashMap<AssetId, [f32; 3]> = ctx
-                    .query::<Prop>()
-                    .map(|p| (p.asset_id, p.position))
-                    .collect();
-                for binding in &self.emitters {
-                    if let Some(prop_id) = binding.follows
-                        && let Some(&pos) = prop_positions.get(&prop_id)
-                    {
-                        self.engine.set_emitter_position(binding.id, pos);
-                    }
+            for binding in &self.emitters {
+                if let Some(prop_id) = binding.follows
+                    && let Some(entity) =
+                        ctx.resource::<EntityByName>().and_then(|n| n.get(prop_id))
+                    && let Some(t) = ctx.get::<Transform>(entity)
+                {
+                    self.engine.set_emitter_position(binding.id, t.position);
                 }
             }
         }

@@ -250,14 +250,6 @@ impl World {
         &self.systems
     }
 
-    // Install a singleton resource before `start`. Used by system tests to force
-    // the decomposed-render flag (DecomposedRender) so the flagged path runs
-    // without touching the process-global env var.
-    #[cfg(test)]
-    pub fn insert_resource<T: std::any::Any>(&mut self, value: T) {
-        self.resources.insert(value);
-    }
-
     // Despawn an entity (all its components, recycling its id). Stands in for the
     // GraphicsSystem-mediated despawn in system tests that need an entity gone
     // before a later system step (e.g. physics-body reaping).

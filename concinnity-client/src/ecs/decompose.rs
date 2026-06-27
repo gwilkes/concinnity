@@ -6,11 +6,12 @@
 // start, after every Prop has been loaded (so each already owns an Entity) and
 // before systems init.
 //
-// It does not remove or alter the Prop components: the renderer and gameplay
-// systems still read Prop. The decomposed components ride alongside on the same
-// entities so they can be cross-checked against the source before any consumer
-// switches over. Cross-references between placements (a Prop's parent) resolve
-// through a name -> Entity index this pass also publishes as a resource.
+// It then drains the Prop column: every renderer and gameplay system reads the
+// per-instance components, so the source Props are no longer needed. drain<Prop>
+// clears only the Prop component, so each entity survives on its Transform /
+// renderer / tag components. Cross-references between placements (a Prop's
+// parent) resolve through a name -> Entity index this pass also publishes as a
+// resource.
 
 use std::collections::HashMap;
 
@@ -20,24 +21,6 @@ use crate::assets::{
 };
 use crate::ecs::asset_id::AssetId;
 use crate::ecs::{Entity, PipelineContext};
-
-// Single source of truth for the decomposed path flag, published once at world
-// start and read by every system that has a decomposed path: GraphicsSystem,
-// PhysicsSystem, Camera3DSystem, AudioSystem. Decomposed is the default; the
-// CN_LEGACY_PROPS env var opts back into the legacy Prop path (which keeps the
-// Prop column instead of draining it). The legacy path and this flag are removed
-// once the decomposed path is verified on every backend and the editor's
-// Prop-based hot-reload is reworked.
-#[derive(Debug, Clone, Copy)]
-pub struct DecomposedRender(pub bool);
-
-// Whether the decomposed component paths are active. False when the resource is
-// absent (e.g. a world that never ran the decomposition pass).
-pub fn decomposed_render_enabled(ctx: &PipelineContext) -> bool {
-    ctx.resource::<DecomposedRender>()
-        .map(|d| d.0)
-        .unwrap_or(false)
-}
 
 // Maps a placement's asset identity (its declared name) to the live Entity it
 // was loaded into. Built by the decomposition pass so later passes can resolve
@@ -52,17 +35,9 @@ impl EntityByName {
     }
 }
 
-// Decompose every loaded Prop into per-instance components on its own entity.
+// Decompose every loaded Prop into per-instance components on its own entity,
+// then drain the Prop column.
 pub(crate) fn run(ctx: &mut PipelineContext) {
-    // Publish the decomposed flag once, unless a caller (a test) already
-    // installed one to force a path. Decomposed is the default; CN_LEGACY_PROPS
-    // opts out. Done before the empty-world early return so every system sees a
-    // consistent flag.
-    if ctx.resource::<DecomposedRender>().is_none() {
-        let on = std::env::var("CN_LEGACY_PROPS").is_err();
-        ctx.insert_resource(DecomposedRender(on));
-    }
-
     // Snapshot each Prop with its entity before mutating storage: inserting
     // components while iterating the Prop column would alias the borrow.
     let props: Vec<(Entity, Prop)> = ctx
@@ -144,13 +119,10 @@ pub(crate) fn run(ctx: &mut PipelineContext) {
 
     ctx.insert_resource(EntityByName(by_name));
 
-    // Decomposed default: drop the Prop column now that every consumer reads the
-    // decomposed components. drain<Prop> clears only the Prop component, so each
-    // entity survives on its Transform/renderer/tag components. The legacy opt-out
-    // keeps the Prop column as a shadow for the legacy systems and hot-reload.
-    if decomposed_render_enabled(ctx) {
-        ctx.drain::<Prop>();
-    }
+    // Drop the Prop column now that every consumer reads the decomposed
+    // components. drain<Prop> clears only the Prop component, so each entity
+    // survives on its Transform / renderer / tag components.
+    ctx.drain::<Prop>();
 }
 
 #[cfg(test)]
@@ -169,9 +141,6 @@ mod tests {
     #[test]
     fn decomposes_props_onto_their_entities() {
         let mut world = World::new_empty();
-        // Legacy opt-out: keep the Prop column so this test can cross-check the
-        // decomposed components against the source Props (shadow mode).
-        world.insert_resource(DecomposedRender(false));
 
         // A model-backed parent placement.
         let mut frame = prop(1);
@@ -193,8 +162,8 @@ mod tests {
 
         world.start().expect("start");
 
-        // The Prop components survive (shadow mode): both representations exist.
-        assert_eq!(world.query::<Prop>().count(), 2);
+        // The Prop column is drained; the entities survive on their components.
+        assert_eq!(world.query::<Prop>().count(), 0);
 
         // Model placement: ModelRenderer + Transform, no MeshRenderer.
         let models: Vec<_> = world
@@ -271,8 +240,8 @@ mod tests {
         assert_eq!(parent_mesh, Some(Some(AssetId(11))));
     }
 
-    // Under the decomposed default (no flag override), the pass drains the Prop
-    // column but keeps each entity on its decomposed components.
+    // The pass drains the Prop column but keeps each entity on its per-instance
+    // components.
     #[test]
     fn decomposed_default_drains_prop_keeping_components() {
         let mut world = World::new_empty();

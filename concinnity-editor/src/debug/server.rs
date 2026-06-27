@@ -274,13 +274,6 @@ impl DebugServer {
                 applied
             );
         }
-
-        // Newly-added Props enter the ECS so subsequent systems (Camera3DSystem,
-        // PhysicsSystem, etc.) see them and the GraphicsSystem per-frame
-        // transform push has parallel props / prop_parents arrays.
-        for prop in effects.added_props {
-            world.push(prop);
-        }
     }
 }
 

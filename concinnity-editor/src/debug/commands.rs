@@ -429,8 +429,7 @@ struct DespawnCmdRequest {
 // sends a `DespawnRequest` the GraphicsSystem applies on its next step (hide the
 // draw slots + despawn the entity, cascading to children). `cn debug` only; lets
 // a headless harness remove an entity and screenshot it gone. The reply fires
-// once the command is queued; applies on the decomposed render path (the
-// default).
+// once the command is queued.
 pub(super) fn handle_despawn(text: &str) -> String {
     let req: DespawnCmdRequest = match serde_json::from_str(text) {
         Ok(r) => r,
@@ -467,7 +466,7 @@ struct ReparentCmdRequest {
 // `ReparentRequest` the GraphicsSystem applies on its next step (re-point the
 // Parent edge + recompose world matrices). `cn debug` only; lets a headless
 // harness move an entity under a new parent and screenshot the result. The reply
-// fires once queued; applies on the decomposed render path (the default).
+// fires once queued.
 pub(super) fn handle_reparent(text: &str) -> String {
     let req: ReparentCmdRequest = match serde_json::from_str(text) {
         Ok(r) => r,

@@ -6,10 +6,10 @@
 // `PhysicsConfig` for the floor / terrain.
 
 use crate::assets::{
-    Camera3D, Collider, Held, Joint, PhysicsConfig, Pickup, Prop, PropBody, RigidBody, Transform,
+    Camera3D, Collider, Held, Joint, PhysicsConfig, Pickup, PropBody, RigidBody, Transform,
 };
 use crate::ecs::asset_id::AssetId;
-use crate::ecs::decompose::{EntityByName, decomposed_render_enabled};
+use crate::ecs::decompose::EntityByName;
 use crate::ecs::{Entity, PipelineContext, StepResult, System};
 use crate::physics::{BodyHandle, ColliderShape, PhysicsWorld};
 use std::collections::{HashMap, HashSet};
@@ -59,11 +59,6 @@ pub struct PhysicsSystem {
     prop_bodies: Vec<PropPhysics>,
     // Index into `prop_bodies` of the prop currently being carried.
     held: Option<usize>,
-    // When on, transforms are read from / written to the per-entity Transform
-    // component and the carried flag is the Held tag, instead of the Prop. Read
-    // once at init from the DecomposedRender resource. Removed with the legacy
-    // Prop path once the decomposed path is the only one.
-    decomposed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -94,15 +89,10 @@ struct PlayerPhysics {
     grounded: bool,
 }
 
-// Links a Prop component to its body in the simulation.
+// Links a prop entity to its body in the simulation.
 #[derive(Debug)]
 struct PropPhysics {
-    // Index into the Prop component list (stable for the run). Used by the
-    // legacy path; unused (0) in the decomposed path.
-    prop_index: usize,
-    // The prop's entity. Used by the decomposed path to read/write its
-    // Transform; dangling in the legacy path. The legacy `prop_index` is removed
-    // when the legacy path is.
+    // The prop's entity, used to read/write its Transform and toggle its Held tag.
     entity: Entity,
     handle: BodyHandle,
     // False for static (immovable) props.
@@ -143,17 +133,14 @@ impl PhysicsSystem {
             player: None,
             prop_bodies: Vec::new(),
             held: None,
-            decomposed: false,
         }
     }
 
-    // Build one body per collider-bearing entity from the decomposed components
+    // Build one body per collider-bearing entity from its per-instance components
     // (Transform + Collider + the Pickup tag), resolving PropBody owners through
-    // the name index. Keys `body_handles` by AssetId (via the name index's
-    // inverse) so the joint wiring stays identical to the legacy path. Iterates
-    // the Collider column, whose order matches the Prop column, so bodies enter
-    // the simulation in the same order as the legacy path.
-    fn build_prop_bodies_decomposed(
+    // the name index and keying `body_handles` by AssetId (via the name index's
+    // inverse) so the joint wiring resolves.
+    fn build_prop_bodies(
         &mut self,
         ctx: &PipelineContext,
         world: &mut PhysicsWorld,
@@ -200,7 +187,6 @@ impl PhysicsSystem {
                     crate::physics::dynamic_params(prop_body),
                 );
                 self.prop_bodies.push(PropPhysics {
-                    prop_index: 0,
                     entity,
                     handle,
                     dynamic: true,
@@ -215,7 +201,6 @@ impl PhysicsSystem {
                     STATIC_FRICTION,
                 );
                 self.prop_bodies.push(PropPhysics {
-                    prop_index: 0,
                     entity,
                     handle,
                     dynamic: false,
@@ -233,7 +218,6 @@ impl PhysicsSystem {
 impl System for PhysicsSystem {
     fn init(&mut self, ctx: &mut PipelineContext) {
         self.last_step = Some(Instant::now());
-        self.decomposed = decomposed_render_enabled(ctx);
 
         let mut world = PhysicsWorld::new(GRAVITY);
 
@@ -285,70 +269,10 @@ impl System for PhysicsSystem {
             }
         }
 
-        // Prop id -> BodyHandle, populated below alongside `self.prop_bodies`.
-        // Joints resolve their `body_a`/`body_b` references through this map
-        // (AssetId-keyed in both paths, so the joint wiring below is unchanged).
+        // Prop name -> BodyHandle, populated alongside `self.prop_bodies`.
+        // Joints resolve their `body_a`/`body_b` references through this map.
         let mut body_handles: HashMap<AssetId, BodyHandle> = HashMap::new();
-        if self.decomposed {
-            self.build_prop_bodies_decomposed(ctx, &mut world, &mut body_handles);
-        } else {
-            // one body per Prop that carries a collider
-            let prop_snaps: Vec<(AssetId, Option<PropCollSnap>)> = ctx
-                .query::<Prop>()
-                .map(|p| {
-                    let snap = p.collider.as_ref().map(|c| PropCollSnap {
-                        shape: crate::physics::collider_shape(c, p.scale),
-                        position: p.position,
-                        rotation_deg: p.rotation_deg,
-                        pickup: p.pickup,
-                    });
-                    (p.asset_id, snap)
-                })
-                .collect();
-            let bodies: Vec<(Option<AssetId>, PropBody)> = ctx
-                .query::<PropBody>()
-                .map(|b| (b.prop_name, b.clone()))
-                .collect();
-
-            for (prop_index, (prop_id, snap)) in prop_snaps.into_iter().enumerate() {
-                let Some(snap) = snap else { continue };
-                let body = bodies
-                    .iter()
-                    .find(|(name, _)| name.is_some() && *name == Some(prop_id));
-                let handle = if let Some((_, prop_body)) = body {
-                    let handle = world.add_dynamic(
-                        &snap.shape,
-                        snap.position,
-                        snap.rotation_deg,
-                        crate::physics::dynamic_params(prop_body),
-                    );
-                    self.prop_bodies.push(PropPhysics {
-                        prop_index,
-                        entity: Entity::dangling(),
-                        handle,
-                        dynamic: true,
-                        pickup: snap.pickup,
-                    });
-                    handle
-                } else {
-                    let handle = world.add_fixed(
-                        &snap.shape,
-                        snap.position,
-                        snap.rotation_deg,
-                        STATIC_FRICTION,
-                    );
-                    self.prop_bodies.push(PropPhysics {
-                        prop_index,
-                        entity: Entity::dangling(),
-                        handle,
-                        dynamic: false,
-                        pickup: false,
-                    });
-                    handle
-                };
-                body_handles.insert(prop_id, handle);
-            }
-        }
+        self.build_prop_bodies(ctx, &mut world, &mut body_handles);
         tracing::debug!(
             "PhysicsSystem: {} prop bodies ({} dynamic)",
             self.prop_bodies.len(),
@@ -488,20 +412,12 @@ impl System for PhysicsSystem {
                 )
             })
             .unwrap_or(([0.0, self.floor_y, 0.0], 0.0, 0.0, [0.0; 3], false, false));
-        // Prop positions for the pickup reach test, keyed for whichever path is
-        // active: legacy by Prop-column index, decomposed by entity.
-        let prop_positions: Vec<[f32; 3]> = if self.decomposed {
-            Vec::new()
-        } else {
-            ctx.query::<Prop>().map(|p| p.position).collect()
-        };
-        let entity_positions: HashMap<Entity, [f32; 3]> = if self.decomposed {
-            ctx.query_with_entity::<Transform>()
-                .map(|(e, t)| (e, t.position))
-                .collect()
-        } else {
-            HashMap::new()
-        };
+        // Entity positions for the pickup reach test, read from the Transform
+        // column.
+        let entity_positions: HashMap<Entity, [f32; 3]> = ctx
+            .query_with_entity::<Transform>()
+            .map(|(e, t)| (e, t.position))
+            .collect();
 
         // camera-space basis vectors
         let fwd_flat = [-cam_yaw.sin(), 0.0, -cam_yaw.cos()];
@@ -513,38 +429,33 @@ impl System for PhysicsSystem {
 
         let world = self.world.as_mut().expect("world checked above");
 
-        let decomposed = self.decomposed;
-
-        // Reap bodies whose entity was despawned (decomposed path): GraphicsSystem
-        // runs before PhysicsSystem and removes the entity from the ECS, so a body
-        // left behind would keep simulating - and colliding with live bodies -
-        // invisibly. Remove it from Rapier and drop its record before the step,
-        // keeping self.held a valid index into the compacted list.
-        if decomposed {
-            let dead: Vec<BodyHandle> = self
-                .prop_bodies
-                .iter()
-                .filter(|p| !ctx.is_alive(p.entity))
-                .map(|p| p.handle)
-                .collect();
-            if !dead.is_empty() {
-                let held_entity = self
-                    .held
-                    .and_then(|i| self.prop_bodies.get(i))
-                    .map(|p| p.entity);
-                for handle in dead {
-                    world.remove_body(handle);
-                }
-                self.prop_bodies.retain(|p| ctx.is_alive(p.entity));
-                self.held =
-                    held_entity.and_then(|e| self.prop_bodies.iter().position(|p| p.entity == e));
+        // Reap bodies whose entity was despawned: GraphicsSystem runs before
+        // PhysicsSystem and removes the entity from the ECS, so a body left behind
+        // would keep simulating - and colliding with live bodies - invisibly.
+        // Remove it from Rapier and drop its record before the step, keeping
+        // self.held a valid index into the compacted list.
+        let dead: Vec<BodyHandle> = self
+            .prop_bodies
+            .iter()
+            .filter(|p| !ctx.is_alive(p.entity))
+            .map(|p| p.handle)
+            .collect();
+        if !dead.is_empty() {
+            let held_entity = self
+                .held
+                .and_then(|i| self.prop_bodies.get(i))
+                .map(|p| p.entity);
+            for handle in dead {
+                world.remove_body(handle);
             }
+            self.prop_bodies.retain(|p| ctx.is_alive(p.entity));
+            self.held =
+                held_entity.and_then(|e| self.prop_bodies.iter().position(|p| p.entity == e));
         }
 
-        // pickup / drop on the interact edge. held_changed carries both keys so
-        // the write-back can target the Prop (legacy) or the Held tag
-        // (decomposed): (prop_index, entity, is_held).
-        let mut held_changed: Option<(usize, Entity, bool)> = None;
+        // pickup / drop on the interact edge; held_changed carries the entity to
+        // toggle the Held tag on in the write-back.
+        let mut held_changed: Option<(Entity, bool)> = None;
         if interact_req {
             if let Some(held_idx) = self.held.take() {
                 // drop: hand the prop back to dynamic simulation with a throw.
@@ -555,7 +466,7 @@ impl System for PhysicsSystem {
                     fwd_full[2] * THROW_SPEED,
                 ];
                 world.make_dynamic(pp.handle, throw);
-                held_changed = Some((pp.prop_index, pp.entity, false));
+                held_changed = Some((pp.entity, false));
             } else {
                 // pickup: nearest carriable prop within reach the player faces.
                 let mut best: Option<(f32, usize)> = None;
@@ -563,14 +474,7 @@ impl System for PhysicsSystem {
                     if !pp.pickup {
                         continue;
                     }
-                    let pos = if decomposed {
-                        entity_positions.get(&pp.entity).copied().unwrap_or(cam_pos)
-                    } else {
-                        prop_positions
-                            .get(pp.prop_index)
-                            .copied()
-                            .unwrap_or(cam_pos)
-                    };
+                    let pos = entity_positions.get(&pp.entity).copied().unwrap_or(cam_pos);
                     let dx = pos[0] - cam_pos[0];
                     let dz = pos[2] - cam_pos[2];
                     let dist = (dx * dx + dz * dz).sqrt();
@@ -585,7 +489,7 @@ impl System for PhysicsSystem {
                 if let Some((_, idx)) = best {
                     let pp = &self.prop_bodies[idx];
                     world.make_kinematic(pp.handle);
-                    held_changed = Some((pp.prop_index, pp.entity, true));
+                    held_changed = Some((pp.entity, true));
                     self.held = Some(idx);
                 }
             }
@@ -639,47 +543,32 @@ impl System for PhysicsSystem {
         // advance the simulation
         world.step(dt);
 
-        // read dynamic prop transforms back out, carrying both keys
-        let prop_updates: Vec<(usize, Entity, [f32; 3], [f32; 3])> = self
+        // read dynamic prop transforms back out, keyed by entity
+        let prop_updates: Vec<(Entity, [f32; 3], [f32; 3])> = self
             .prop_bodies
             .iter()
             .filter(|p| p.dynamic)
             .map(|p| {
                 let (pos, rot) = world.body_pose(p.handle);
-                (p.prop_index, p.entity, pos, rot)
+                (p.entity, pos, rot)
             })
             .collect();
 
-        // write transforms + carried flag back: to the Transform component and
-        // Held tag when decomposed, to the Prop otherwise.
-        if decomposed {
-            for (_idx, entity, pos, rot) in prop_updates {
-                if let Some(t) = ctx.get_mut::<Transform>(entity) {
-                    t.position = pos;
-                    t.rotation_deg = rot;
-                }
+        // write the simulated pose back to each entity's Transform, and the
+        // carried flag to its Held tag.
+        for (entity, pos, rot) in prop_updates {
+            if let Some(t) = ctx.get_mut::<Transform>(entity) {
+                t.position = pos;
+                t.rotation_deg = rot;
             }
-            if let Some((_idx, entity, is_held)) = held_changed {
-                if is_held {
-                    if ctx.get::<Held>(entity).is_none() {
-                        ctx.insert(entity, Held);
-                    }
-                } else {
-                    ctx.remove::<Held>(entity);
+        }
+        if let Some((entity, is_held)) = held_changed {
+            if is_held {
+                if ctx.get::<Held>(entity).is_none() {
+                    ctx.insert(entity, Held);
                 }
-            }
-        } else {
-            let mut props: Vec<&mut Prop> = ctx.query_mut::<Prop>().collect();
-            for (idx, _entity, pos, rot) in prop_updates {
-                if let Some(prop) = props.get_mut(idx) {
-                    prop.position = pos;
-                    prop.rotation_deg = rot;
-                }
-            }
-            if let Some((idx, _entity, is_held)) = held_changed
-                && let Some(prop) = props.get_mut(idx)
-            {
-                prop.is_held = is_held;
+            } else {
+                ctx.remove::<Held>(entity);
             }
         }
 
@@ -830,7 +719,7 @@ fn lcg_hash(mut v: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::assets::CameraController;
+    use crate::assets::{CameraController, Prop};
     use crate::ecs::World;
 
     #[test]
@@ -925,7 +814,6 @@ mod tests {
 
     use crate::assets::PropCollider;
     use crate::ecs::asset_id::AssetId;
-    use crate::ecs::decompose::DecomposedRender;
 
     // A dynamic, gravity-affected ball prop above the floor.
     fn ball_prop(id: AssetId, position: [f32; 3], pickup: bool) -> Prop {
@@ -965,14 +853,13 @@ mod tests {
         }
     }
 
-    // Flag on: the simulated pose is written to the prop's Transform, and its
-    // Prop position is left untouched.
+    // The simulated pose is written to the prop's Transform; the Prop column was
+    // drained at load.
     #[test]
-    fn dynamic_prop_writes_transform_when_decomposed() {
+    fn dynamic_prop_writes_transform() {
         use std::{thread, time::Duration};
         let id = AssetId(1);
         let mut world = World::new_empty();
-        world.insert_resource(DecomposedRender(true));
         world.add_component(PhysicsConfig::default());
         world.add_component(ball_prop(id, [0.0, 5.0, 0.0], false));
         world.add_component(ball_body(id));
@@ -986,14 +873,14 @@ mod tests {
         let transform_y = world.query::<Transform>().next().unwrap().position[1];
         assert!(
             transform_y < 5.0,
-            "decomposed path falls the Transform (y={transform_y})"
+            "the simulated pose falls the Transform (y={transform_y})"
         );
-        // The decomposed default drains the Prop column, so the simulated pose
-        // can only have gone to the Transform.
+        // The Prop column is drained at load, so the pose can only have gone to
+        // the Transform.
         assert_eq!(
             world.query::<Prop>().count(),
             0,
-            "decomposed default drains the Prop column"
+            "the Prop column is drained at load"
         );
     }
 
@@ -1016,7 +903,6 @@ mod tests {
         use std::{thread, time::Duration};
         let id = AssetId(1);
         let mut world = World::new_empty();
-        world.insert_resource(DecomposedRender(true));
         world.add_component(PhysicsConfig::default());
         world.add_component(ball_prop(id, [0.0, 5.0, 0.0], false));
         world.add_component(ball_body(id));
@@ -1048,41 +934,13 @@ mod tests {
         assert_eq!(body_count(&world), after, "no further bodies removed");
     }
 
-    // Flag off: the simulated pose is written to the Prop, and the Transform
-    // shadow is left untouched.
+    // Picking up a carriable prop tags its entity with Held; the Prop column is
+    // drained, so the carried state lives only on the Held tag.
     #[test]
-    fn dynamic_prop_writes_prop_when_legacy() {
+    fn pickup_sets_held_tag() {
         use std::{thread, time::Duration};
         let id = AssetId(1);
         let mut world = World::new_empty();
-        world.insert_resource(DecomposedRender(false));
-        world.add_component(PhysicsConfig::default());
-        world.add_component(ball_prop(id, [0.0, 5.0, 0.0], false));
-        world.add_component(ball_body(id));
-        world.start().unwrap();
-
-        for _ in 0..3 {
-            thread::sleep(Duration::from_millis(20));
-            world.step();
-        }
-
-        let prop_y = world.query::<Prop>().next().unwrap().position[1];
-        let transform_y = world.query::<Transform>().next().unwrap().position[1];
-        assert!(prop_y < 5.0, "legacy path falls the Prop (y={prop_y})");
-        assert_eq!(
-            transform_y, 5.0,
-            "legacy path leaves the Transform shadow untouched"
-        );
-    }
-
-    // Flag on: picking up a carriable prop tags its entity with Held; the Prop
-    // column is drained, so the carried state lives only on the Held tag.
-    #[test]
-    fn pickup_sets_held_tag_when_decomposed() {
-        use std::{thread, time::Duration};
-        let id = AssetId(1);
-        let mut world = World::new_empty();
-        world.insert_resource(DecomposedRender(true));
         world.add_component(PhysicsConfig::default());
         world.add_component(ball_prop(id, [0.0, 1.0, -2.0], true));
         world.add_component(ball_body(id));
@@ -1100,34 +958,7 @@ mod tests {
         assert_eq!(
             world.query::<Prop>().count(),
             0,
-            "decomposed default drains the Prop column"
-        );
-    }
-
-    // Flag off: pickup sets Prop.is_held and inserts no Held tag.
-    #[test]
-    fn pickup_sets_is_held_when_legacy() {
-        use std::{thread, time::Duration};
-        let id = AssetId(1);
-        let mut world = World::new_empty();
-        world.insert_resource(DecomposedRender(false));
-        world.add_component(PhysicsConfig::default());
-        world.add_component(ball_prop(id, [0.0, 1.0, -2.0], true));
-        world.add_component(ball_body(id));
-        world.add_component(interacting_camera([0.0, 1.0, 0.0]));
-        world.start().unwrap();
-
-        thread::sleep(Duration::from_millis(5));
-        world.step();
-
-        assert!(
-            world.query::<Prop>().next().unwrap().is_held,
-            "legacy pickup sets Prop.is_held"
-        );
-        assert_eq!(
-            world.query::<Held>().count(),
-            0,
-            "legacy pickup inserts no Held tag"
+            "the Prop column is drained at load"
         );
     }
 }

@@ -1,9 +1,9 @@
 // src/gfx/graphics_system/despawn.rs
 //
-// Runtime entity despawn for the decomposed render path: remove an authored
-// placement (and its descendants) from the live world and reclaim the GPU draw
-// slots it occupied, so nothing it contributed lingers in any pass. Driven by
-// DespawnRequest events the GraphicsSystem drains each step (see frame.rs).
+// Runtime entity despawn: remove an authored placement (and its descendants)
+// from the live world and reclaim the GPU draw slots it occupied, so nothing it
+// contributed lingers in any pass. Driven by DespawnRequest events the
+// GraphicsSystem drains each step (see frame.rs).
 
 use crate::assets::{Children, RenderHandle};
 use crate::ecs::{Entity, PipelineContext};

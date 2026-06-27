@@ -2,8 +2,8 @@
 // ticking, and the backend draw call.
 
 use crate::assets::{
-    Camera3D, DespawnRequest, FrameInput, HitRegion, LabelBox, LayoutContainer, Prop,
-    ReparentRequest, SceneCommand, SettingCommand, SettingOp, Sprite, TextLabel, WindowMode,
+    Camera3D, DespawnRequest, FrameInput, HitRegion, LabelBox, LayoutContainer, ReparentRequest,
+    SceneCommand, SettingCommand, SettingOp, Sprite, TextLabel, WindowMode,
 };
 use crate::ecs::asset_id::AssetId;
 use crate::ecs::{PipelineContext, StepResult};
@@ -234,95 +234,77 @@ impl GraphicsSystem {
                     return StepResult::Stop;
                 }
 
-                // Runtime entity despawn (decomposed path only): drain
-                // DespawnRequest events, resolve each name to its entity, hide
-                // that entity's draw slots, and remove it (and its descendants)
-                // from the ECS. Done before the transform push so a despawned
-                // entity is already gone from the GlobalTransform x RenderHandle
-                // join this frame and contributes nothing to any pass.
-                if self.decomposed_render {
-                    let despawn_names: Vec<AssetId> = match ctx.events::<DespawnRequest>() {
-                        Some(events) => events
-                            .read(&mut self.despawn_cmd_cursor)
-                            .into_iter()
-                            .map(|r| r.name)
-                            .collect(),
-                        None => Vec::new(),
-                    };
-                    if !despawn_names.is_empty() {
-                        // Clone the name index out so the ctx borrow ends before
-                        // the despawns, which take &mut ctx.
-                        let by_name = ctx
-                            .resource::<crate::ecs::decompose::EntityByName>()
-                            .map(|n| n.0.clone())
-                            .unwrap_or_default();
-                        for name in despawn_names {
-                            if let Some(&entity) = by_name.get(&name) {
-                                super::despawn::despawn_subtree(ctx, backend, entity);
-                            }
+                // Runtime entity despawn: drain DespawnRequest events, resolve
+                // each name to its entity, hide that entity's draw slots, and
+                // remove it (and its descendants) from the ECS. Done before the
+                // transform push so a despawned entity is already gone from the
+                // GlobalTransform x RenderHandle join this frame and contributes
+                // nothing to any pass.
+                let despawn_names: Vec<AssetId> = match ctx.events::<DespawnRequest>() {
+                    Some(events) => events
+                        .read(&mut self.despawn_cmd_cursor)
+                        .into_iter()
+                        .map(|r| r.name)
+                        .collect(),
+                    None => Vec::new(),
+                };
+                if !despawn_names.is_empty() {
+                    // Clone the name index out so the ctx borrow ends before the
+                    // despawns, which take &mut ctx.
+                    let by_name = ctx
+                        .resource::<crate::ecs::decompose::EntityByName>()
+                        .map(|n| n.0.clone())
+                        .unwrap_or_default();
+                    for name in despawn_names {
+                        if let Some(&entity) = by_name.get(&name) {
+                            super::despawn::despawn_subtree(ctx, backend, entity);
                         }
                     }
                 }
 
-                // Runtime re-parenting (decomposed path only): drain
-                // ReparentRequest events, resolve the child + parent names to
-                // entities, and re-point the child's Parent edge (recomposing
-                // world matrices). After the despawn drain so a reparent naming a
-                // just-removed entity simply finds nothing to move.
-                if self.decomposed_render {
-                    let reparents: Vec<ReparentRequest> = match ctx.events::<ReparentRequest>() {
-                        Some(events) => events
-                            .read(&mut self.reparent_cmd_cursor)
-                            .into_iter()
-                            .copied()
-                            .collect(),
-                        None => Vec::new(),
-                    };
-                    if !reparents.is_empty() {
-                        let by_name = ctx
-                            .resource::<crate::ecs::decompose::EntityByName>()
-                            .map(|n| n.0.clone())
-                            .unwrap_or_default();
-                        for req in reparents {
-                            let Some(&child) = by_name.get(&req.child) else {
-                                continue;
-                            };
-                            let parent = req.parent.and_then(|p| by_name.get(&p).copied());
-                            // A named-but-unresolved parent skips, so a typo never
-                            // silently detaches the child to a root.
-                            if req.parent.is_some() && parent.is_none() {
-                                continue;
-                            }
-                            draw_list::reparent(ctx, child, parent);
+                // Runtime re-parenting: drain ReparentRequest events, resolve the
+                // child + parent names to entities, and re-point the child's
+                // Parent edge (recomposing world matrices). After the despawn
+                // drain so a reparent naming a just-removed entity simply finds
+                // nothing to move.
+                let reparents: Vec<ReparentRequest> = match ctx.events::<ReparentRequest>() {
+                    Some(events) => events
+                        .read(&mut self.reparent_cmd_cursor)
+                        .into_iter()
+                        .copied()
+                        .collect(),
+                    None => Vec::new(),
+                };
+                if !reparents.is_empty() {
+                    let by_name = ctx
+                        .resource::<crate::ecs::decompose::EntityByName>()
+                        .map(|n| n.0.clone())
+                        .unwrap_or_default();
+                    for req in reparents {
+                        let Some(&child) = by_name.get(&req.child) else {
+                            continue;
+                        };
+                        let parent = req.parent.and_then(|p| by_name.get(&p).copied());
+                        // A named-but-unresolved parent skips, so a typo never
+                        // silently detaches the child to a root.
+                        if req.parent.is_some() && parent.is_none() {
+                            continue;
                         }
+                        draw_list::reparent(ctx, child, parent);
                     }
                 }
 
-                // push updated model matrices for any props that were mutated
-                // since the last frame (e.g. by Camera3DSystem on interact).
-                // World matrices are resolved top-down so parent transforms
-                // propagate correctly to all children.
-                if self.decomposed_render {
-                    // Resolve each entity's GlobalTransform from Transform +
-                    // Parent, then push it to the entity's GPU draw slots.
-                    draw_list::propagate_transforms(ctx);
-                    for (_entity, global, handle) in
-                        ctx.join2::<crate::assets::GlobalTransform, crate::assets::RenderHandle>()
-                    {
-                        for &slot in &handle.draws {
-                            backend.update_model(slot as usize, global.0);
-                        }
-                    }
-                } else {
-                    let props: Vec<_> = ctx.query::<Prop>().collect();
-                    let world_mats =
-                        draw_list::compute_world_matrices(props.as_slice(), &self.prop_parents);
-                    for (prop_idx, world_mat) in world_mats.iter().enumerate() {
-                        if let Some(draw_idxs) = self.prop_draw_indices.get(prop_idx) {
-                            for &draw_idx in draw_idxs {
-                                backend.update_model(draw_idx, *world_mat);
-                            }
-                        }
+                // Push updated model matrices for any entity whose transform
+                // changed since last frame (physics, camera interact, reparent):
+                // resolve each entity's GlobalTransform from Transform + Parent
+                // (top-down so parents propagate to children), then push it to the
+                // entity's GPU draw slots.
+                draw_list::propagate_transforms(ctx);
+                for (_entity, global, handle) in
+                    ctx.join2::<crate::assets::GlobalTransform, crate::assets::RenderHandle>()
+                {
+                    for &slot in &handle.draws {
+                        backend.update_model(slot as usize, global.0);
                     }
                 }
 
@@ -344,25 +326,18 @@ impl GraphicsSystem {
                         .collect(),
                     None => Vec::new(),
                 };
-                // Source scene-jump visibility from the decomposed components when
-                // active, snapshotting once for the whole command batch.
-                let decomposed_vis = if self.decomposed_render && !scene_cmds.is_empty() {
-                    Some(super::scene::decomposed_visibility_snapshot(ctx))
+                // Source scene-jump visibility from the per-entity components,
+                // snapshotting once for the whole command batch.
+                let (draws, scenes) = if scene_cmds.is_empty() {
+                    (Vec::new(), Vec::new())
                 } else {
-                    None
+                    super::scene::decomposed_visibility_snapshot(ctx)
                 };
                 for cmd in scene_cmds {
-                    let (draws, scenes) = match &decomposed_vis {
-                        Some((d, s)) => (d.as_slice(), s.as_slice()),
-                        None => (
-                            self.prop_draw_indices.as_slice(),
-                            self.prop_scene.as_slice(),
-                        ),
-                    };
                     scene_reel::jump_to_scene(
                         &mut self.reel,
-                        draws,
-                        scenes,
+                        &draws,
+                        &scenes,
                         elapsed,
                         cmd.scene,
                         &cmd.transition,
@@ -653,22 +628,12 @@ impl GraphicsSystem {
                     }
                 }
 
-                // advance SceneReel and apply fade / visibility changes. When the
-                // decomposed path is active, source visibility from the live
-                // components; the snapshot is rebuilt each frame the reel exists.
+                // advance SceneReel and apply fade / visibility changes, sourcing
+                // visibility from the live per-entity components; the snapshot is
+                // rebuilt each frame the reel exists.
                 if self.reel.is_some() {
-                    if self.decomposed_render {
-                        let (draws, scenes) = super::scene::decomposed_visibility_snapshot(ctx);
-                        scene_reel::tick_reel(&mut self.reel, &draws, &scenes, elapsed, backend);
-                    } else {
-                        scene_reel::tick_reel(
-                            &mut self.reel,
-                            &self.prop_draw_indices,
-                            &self.prop_scene,
-                            elapsed,
-                            backend,
-                        );
-                    }
+                    let (draws, scenes) = super::scene::decomposed_visibility_snapshot(ctx);
+                    scene_reel::tick_reel(&mut self.reel, &draws, &scenes, elapsed, backend);
                 }
 
                 // Drive albedo-texture streaming: re-score every slot by

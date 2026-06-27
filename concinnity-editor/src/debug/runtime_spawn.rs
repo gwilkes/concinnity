@@ -517,8 +517,7 @@ pub(crate) fn dispatch_rebind(cmd: RuntimeCommand, world: &mut crate::ecs::World
 // draw slots, and despawns it and its descendants. Routed here (like
 // `CameraSet` / `QualitySet`) because it mutates the ECS, not the backend. The
 // reply fires once the event is queued; an unknown name is a clean error. The
-// despawn applies only on the decomposed render path (the default); under the
-// legacy opt-out the GraphicsSystem ignores the event.
+// the despawn is applied by the GraphicsSystem on its next step.
 pub(crate) fn dispatch_despawn(cmd: RuntimeCommand, world: &mut crate::ecs::World) {
     let RuntimeCommand::Despawn { name, reply } = cmd else {
         return;
@@ -543,7 +542,7 @@ pub(crate) fn dispatch_despawn(cmd: RuntimeCommand, world: &mut crate::ecs::Worl
 // reads it on its next step, resolves the names to entities, and re-points the
 // child's Parent edge. Routed here (like `Despawn`) because it mutates the ECS,
 // not the backend. The reply fires once the event is queued; an unknown name is
-// a clean error. Applies only on the decomposed render path (the default).
+// a clean error.
 pub(crate) fn dispatch_reparent(cmd: RuntimeCommand, world: &mut crate::ecs::World) {
     let RuntimeCommand::Reparent {
         child,

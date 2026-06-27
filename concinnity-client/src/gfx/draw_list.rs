@@ -94,6 +94,69 @@ fn is_dynamic_prop(prop: &Prop) -> bool {
     prop.pickup || prop.interactable || prop.parent.is_some() || prop.collider.is_some()
 }
 
+// The renderer-relevant view of one placement that build_draw_list consumes:
+// the mesh/model/material/texture refs, the cull distance, whether it is dynamic
+// (skips frustum culling), and the asset id (error logging only). Sourced from a
+// Prop (legacy) or the decomposed MeshRenderer/ModelRenderer + tag components.
+#[derive(Debug, PartialEq)]
+pub(crate) struct RenderableItem {
+    pub asset_id: AssetId,
+    pub model: Option<AssetId>,
+    pub mesh: Option<AssetId>,
+    pub material: Option<AssetId>,
+    pub texture: Option<AssetId>,
+    pub cull_distance: f32,
+    pub is_dynamic: bool,
+}
+
+impl RenderableItem {
+    pub(crate) fn from_prop(prop: &Prop) -> Self {
+        Self {
+            asset_id: prop.asset_id,
+            model: prop.model,
+            mesh: prop.mesh,
+            material: prop.material,
+            texture: prop.texture,
+            cull_distance: prop.cull_distance,
+            is_dynamic: is_dynamic_prop(prop),
+        }
+    }
+}
+
+// The decomposed-path equivalent of from_prop: read one entity's renderer
+// fields from its MeshRenderer xor ModelRenderer and its dynamic flag from the
+// Pickup / Interactable / Parent / Collider tags. asset_id is for error
+// logging only (resolved from the name index by the caller).
+pub(crate) fn decomposed_renderable_item(
+    ctx: &crate::ecs::PipelineContext,
+    entity: crate::ecs::Entity,
+    asset_id: AssetId,
+) -> RenderableItem {
+    use crate::assets::{Collider, Interactable, MeshRenderer, ModelRenderer, Parent, Pickup};
+
+    let (model, mesh, material, texture, cull_distance) =
+        if let Some(m) = ctx.get::<ModelRenderer>(entity) {
+            (Some(m.model), None, None, None, m.cull_distance)
+        } else if let Some(m) = ctx.get::<MeshRenderer>(entity) {
+            (None, m.mesh, m.material, m.texture, m.cull_distance)
+        } else {
+            (None, None, None, None, 0.0)
+        };
+    let is_dynamic = ctx.get::<Pickup>(entity).is_some()
+        || ctx.get::<Interactable>(entity).is_some()
+        || ctx.get::<Parent>(entity).is_some()
+        || ctx.get::<Collider>(entity).is_some();
+    RenderableItem {
+        asset_id,
+        model,
+        mesh,
+        material,
+        texture,
+        cull_distance,
+        is_dynamic,
+    }
+}
+
 // Column-major 4×4 matrix multiply: result = a * b; layout m[col][row].
 fn mat_mul4(a: [[f32; 4]; 4], b: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
     let mut out = [[0.0f32; 4]; 4];
@@ -149,8 +212,14 @@ pub fn compute_world_matrices(props: &[&Prop], parents: &[Option<usize>]) -> Vec
 // local matrix, children compose parent-world * local, and cyclic parents fall
 // back to their local matrix. Reads Transform and Parent, writes GlobalTransform
 // (seeded on every transform entity at init).
-pub(crate) fn propagate_transforms(ctx: &mut crate::ecs::PipelineContext) {
-    use crate::assets::{GlobalTransform, Parent, Transform};
+// Resolve each entity's world matrix from its Transform and Parent chain, the
+// entity-keyed analogue of compute_world_matrices. Returns an entity -> world
+// matrix map (cyclic entities fall back to their local matrix). Shared by the
+// per-frame propagate_transforms and the render-init draw-list build.
+pub(crate) fn resolve_world_matrices(
+    ctx: &crate::ecs::PipelineContext,
+) -> std::collections::HashMap<crate::ecs::Entity, [[f32; 4]; 4]> {
+    use crate::assets::{Parent, Transform};
     use crate::ecs::Entity;
     use std::collections::HashMap;
 
@@ -189,7 +258,13 @@ pub(crate) fn propagate_transforms(ctx: &mut crate::ecs::PipelineContext) {
     for (entity, local) in &locals {
         world.entry(*entity).or_insert(*local);
     }
+    world
+}
 
+pub(crate) fn propagate_transforms(ctx: &mut crate::ecs::PipelineContext) {
+    use crate::assets::GlobalTransform;
+
+    let world = resolve_world_matrices(ctx);
     for (entity, matrix) in world {
         if let Some(global) = ctx.get_mut::<GlobalTransform>(entity) {
             global.0 = matrix;
@@ -395,7 +470,7 @@ pub(crate) fn load_room_geometry(
 // Returns None if any referenced asset is missing (error already logged).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_draw_list(
-    props: &[&Prop],
+    items: &[RenderableItem],
     instanced_props: &[InstancedProp],
     world_mats: &[[[f32; 4]; 4]],
     model_map: &std::collections::HashMap<AssetId, Vec<SubMeshRef>>,
@@ -420,11 +495,11 @@ pub(crate) fn build_draw_list(
 
     // track explicitly referenced mesh ids so unreferenced ones get auto-rendered
     let mut referenced: std::collections::HashSet<AssetId> = std::collections::HashSet::new();
-    for prop in props {
-        if let Some(mesh_id) = prop.mesh {
+    for item in items {
+        if let Some(mesh_id) = item.mesh {
             referenced.insert(mesh_id);
         }
-        if let Some(model_id) = prop.model
+        if let Some(model_id) = item.model
             && let Some(submeshes) = model_map.get(&model_id)
         {
             for sub in submeshes {
@@ -477,18 +552,18 @@ pub(crate) fn build_draw_list(
         ))
     };
 
-    for (prop_idx, prop) in props.iter().enumerate() {
-        let model_mat = world_mats[prop_idx];
+    for (item_idx, item) in items.iter().enumerate() {
+        let model_mat = world_mats[item_idx];
         let mut prop_idxs: Vec<usize> = Vec::new();
 
-        if let Some(model_id) = prop.model {
+        if let Some(model_id) = item.model {
             // multi-mesh model path: one draw object per sub-mesh
             let submeshes = match model_map.get(&model_id) {
                 Some(s) => s,
                 None => {
                     tracing::error!(
                         "GraphicsSystem: Prop {} references unknown model {} -- add a Model asset with that id",
-                        prop.asset_id,
+                        item.asset_id,
                         model_id
                     );
                     return None;
@@ -539,7 +614,7 @@ pub(crate) fn build_draw_list(
                     None => (0, 0, MaterialUniforms::DEFAULT),
                 };
                 let (bb_min, bb_max) =
-                    if is_dynamic_prop(prop) || always_resident_meshes.contains(&sub_mesh_id) {
+                    if item.is_dynamic || always_resident_meshes.contains(&sub_mesh_id) {
                         UNCULLED_BB
                     } else {
                         crate::gfx::frustum::transform_aabb(local_min, local_max, model_mat)
@@ -565,18 +640,18 @@ pub(crate) fn build_draw_list(
                     resident: true,
                     bb_min,
                     bb_max,
-                    cull_distance: prop.cull_distance,
+                    cull_distance: item.cull_distance,
                     lod_alternates,
                 });
             }
         } else {
             // single-mesh path
-            let mesh_id = match prop.mesh {
+            let mesh_id = match item.mesh {
                 Some(m) => m,
                 None => {
                     tracing::error!(
                         "GraphicsSystem: Prop {} has neither a model nor a mesh",
-                        prop.asset_id
+                        item.asset_id
                     );
                     return None;
                 }
@@ -594,36 +669,35 @@ pub(crate) fn build_draw_list(
                 None => {
                     tracing::error!(
                         "GraphicsSystem: Prop {} references unknown mesh {} -- add a Mesh or ProceduralMesh asset with that id",
-                        prop.asset_id,
+                        item.asset_id,
                         mesh_id
                     );
                     return None;
                 }
             };
-            let (texture_slot, normal_map_slot, material) = if let Some(mat_id) = prop.material {
+            let (texture_slot, normal_map_slot, material) = if let Some(mat_id) = item.material {
                 match material_map.get(&mat_id) {
                     Some(&(slot, nms, uniforms)) => (slot, nms, uniforms),
                     None => {
                         tracing::error!(
                             "GraphicsSystem: Prop {} references unknown material {} -- add a Material asset with that id",
-                            prop.asset_id,
+                            item.asset_id,
                             mat_id
                         );
                         return None;
                     }
                 }
-            } else if let Some(tex_id) = prop.texture {
+            } else if let Some(tex_id) = item.texture {
                 let slot = *texture_name_to_slot.get(&tex_id).unwrap_or(&0);
                 (slot, 0, MaterialUniforms::DEFAULT)
             } else {
                 (0, 0, MaterialUniforms::DEFAULT)
             };
-            let (bb_min, bb_max) =
-                if is_dynamic_prop(prop) || always_resident_meshes.contains(&mesh_id) {
-                    UNCULLED_BB
-                } else {
-                    crate::gfx::frustum::transform_aabb(local_min, local_max, model_mat)
-                };
+            let (bb_min, bb_max) = if item.is_dynamic || always_resident_meshes.contains(&mesh_id) {
+                UNCULLED_BB
+            } else {
+                crate::gfx::frustum::transform_aabb(local_min, local_max, model_mat)
+            };
             prop_idxs.push(draw_objects.len());
             mesh_id_to_draws
                 .entry(mesh_id)
@@ -643,7 +717,7 @@ pub(crate) fn build_draw_list(
                 resident: true,
                 bb_min,
                 bb_max,
-                cull_distance: prop.cull_distance,
+                cull_distance: item.cull_distance,
                 lod_alternates,
             });
         }
@@ -1170,12 +1244,16 @@ mod tests {
         prop.mesh = Some(AssetId(0));
         let props_refs: Vec<&Prop> = vec![&prop];
         let world_mats = compute_world_matrices(&props_refs, &[None]);
+        let items: Vec<RenderableItem> = props_refs
+            .iter()
+            .map(|p| RenderableItem::from_prop(p))
+            .collect();
 
         let mut always_resident = std::collections::HashSet::new();
         always_resident.insert(AssetId(0));
 
         let (_v, _i, draw_objects, _c, _p, _m) = build_draw_list(
-            &props_refs,
+            &items,
             &[],
             &world_mats,
             &std::collections::HashMap::new(),
@@ -1192,5 +1270,91 @@ mod tests {
         assert!(draw_objects[0].bb_min[0].is_nan());
         assert!(draw_objects[0].bb_max[0].is_nan());
         assert!(!draw_objects[0].cullable());
+    }
+
+    // The decomposed item built from a mesh entity's components must equal the
+    // one from_prop builds from the source Prop, field for field, so the draw
+    // objects are identical.
+    #[test]
+    fn decomposed_renderable_item_matches_a_mesh_prop() {
+        use crate::assets::{Collider, MeshRenderer, Pickup, PropCollider};
+        use crate::blob::BlobData;
+        use crate::ecs::{ComponentStorage, PipelineContext, Resources};
+        use crate::gfx::profile::FrameProfile;
+
+        let mut prop = make_prop([0.0; 3]);
+        prop.asset_id = AssetId(7);
+        prop.mesh = Some(AssetId(10));
+        prop.material = Some(AssetId(20));
+        prop.cull_distance = 50.0;
+        prop.pickup = true;
+        prop.collider = Some(PropCollider::default());
+
+        let mut components = ComponentStorage::default();
+        let mut blob = BlobData::empty();
+        let mut profile = FrameProfile::default();
+        let mut resources = Resources::new();
+        let mut ctx = PipelineContext {
+            components: &mut components,
+            blob: &mut blob,
+            profile: &mut profile,
+            resources: &mut resources,
+        };
+
+        let e = ctx.components.spawn();
+        ctx.insert(
+            e,
+            MeshRenderer {
+                mesh: prop.mesh,
+                material: prop.material,
+                texture: prop.texture,
+                cull_distance: prop.cull_distance,
+            },
+        );
+        ctx.insert(e, Pickup);
+        ctx.insert(e, Collider(prop.collider.clone().unwrap()));
+
+        let item = decomposed_renderable_item(&ctx, e, prop.asset_id);
+        assert_eq!(item, RenderableItem::from_prop(&prop));
+        assert!(item.is_dynamic);
+    }
+
+    // Same for a model entity: ModelRenderer-sourced item equals from_prop, and
+    // with no dynamic tags the item is static.
+    #[test]
+    fn decomposed_renderable_item_matches_a_model_prop() {
+        use crate::assets::ModelRenderer;
+        use crate::blob::BlobData;
+        use crate::ecs::{ComponentStorage, PipelineContext, Resources};
+        use crate::gfx::profile::FrameProfile;
+
+        let mut prop = make_prop([0.0; 3]);
+        prop.asset_id = AssetId(8);
+        prop.model = Some(AssetId(100));
+        prop.cull_distance = 30.0;
+
+        let mut components = ComponentStorage::default();
+        let mut blob = BlobData::empty();
+        let mut profile = FrameProfile::default();
+        let mut resources = Resources::new();
+        let mut ctx = PipelineContext {
+            components: &mut components,
+            blob: &mut blob,
+            profile: &mut profile,
+            resources: &mut resources,
+        };
+
+        let e = ctx.components.spawn();
+        ctx.insert(
+            e,
+            ModelRenderer {
+                model: prop.model.unwrap(),
+                cull_distance: prop.cull_distance,
+            },
+        );
+
+        let item = decomposed_renderable_item(&ctx, e, prop.asset_id);
+        assert_eq!(item, RenderableItem::from_prop(&prop));
+        assert!(!item.is_dynamic);
     }
 }

@@ -1173,7 +1173,40 @@ impl GraphicsSystem {
                 .collect();
         }
 
-        let world_mats = draw_list::compute_world_matrices(props.as_slice(), &self.prop_parents);
+        // Build the draw-list inputs from either the Props (legacy) or the
+        // decomposed per-entity components: the draw objects are byte-identical,
+        // but sourcing the renderer fields from MeshRenderer/ModelRenderer and
+        // the world matrices from Transform/Parent is what lets the Prop column
+        // be drained. `items` / `world_mats` are column-aligned with
+        // `prop_entities` under the flag.
+        let (items, world_mats): (Vec<draw_list::RenderableItem>, Vec<[[f32; 4]; 4]>) =
+            if self.decomposed_render {
+                let resolved = draw_list::resolve_world_matrices(ctx);
+                let entity_name: std::collections::HashMap<crate::ecs::Entity, AssetId> = ctx
+                    .resource::<crate::ecs::decompose::EntityByName>()
+                    .map(|n| n.0.iter().map(|(&id, &e)| (e, id)).collect())
+                    .unwrap_or_default();
+                let mut items = Vec::with_capacity(prop_entities.len());
+                let mut mats = Vec::with_capacity(prop_entities.len());
+                for &entity in &prop_entities {
+                    let asset_id = entity_name.get(&entity).copied().unwrap_or_default();
+                    items.push(draw_list::decomposed_renderable_item(ctx, entity, asset_id));
+                    mats.push(
+                        resolved
+                            .get(&entity)
+                            .copied()
+                            .unwrap_or(draw_list::IDENTITY4),
+                    );
+                }
+                (items, mats)
+            } else {
+                let mats = draw_list::compute_world_matrices(props.as_slice(), &self.prop_parents);
+                let items = props
+                    .iter()
+                    .map(|p| draw_list::RenderableItem::from_prop(p))
+                    .collect();
+                (items, mats)
+            };
 
         let (
             all_vertices,
@@ -1183,7 +1216,7 @@ impl GraphicsSystem {
             prop_draw_indices,
             mesh_id_to_draws,
         ) = match draw_list::build_draw_list(
-            &props,
+            &items,
             &instanced_props,
             &world_mats,
             &model_map,
@@ -1202,8 +1235,8 @@ impl GraphicsSystem {
         self.prop_draw_indices = prop_draw_indices;
 
         // Decomposed render path: give each prop entity a RenderHandle (its GPU
-        // draw slots) and a GlobalTransform (seeded to its init world matrix), so
-        // the per-frame push reads these instead of the positional side-tables.
+        // draw slots) and a GlobalTransform (its init world matrix), so the
+        // per-frame push reads these instead of the positional side-tables.
         // prop_entities is column-aligned with prop_draw_indices and world_mats.
         if self.decomposed_render {
             for (i, &entity) in prop_entities.iter().enumerate() {

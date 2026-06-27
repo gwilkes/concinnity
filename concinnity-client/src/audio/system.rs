@@ -6,9 +6,10 @@
 
 use std::collections::HashMap;
 
-use crate::assets::{AudioClip, AudioCommand, AudioEmitter, Camera3D, Prop};
+use crate::assets::{AudioClip, AudioCommand, AudioEmitter, Camera3D, Transform};
 use crate::audio::{AudioEngine, EmitterId};
 use crate::ecs::asset_id::AssetId;
+use crate::ecs::decompose::EntityByName;
 use crate::ecs::{PipelineContext, StepResult, System};
 
 // 3D positional audio behavior. Constructed internally by `World::start` when
@@ -18,6 +19,8 @@ pub struct AudioSystem {
     engine: AudioEngine,
     // One entry per `AudioEmitter` that became a live engine emitter.
     emitters: Vec<EmitterBinding>,
+    // Cursor into the Events<AudioCommand> queue (live master-volume changes).
+    audio_cmd_cursor: crate::ecs::EventCursor,
 }
 
 // Links one engine emitter to the world data that positions it.
@@ -43,6 +46,7 @@ impl AudioSystem {
         Self {
             engine: AudioEngine::new(),
             emitters: Vec::new(),
+            audio_cmd_cursor: crate::ecs::EventCursor::default(),
         }
     }
 }
@@ -102,11 +106,12 @@ impl System for AudioSystem {
     }
 
     fn step(&mut self, ctx: &mut PipelineContext) -> StepResult {
-        // Apply any live master-volume change pushed this tick by GraphicsSystem,
-        // which runs first. Drained so the signals do not accumulate; the last
-        // one this tick wins.
-        for cmd in ctx.drain::<AudioCommand>() {
-            self.engine.set_master_volume(cmd.master_volume);
+        // Apply any live master-volume change sent this tick by GraphicsSystem,
+        // which runs first. The last one this tick wins.
+        if let Some(events) = ctx.events::<AudioCommand>() {
+            for cmd in events.read(&mut self.audio_cmd_cursor) {
+                self.engine.set_master_volume(cmd.master_volume);
+            }
         }
 
         // The listener rides the camera.
@@ -118,17 +123,16 @@ impl System for AudioSystem {
             self.engine.set_listener(pos, yaw, pitch);
         }
 
-        // Prop-bound emitters track their Prop's current position.
+        // Prop-bound emitters track their followed prop's current position, read
+        // from its Transform via the name index.
         if self.emitters.iter().any(|b| b.follows.is_some()) {
-            let prop_positions: HashMap<AssetId, [f32; 3]> = ctx
-                .query::<Prop>()
-                .map(|p| (p.asset_id, p.position))
-                .collect();
             for binding in &self.emitters {
                 if let Some(prop_id) = binding.follows
-                    && let Some(&pos) = prop_positions.get(&prop_id)
+                    && let Some(entity) =
+                        ctx.resource::<EntityByName>().and_then(|n| n.get(prop_id))
+                    && let Some(t) = ctx.get::<Transform>(entity)
                 {
-                    self.engine.set_emitter_position(binding.id, pos);
+                    self.engine.set_emitter_position(binding.id, t.position);
                 }
             }
         }
@@ -176,10 +180,9 @@ mod tests {
             .expect("world has an AudioSystem")
     }
 
-    // A master-volume AudioCommand pushed mid-tick is drained AND applied by the
+    // A master-volume AudioCommand sent mid-tick is read AND applied by the
     // audio system the same tick, so the new master takes effect without a
-    // restart (the settings-menu master-volume row). It is also drained, so it
-    // does not accumulate frame to frame.
+    // restart (the settings-menu master-volume row).
     #[test]
     fn audio_command_applies_master_volume_live() {
         use crate::assets::AudioCommand;
@@ -190,21 +193,21 @@ mod tests {
         // Init applied the persisted master (unity by default in a test).
         assert!((applied_master_volume(&world) - 1.0).abs() < 1.0e-6);
 
-        // GraphicsSystem would push this when the master-volume row is cycled;
-        // the audio system drains it this same tick.
-        world.add_component(AudioCommand { master_volume: 0.5 });
+        // GraphicsSystem would send this when the master-volume row is cycled;
+        // the audio system reads it this same tick.
+        world
+            .events_mut::<AudioCommand>()
+            .send(AudioCommand { master_volume: 0.5 });
         world.step();
 
         assert!(
             (applied_master_volume(&world) - 0.5).abs() < 1.0e-6,
             "master volume should be applied live this tick"
         );
-        // Drained, not piled up.
-        assert!(world.query::<AudioCommand>().next().is_none());
     }
 
-    // Several AudioCommands queued in one tick (e.g. a rapid double-cycle) are
-    // all drained; the last one pushed is applied last and wins.
+    // Several AudioCommands sent in one tick (e.g. a rapid double-cycle) are
+    // all read in order; the last one sent is applied last and wins.
     #[test]
     fn audio_command_last_write_wins_per_tick() {
         use crate::assets::AudioCommand;
@@ -213,13 +216,14 @@ mod tests {
         world.add_component(AudioEmitter::default());
         world.start().unwrap();
 
-        world.add_component(AudioCommand { master_volume: 0.5 });
-        world.add_component(AudioCommand {
+        world
+            .events_mut::<AudioCommand>()
+            .send(AudioCommand { master_volume: 0.5 });
+        world.events_mut::<AudioCommand>().send(AudioCommand {
             master_volume: 0.25,
         });
         world.step();
 
         assert!((applied_master_volume(&world) - 0.25).abs() < 1.0e-6);
-        assert!(world.query::<AudioCommand>().next().is_none());
     }
 }

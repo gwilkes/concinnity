@@ -69,6 +69,7 @@ impl RenderBackend for DxContext {
         fn draw_frame(&mut self, elapsed: f32, fov_y_radians: f32, near: f32, far: f32, cam_pos: [f32; 3], text_calls: &[TextDrawCall]) -> Result<(), String>;
         fn update_view(&mut self, matrix: [[f32; 4]; 4]);
         fn update_model(&mut self, index: usize, model: [[f32; 4]; 4]);
+        fn retire_draw_object(&mut self, draw_idx: usize);
         fn update_skinned_pose(&mut self, skinned_index: usize, matrices: &[[[f32; 4]; 4]]);
         fn evict_texture_slot(&mut self, slot: usize) -> Result<(), String>;
         fn update_texture_slot(&mut self, slot: usize, w: u32, h: u32, px: &[u8]) -> Result<(), String>;

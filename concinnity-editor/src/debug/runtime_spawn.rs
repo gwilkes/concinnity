@@ -286,6 +286,24 @@ pub(crate) enum RuntimeCommand {
         key: crate::assets::Key,
         reply: std::sync::mpsc::SyncSender<Result<(), String>>,
     },
+    // Despawn an authored placement (and its descendants) by name. ECS-side: it
+    // sends a `DespawnRequest` event the GraphicsSystem drains on its next step
+    // (resolving the name to its entity, hiding the draw slots, removing the
+    // entity), so the per-frame drive routes it to `dispatch_despawn` once the
+    // `systems_mut` borrow ends, like `CameraSet` / `QualitySet`.
+    Despawn {
+        name: String,
+        reply: std::sync::mpsc::SyncSender<Result<(), String>>,
+    },
+    // Re-parent an authored placement by name (parent `None` detaches it to a
+    // root). ECS-side like `Despawn`: it sends a `ReparentRequest` event the
+    // GraphicsSystem drains on its next step, so the per-frame drive routes it to
+    // `dispatch_reparent` once the `systems_mut` borrow ends.
+    Reparent {
+        child: String,
+        parent: Option<String>,
+        reply: std::sync::mpsc::SyncSender<Result<(), String>>,
+    },
 }
 
 static QUEUE: Mutex<Vec<RuntimeCommand>> = Mutex::new(Vec::new());
@@ -425,6 +443,14 @@ pub(crate) fn dispatch_runtime_spawn(
             // ECS-side like QualitySet; routed to `dispatch_rebind`.
             let _ = reply.send(Err("rebind: misrouted to backend dispatch".to_string()));
         }
+        RuntimeCommand::Despawn { reply, .. } => {
+            // ECS-side like CameraSet; routed to `dispatch_despawn`.
+            let _ = reply.send(Err("despawn: misrouted to backend dispatch".to_string()));
+        }
+        RuntimeCommand::Reparent { reply, .. } => {
+            // ECS-side like CameraSet; routed to `dispatch_reparent`.
+            let _ = reply.send(Err("reparent: misrouted to backend dispatch".to_string()));
+        }
     }
 }
 
@@ -439,9 +465,9 @@ pub(crate) fn dispatch_camera_set(cmd: RuntimeCommand, world: &mut crate::ecs::W
     let _ = reply.send(apply_camera_set(&args, world));
 }
 
-// Apply a drained `QualitySet` command by pushing a `SettingCommand` into the
+// Apply a drained `QualitySet` command by sending a `SettingCommand` into the
 // ECS, exactly as `UiInputSystem` does for a settings-menu toggle. The
-// `GraphicsSystem` drains it on its next step and applies the change live
+// `GraphicsSystem` reads it on its next step and applies the change live
 // (`apply_quality_settings`), so this exercises the real toggle path rather
 // than a duplicate. Routed here (like `CameraSet`) because it mutates the ECS,
 // not the backend. `cn debug` only.
@@ -449,18 +475,20 @@ pub(crate) fn dispatch_quality_set(cmd: RuntimeCommand, world: &mut crate::ecs::
     let RuntimeCommand::QualitySet { setting, op, reply } = cmd else {
         return;
     };
-    world.push(crate::assets::SettingCommand {
-        setting,
-        op,
-        value_label: None,
-        persist: true,
-    });
+    world
+        .events_mut::<crate::assets::SettingCommand>()
+        .send(crate::assets::SettingCommand {
+            setting,
+            op,
+            value_label: None,
+            persist: true,
+        });
     let _ = reply.send(Ok(()));
 }
 
-// Apply a drained `Rebind` command by pushing a `Rebind` `SettingCommand` into
+// Apply a drained `Rebind` command by sending a `Rebind` `SettingCommand` into
 // the ECS, exactly as `UiInputSystem` does after a capture. `GraphicsSystem`
-// drains it on its next step and applies the rebind live (swap + `set_keymap` +
+// reads it on its next step and applies the rebind live (swap + `set_keymap` +
 // persist + label refresh via its registry, which is why `value_label` is left
 // `None` here). Routed here (like `QualitySet`) because it mutates the ECS.
 pub(crate) fn dispatch_rebind(cmd: RuntimeCommand, world: &mut crate::ecs::World) {
@@ -472,12 +500,85 @@ pub(crate) fn dispatch_rebind(cmd: RuntimeCommand, world: &mut crate::ecs::World
     else {
         return;
     };
-    world.push(crate::assets::SettingCommand {
-        setting,
-        op: crate::assets::SettingOp::Rebind(key),
-        value_label: None,
-        persist: true,
-    });
+    world
+        .events_mut::<crate::assets::SettingCommand>()
+        .send(crate::assets::SettingCommand {
+            setting,
+            op: crate::assets::SettingOp::Rebind(key),
+            value_label: None,
+            persist: true,
+        });
+    let _ = reply.send(Ok(()));
+}
+
+// Apply a drained `Despawn` command by resolving the placement name to its
+// AssetId and sending a `DespawnRequest` event into the ECS. GraphicsSystem
+// reads it on its next step, resolves the name to its entity, hides the entity's
+// draw slots, and despawns it and its descendants. Routed here (like
+// `CameraSet` / `QualitySet`) because it mutates the ECS, not the backend. The
+// reply fires once the event is queued; an unknown name is a clean error. The
+// the despawn is applied by the GraphicsSystem on its next step.
+pub(crate) fn dispatch_despawn(cmd: RuntimeCommand, world: &mut crate::ecs::World) {
+    let RuntimeCommand::Despawn { name, reply } = cmd else {
+        return;
+    };
+    let table = crate::ecs::asset_id::name_table();
+    let Some(id) = table
+        .iter()
+        .position(|n| n == &name)
+        .map(|i| crate::ecs::asset_id::AssetId(i as u32))
+    else {
+        let _ = reply.send(Err(format!("despawn: name '{name}' not found")));
+        return;
+    };
+    world
+        .events_mut::<crate::assets::DespawnRequest>()
+        .send(crate::assets::DespawnRequest { name: id });
+    let _ = reply.send(Ok(()));
+}
+
+// Apply a drained `Reparent` command by resolving the child + parent names to
+// AssetIds and sending a `ReparentRequest` event into the ECS. GraphicsSystem
+// reads it on its next step, resolves the names to entities, and re-points the
+// child's Parent edge. Routed here (like `Despawn`) because it mutates the ECS,
+// not the backend. The reply fires once the event is queued; an unknown name is
+// a clean error.
+pub(crate) fn dispatch_reparent(cmd: RuntimeCommand, world: &mut crate::ecs::World) {
+    let RuntimeCommand::Reparent {
+        child,
+        parent,
+        reply,
+    } = cmd
+    else {
+        return;
+    };
+    let table = crate::ecs::asset_id::name_table();
+    let resolve = |name: &str| {
+        table
+            .iter()
+            .position(|n| n == name)
+            .map(|i| crate::ecs::asset_id::AssetId(i as u32))
+    };
+    let Some(child_id) = resolve(&child) else {
+        let _ = reply.send(Err(format!("reparent: child '{child}' not found")));
+        return;
+    };
+    let parent_id = match &parent {
+        Some(p) => match resolve(p) {
+            Some(id) => Some(id),
+            None => {
+                let _ = reply.send(Err(format!("reparent: parent '{p}' not found")));
+                return;
+            }
+        },
+        None => None,
+    };
+    world
+        .events_mut::<crate::assets::ReparentRequest>()
+        .send(crate::assets::ReparentRequest {
+            child: child_id,
+            parent: parent_id,
+        });
     let _ = reply.send(Ok(()));
 }
 
@@ -584,6 +685,44 @@ mod tests {
             _ => panic!("wrong variant"),
         }
         // Second drain is empty.
+        assert!(drain().is_empty());
+    }
+
+    #[test]
+    fn despawn_enqueue_drain_round_trip() {
+        let _ = drain();
+        let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+        enqueue(RuntimeCommand::Despawn {
+            name: "crate_a".to_string(),
+            reply: tx,
+        });
+        let cmds = drain();
+        assert_eq!(cmds.len(), 1);
+        match cmds.into_iter().next().unwrap() {
+            RuntimeCommand::Despawn { name, .. } => assert_eq!(name, "crate_a"),
+            _ => panic!("wrong variant"),
+        }
+        assert!(drain().is_empty());
+    }
+
+    #[test]
+    fn reparent_enqueue_drain_round_trip() {
+        let _ = drain();
+        let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+        enqueue(RuntimeCommand::Reparent {
+            child: "box_a".to_string(),
+            parent: Some("frame".to_string()),
+            reply: tx,
+        });
+        let cmds = drain();
+        assert_eq!(cmds.len(), 1);
+        match cmds.into_iter().next().unwrap() {
+            RuntimeCommand::Reparent { child, parent, .. } => {
+                assert_eq!(child, "box_a");
+                assert_eq!(parent.as_deref(), Some("frame"));
+            }
+            _ => panic!("wrong variant"),
+        }
         assert!(drain().is_empty());
     }
 

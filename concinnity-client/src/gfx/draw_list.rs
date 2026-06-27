@@ -4,7 +4,7 @@
 // None of these functions hold or borrow a backend handle.
 
 use crate::assets::{
-    File, FileKind, InstancedProp, Mesh, ProceduralMesh, Prop, Room, SubMeshRef, VoxelChunk,
+    File, FileKind, InstancedProp, Mesh, ProceduralMesh, Room, SubMeshRef, VoxelChunk,
 };
 use crate::ecs::PipelineContext;
 use crate::ecs::asset_id::AssetId;
@@ -80,18 +80,59 @@ fn local_bounds(verts: &[Vertex]) -> ([f32; 3], [f32; 3]) {
     (mn, mx)
 }
 
-// Props whose transform can change at runtime are pulled out of the BVH and
-// always drawn (after a per-object frustum test). The BVH is built once at
-// init and does not refit, so anything that moves would otherwise risk being
-// culled incorrectly: its model matrix updates but its init-time AABB
-// remains, so the wrong region of space is tested against the frustum.
-// `pickup` and `interactable` move via Camera3DSystem; `parent.is_some()` may
-// inherit a parent transform that changes; `collider.is_some()` rides a
-// PhysicsSystem rigid body that may translate / rotate every step (and even
-// a "static" collider is cheap to mark dynamic; the per-object frustum test
-// is O(1) and the BVH would not have refit it either way).
-fn is_dynamic_prop(prop: &Prop) -> bool {
-    prop.pickup || prop.interactable || prop.parent.is_some() || prop.collider.is_some()
+// The renderer-relevant view of one placement that build_draw_list consumes:
+// the mesh/model/material/texture refs, the cull distance, whether it is dynamic
+// (skips frustum culling), and the asset id (error logging only). Built from an
+// entity's MeshRenderer/ModelRenderer + tag components by
+// `decomposed_renderable_item`.
+//
+// An entity is dynamic (pulled out of the BVH and always drawn after a per-object
+// frustum test) when it carries a Pickup, Interactable, Parent, or Collider tag.
+// The BVH is built once at init and does not refit, so a moving entity would
+// otherwise risk being culled against its stale init-time AABB.
+#[derive(Debug, PartialEq)]
+pub(crate) struct RenderableItem {
+    pub asset_id: AssetId,
+    pub model: Option<AssetId>,
+    pub mesh: Option<AssetId>,
+    pub material: Option<AssetId>,
+    pub texture: Option<AssetId>,
+    pub cull_distance: f32,
+    pub is_dynamic: bool,
+}
+
+// Build one entity's RenderableItem: read its renderer fields from its
+// MeshRenderer xor ModelRenderer and its dynamic flag from the Pickup /
+// Interactable / Parent / Collider tags. asset_id is for error logging only
+// (resolved from the name index by the caller).
+pub(crate) fn decomposed_renderable_item(
+    ctx: &crate::ecs::PipelineContext,
+    entity: crate::ecs::Entity,
+    asset_id: AssetId,
+) -> RenderableItem {
+    use crate::assets::{Collider, Interactable, MeshRenderer, ModelRenderer, Parent, Pickup};
+
+    let (model, mesh, material, texture, cull_distance) =
+        if let Some(m) = ctx.get::<ModelRenderer>(entity) {
+            (Some(m.model), None, None, None, m.cull_distance)
+        } else if let Some(m) = ctx.get::<MeshRenderer>(entity) {
+            (None, m.mesh, m.material, m.texture, m.cull_distance)
+        } else {
+            (None, None, None, None, 0.0)
+        };
+    let is_dynamic = ctx.get::<Pickup>(entity).is_some()
+        || ctx.get::<Interactable>(entity).is_some()
+        || ctx.get::<Parent>(entity).is_some()
+        || ctx.get::<Collider>(entity).is_some();
+    RenderableItem {
+        asset_id,
+        model,
+        mesh,
+        material,
+        texture,
+        cull_distance,
+        is_dynamic,
+    }
 }
 
 // Column-major 4×4 matrix multiply: result = a * b; layout m[col][row].
@@ -107,41 +148,102 @@ fn mat_mul4(a: [[f32; 4]; 4], b: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
     out
 }
 
-// Resolve world matrices for a flat list of Props that may form a parent-child
-// hierarchy. `parents[i]` is the index of prop i's parent, or None for roots.
-//
-// Iterates until all props are resolved or no further progress is possible
-// (which indicates a cycle; cyclic props fall back to their local matrix).
-pub fn compute_world_matrices(props: &[&Prop], parents: &[Option<usize>]) -> Vec<[[f32; 4]; 4]> {
-    let n = props.len();
-    let mut world: Vec<Option<[[f32; 4]; 4]>> = vec![None; n];
+// Resolve each entity's world matrix from its Transform and Parent chain: roots
+// use their local matrix, children compose parent-world * local, and cyclic
+// parents fall back to their local matrix. Returns an entity -> world matrix map.
+// Shared by the per-frame propagate_transforms and the render-init draw-list
+// build.
+pub(crate) fn resolve_world_matrices(
+    ctx: &crate::ecs::PipelineContext,
+) -> std::collections::HashMap<crate::ecs::Entity, [[f32; 4]; 4]> {
+    use crate::assets::{Parent, Transform};
+    use crate::ecs::Entity;
+    use std::collections::HashMap;
 
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for i in 0..n {
-            if world[i].is_some() {
+    let parents: HashMap<Entity, Entity> = ctx
+        .query_with_entity::<Parent>()
+        .map(|(entity, parent)| (entity, parent.0))
+        .collect();
+    let locals: Vec<(Entity, [[f32; 4]; 4])> = ctx
+        .query_with_entity::<Transform>()
+        .map(|(entity, transform)| (entity, transform.model_matrix()))
+        .collect();
+
+    // Fixed-point resolution: keep a pass running while any entity newly
+    // resolves; stop on a pass with no progress (a cycle) or once all are done.
+    let mut world: HashMap<Entity, [[f32; 4]; 4]> = HashMap::with_capacity(locals.len());
+    loop {
+        let mut progressed = false;
+        for (entity, local) in &locals {
+            if world.contains_key(entity) {
                 continue;
             }
-            let local = props[i].model_matrix();
-            let w = match parents.get(i).copied().flatten() {
-                None => local,
-                Some(pi) => match world.get(pi).copied().flatten() {
-                    Some(pw) => mat_mul4(pw, local),
-                    None => continue, // parent not yet resolved
-                },
+            let resolved = match parents.get(entity) {
+                None => Some(*local),
+                Some(parent) => world.get(parent).map(|pw| mat_mul4(*pw, *local)),
             };
-            world[i] = Some(w);
-            changed = true;
+            if let Some(matrix) = resolved {
+                world.insert(*entity, matrix);
+                progressed = true;
+            }
+        }
+        if !progressed || world.len() == locals.len() {
+            break;
+        }
+    }
+    // Cyclic entities fall back to their local matrix.
+    for (entity, local) in &locals {
+        world.entry(*entity).or_insert(*local);
+    }
+    world
+}
+
+pub(crate) fn propagate_transforms(ctx: &mut crate::ecs::PipelineContext) {
+    use crate::assets::GlobalTransform;
+
+    let world = resolve_world_matrices(ctx);
+    for (entity, matrix) in world {
+        if let Some(global) = ctx.get_mut::<GlobalTransform>(entity) {
+            global.0 = matrix;
+        }
+    }
+}
+
+// Re-parent an entity at runtime: detach it from its current parent (if any),
+// attach it under `new_parent` (or leave it a root when `None`), keep both
+// parents' Children lists in sync, and recompose world matrices so the new
+// chain shows up immediately. Entity-keyed throughout, so it is invariant to
+// component-column order. Driven by ReparentRequest events the GraphicsSystem
+// drains each step.
+pub(crate) fn reparent(
+    ctx: &mut crate::ecs::PipelineContext,
+    child: crate::ecs::Entity,
+    new_parent: Option<crate::ecs::Entity>,
+) {
+    use crate::assets::{Children, Parent};
+
+    // Drop the old parent edge and unlist the child from that parent.
+    if let Some(old) = ctx.remove::<Parent>(child)
+        && let Some(siblings) = ctx.get_mut::<Children>(old.0)
+    {
+        siblings.0.retain(|&e| e != child);
+    }
+
+    // Attach under the new parent (None leaves it a root). The Parent column is
+    // free of `child` here (just removed), so the insert never duplicates.
+    if let Some(parent) = new_parent {
+        ctx.insert(child, Parent(parent));
+        match ctx.get_mut::<Children>(parent) {
+            Some(kids) => {
+                if !kids.0.contains(&child) {
+                    kids.0.push(child);
+                }
+            }
+            None => ctx.insert(parent, Children(vec![child])),
         }
     }
 
-    // Any unresolved props (from cycles) fall back to their local matrix.
-    world
-        .into_iter()
-        .enumerate()
-        .map(|(i, w)| w.unwrap_or_else(|| props[i].model_matrix()))
-        .collect()
+    propagate_transforms(ctx);
 }
 
 // Decoded mesh geometry plus its optional LOD trailer. Returned by
@@ -342,7 +444,7 @@ pub(crate) fn load_room_geometry(
 // Returns None if any referenced asset is missing (error already logged).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_draw_list(
-    props: &[&Prop],
+    items: &[RenderableItem],
     instanced_props: &[InstancedProp],
     world_mats: &[[[f32; 4]; 4]],
     model_map: &std::collections::HashMap<AssetId, Vec<SubMeshRef>>,
@@ -367,11 +469,11 @@ pub(crate) fn build_draw_list(
 
     // track explicitly referenced mesh ids so unreferenced ones get auto-rendered
     let mut referenced: std::collections::HashSet<AssetId> = std::collections::HashSet::new();
-    for prop in props {
-        if let Some(mesh_id) = prop.mesh {
+    for item in items {
+        if let Some(mesh_id) = item.mesh {
             referenced.insert(mesh_id);
         }
-        if let Some(model_id) = prop.model
+        if let Some(model_id) = item.model
             && let Some(submeshes) = model_map.get(&model_id)
         {
             for sub in submeshes {
@@ -424,18 +526,18 @@ pub(crate) fn build_draw_list(
         ))
     };
 
-    for (prop_idx, prop) in props.iter().enumerate() {
-        let model_mat = world_mats[prop_idx];
+    for (item_idx, item) in items.iter().enumerate() {
+        let model_mat = world_mats[item_idx];
         let mut prop_idxs: Vec<usize> = Vec::new();
 
-        if let Some(model_id) = prop.model {
+        if let Some(model_id) = item.model {
             // multi-mesh model path: one draw object per sub-mesh
             let submeshes = match model_map.get(&model_id) {
                 Some(s) => s,
                 None => {
                     tracing::error!(
                         "GraphicsSystem: Prop {} references unknown model {} -- add a Model asset with that id",
-                        prop.asset_id,
+                        item.asset_id,
                         model_id
                     );
                     return None;
@@ -486,7 +588,7 @@ pub(crate) fn build_draw_list(
                     None => (0, 0, MaterialUniforms::DEFAULT),
                 };
                 let (bb_min, bb_max) =
-                    if is_dynamic_prop(prop) || always_resident_meshes.contains(&sub_mesh_id) {
+                    if item.is_dynamic || always_resident_meshes.contains(&sub_mesh_id) {
                         UNCULLED_BB
                     } else {
                         crate::gfx::frustum::transform_aabb(local_min, local_max, model_mat)
@@ -512,18 +614,18 @@ pub(crate) fn build_draw_list(
                     resident: true,
                     bb_min,
                     bb_max,
-                    cull_distance: prop.cull_distance,
+                    cull_distance: item.cull_distance,
                     lod_alternates,
                 });
             }
         } else {
             // single-mesh path
-            let mesh_id = match prop.mesh {
+            let mesh_id = match item.mesh {
                 Some(m) => m,
                 None => {
                     tracing::error!(
                         "GraphicsSystem: Prop {} has neither a model nor a mesh",
-                        prop.asset_id
+                        item.asset_id
                     );
                     return None;
                 }
@@ -541,36 +643,35 @@ pub(crate) fn build_draw_list(
                 None => {
                     tracing::error!(
                         "GraphicsSystem: Prop {} references unknown mesh {} -- add a Mesh or ProceduralMesh asset with that id",
-                        prop.asset_id,
+                        item.asset_id,
                         mesh_id
                     );
                     return None;
                 }
             };
-            let (texture_slot, normal_map_slot, material) = if let Some(mat_id) = prop.material {
+            let (texture_slot, normal_map_slot, material) = if let Some(mat_id) = item.material {
                 match material_map.get(&mat_id) {
                     Some(&(slot, nms, uniforms)) => (slot, nms, uniforms),
                     None => {
                         tracing::error!(
                             "GraphicsSystem: Prop {} references unknown material {} -- add a Material asset with that id",
-                            prop.asset_id,
+                            item.asset_id,
                             mat_id
                         );
                         return None;
                     }
                 }
-            } else if let Some(tex_id) = prop.texture {
+            } else if let Some(tex_id) = item.texture {
                 let slot = *texture_name_to_slot.get(&tex_id).unwrap_or(&0);
                 (slot, 0, MaterialUniforms::DEFAULT)
             } else {
                 (0, 0, MaterialUniforms::DEFAULT)
             };
-            let (bb_min, bb_max) =
-                if is_dynamic_prop(prop) || always_resident_meshes.contains(&mesh_id) {
-                    UNCULLED_BB
-                } else {
-                    crate::gfx::frustum::transform_aabb(local_min, local_max, model_mat)
-                };
+            let (bb_min, bb_max) = if item.is_dynamic || always_resident_meshes.contains(&mesh_id) {
+                UNCULLED_BB
+            } else {
+                crate::gfx::frustum::transform_aabb(local_min, local_max, model_mat)
+            };
             prop_idxs.push(draw_objects.len());
             mesh_id_to_draws
                 .entry(mesh_id)
@@ -590,7 +691,7 @@ pub(crate) fn build_draw_list(
                 resident: true,
                 bb_min,
                 bb_max,
-                cull_distance: prop.cull_distance,
+                cull_distance: item.cull_distance,
                 lod_alternates,
             });
         }
@@ -810,35 +911,133 @@ mod tests {
         }
     }
 
+    // propagate_transforms composes each entity's GlobalTransform from its parent
+    // chain: a root's world matrix is its local, a child's is parent_world * local.
     #[test]
-    fn is_dynamic_prop_flags_collider_bearing_props() {
-        // A plain static prop stays in the BVH.
-        let plain = make_prop([0.0; 3]);
-        assert!(!is_dynamic_prop(&plain));
+    fn propagate_transforms_composes_parent_then_child() {
+        use crate::assets::{GlobalTransform, Parent, Transform};
+        use crate::blob::BlobData;
+        use crate::ecs::{ComponentStorage, PipelineContext, Resources};
+        use crate::gfx::profile::FrameProfile;
 
-        // A prop with a collider rides a physics body that may translate /
-        // rotate every step; the init-time BVH AABB would stale out, so it
-        // must opt out of the BVH and pay the per-frame frustum test instead.
-        // Reproduces the "physics ball disappears when the camera gets close"
-        // bug: the ball rolled past its init AABB, so the BVH culled it even
-        // when it was right in front of the camera.
-        let mut with_collider = make_prop([0.0; 3]);
-        with_collider.collider = Some(crate::assets::PropCollider::default());
-        assert!(is_dynamic_prop(&with_collider));
+        let parent_t = Transform {
+            position: [1.0, 2.0, 3.0],
+            rotation_deg: [0.0, 30.0, 0.0],
+            scale: [1.0, 1.0, 1.0],
+        };
+        let child_t = Transform {
+            position: [0.0, 0.0, 1.0],
+            rotation_deg: [10.0, 0.0, 5.0],
+            scale: [2.0, 2.0, 2.0],
+        };
 
-        // The pre-existing dynamic flags (pickup / interactable / parent)
-        // still mark a prop dynamic on their own.
-        let mut pickup = make_prop([0.0; 3]);
-        pickup.pickup = true;
-        assert!(is_dynamic_prop(&pickup));
+        let mut components = ComponentStorage::default();
+        let mut blob = BlobData::empty();
+        let mut profile = FrameProfile::default();
+        let mut resources = Resources::new();
+        let mut ctx = PipelineContext {
+            components: &mut components,
+            blob: &mut blob,
+            profile: &mut profile,
+            resources: &mut resources,
+        };
 
-        let mut interactable = make_prop([0.0; 3]);
-        interactable.interactable = true;
-        assert!(is_dynamic_prop(&interactable));
+        // A child parented to a root, each with its own GlobalTransform to write.
+        let parent_e = ctx.components.spawn();
+        ctx.insert(parent_e, parent_t);
+        ctx.insert(parent_e, GlobalTransform::default());
+        let child_e = ctx.components.spawn();
+        ctx.insert(child_e, child_t);
+        ctx.insert(child_e, Parent(parent_e));
+        ctx.insert(child_e, GlobalTransform::default());
 
-        let mut parented = make_prop([0.0; 3]);
-        parented.parent = Some(AssetId(1));
-        assert!(is_dynamic_prop(&parented));
+        propagate_transforms(&mut ctx);
+
+        let parent_g = ctx.components.get::<GlobalTransform>(parent_e).unwrap().0;
+        let child_g = ctx.components.get::<GlobalTransform>(child_e).unwrap().0;
+        assert_eq!(parent_g, parent_t.model_matrix(), "root world = local");
+        assert_eq!(
+            child_g,
+            mat_mul4(parent_t.model_matrix(), child_t.model_matrix()),
+            "child world = parent_world * local"
+        );
+    }
+
+    #[test]
+    fn reparent_recomposes_child_world_matrix_and_relists() {
+        use crate::assets::{Children, GlobalTransform, Parent, Transform};
+        use crate::blob::BlobData;
+        use crate::ecs::{ComponentStorage, PipelineContext, Resources};
+        use crate::gfx::profile::FrameProfile;
+
+        let translate = |x: f32| Transform {
+            position: [x, 0.0, 0.0],
+            rotation_deg: [0.0; 3],
+            scale: [1.0; 3],
+        };
+        let (a_t, b_t, child_t) = (translate(10.0), translate(-5.0), translate(1.0));
+
+        let mut components = ComponentStorage::default();
+        let mut blob = BlobData::empty();
+        let mut profile = FrameProfile::default();
+        let mut resources = Resources::new();
+        let mut ctx = PipelineContext {
+            components: &mut components,
+            blob: &mut blob,
+            profile: &mut profile,
+            resources: &mut resources,
+        };
+
+        // Two candidate parents and a child, each with a GlobalTransform slot.
+        let a = ctx.components.spawn();
+        ctx.insert(a, a_t);
+        ctx.insert(a, GlobalTransform::default());
+        let b = ctx.components.spawn();
+        ctx.insert(b, b_t);
+        ctx.insert(b, GlobalTransform::default());
+        let child = ctx.components.spawn();
+        ctx.insert(child, child_t);
+        ctx.insert(child, GlobalTransform::default());
+
+        // Attach under A: the child's world matrix composes A x local, and A
+        // lists it.
+        reparent(&mut ctx, child, Some(a));
+        let under_a = ctx.components.get::<GlobalTransform>(child).unwrap().0;
+        assert_eq!(
+            under_a,
+            mat_mul4(a_t.model_matrix(), child_t.model_matrix())
+        );
+        assert_eq!(ctx.components.get::<Children>(a).unwrap().0, vec![child]);
+
+        // Move under B: world matrix recomposes against B, A unlists it.
+        reparent(&mut ctx, child, Some(b));
+        let under_b = ctx.components.get::<GlobalTransform>(child).unwrap().0;
+        assert_eq!(
+            under_b,
+            mat_mul4(b_t.model_matrix(), child_t.model_matrix())
+        );
+        assert_ne!(under_a, under_b, "the child actually moved");
+        assert!(
+            ctx.components.get::<Children>(a).unwrap().0.is_empty(),
+            "A unlisted the child"
+        );
+        assert_eq!(ctx.components.get::<Children>(b).unwrap().0, vec![child]);
+        assert_eq!(ctx.components.get::<Parent>(child).unwrap().0, b);
+
+        // Detach to a root: no Parent, world matrix is its own local.
+        reparent(&mut ctx, child, None);
+        assert_eq!(
+            ctx.components.get::<GlobalTransform>(child).unwrap().0,
+            child_t.model_matrix()
+        );
+        assert!(
+            ctx.components.get::<Parent>(child).is_none(),
+            "child is now a root"
+        );
+        assert!(
+            ctx.components.get::<Children>(b).unwrap().0.is_empty(),
+            "B unlisted the child"
+        );
     }
 
     #[test]
@@ -873,42 +1072,6 @@ mod tests {
         assert_eq!(result[3], [1.0, 1.0, 0.0, 1.0]);
         assert_eq!(result[0], [1.0, 0.0, 0.0, 0.0]);
         assert_eq!(result[1], [0.0, 1.0, 0.0, 0.0]);
-    }
-
-    #[test]
-    fn compute_world_matrices_flat_list() {
-        let a = make_prop([1.0, 0.0, 0.0]);
-        let b = make_prop([0.0, 2.0, 0.0]);
-        let props: Vec<&Prop> = vec![&a, &b];
-        let mats = compute_world_matrices(&props, &[None, None]);
-        assert_eq!(mats[0], a.model_matrix());
-        assert_eq!(mats[1], b.model_matrix());
-    }
-
-    #[test]
-    fn compute_world_matrices_child_inherits_parent_translation() {
-        let parent = make_prop([1.0, 0.0, 0.0]);
-        let child = make_prop([0.0, 1.0, 0.0]);
-        let props: Vec<&Prop> = vec![&parent, &child];
-        let mats = compute_world_matrices(&props, &[None, Some(0)]);
-        // parent unchanged
-        assert_eq!(mats[0], parent.model_matrix());
-        // child world translation = parent_pos + child_pos = (1,1,0)
-        // col 3 carries translation in column-major layout
-        assert!((mats[1][3][0] - 1.0).abs() < 1e-5);
-        assert!((mats[1][3][1] - 1.0).abs() < 1e-5);
-        assert!((mats[1][3][2]).abs() < 1e-5);
-    }
-
-    #[test]
-    fn compute_world_matrices_cycle_falls_back_to_local() {
-        let a = make_prop([1.0, 0.0, 0.0]);
-        let b = make_prop([0.0, 1.0, 0.0]);
-        let props: Vec<&Prop> = vec![&a, &b];
-        // Mutual cycle: a's parent is b, b's parent is a; neither can resolve.
-        let mats = compute_world_matrices(&props, &[Some(1), Some(0)]);
-        assert_eq!(mats[0], a.model_matrix());
-        assert_eq!(mats[1], b.model_matrix());
     }
 
     fn unit_quad_mesh() -> LoadedMesh {
@@ -1049,16 +1212,23 @@ mod tests {
         let mut mesh_geometry = std::collections::HashMap::new();
         mesh_geometry.insert(AssetId(0), unit_quad_mesh());
 
-        let mut prop = make_prop([0.0; 3]);
-        prop.mesh = Some(AssetId(0));
-        let props_refs: Vec<&Prop> = vec![&prop];
-        let world_mats = compute_world_matrices(&props_refs, &[None]);
+        // A single static mesh-backed item referencing the always-resident mesh.
+        let items = vec![RenderableItem {
+            asset_id: AssetId(0),
+            model: None,
+            mesh: Some(AssetId(0)),
+            material: None,
+            texture: None,
+            cull_distance: 0.0,
+            is_dynamic: false,
+        }];
+        let world_mats = vec![IDENTITY4];
 
         let mut always_resident = std::collections::HashSet::new();
         always_resident.insert(AssetId(0));
 
         let (_v, _i, draw_objects, _c, _p, _m) = build_draw_list(
-            &props_refs,
+            &items,
             &[],
             &world_mats,
             &std::collections::HashMap::new(),
@@ -1075,5 +1245,111 @@ mod tests {
         assert!(draw_objects[0].bb_min[0].is_nan());
         assert!(draw_objects[0].bb_max[0].is_nan());
         assert!(!draw_objects[0].cullable());
+    }
+
+    // The item built from a mesh entity's components reads the renderer fields
+    // from MeshRenderer and marks the entity dynamic from its Pickup / Collider
+    // tags.
+    #[test]
+    fn decomposed_renderable_item_matches_a_mesh_prop() {
+        use crate::assets::{Collider, MeshRenderer, Pickup, PropCollider};
+        use crate::blob::BlobData;
+        use crate::ecs::{ComponentStorage, PipelineContext, Resources};
+        use crate::gfx::profile::FrameProfile;
+
+        let mut prop = make_prop([0.0; 3]);
+        prop.asset_id = AssetId(7);
+        prop.mesh = Some(AssetId(10));
+        prop.material = Some(AssetId(20));
+        prop.cull_distance = 50.0;
+        prop.pickup = true;
+        prop.collider = Some(PropCollider::default());
+
+        let mut components = ComponentStorage::default();
+        let mut blob = BlobData::empty();
+        let mut profile = FrameProfile::default();
+        let mut resources = Resources::new();
+        let mut ctx = PipelineContext {
+            components: &mut components,
+            blob: &mut blob,
+            profile: &mut profile,
+            resources: &mut resources,
+        };
+
+        let e = ctx.components.spawn();
+        ctx.insert(
+            e,
+            MeshRenderer {
+                mesh: prop.mesh,
+                material: prop.material,
+                texture: prop.texture,
+                cull_distance: prop.cull_distance,
+            },
+        );
+        ctx.insert(e, Pickup);
+        ctx.insert(e, Collider(prop.collider.clone().unwrap()));
+
+        let item = decomposed_renderable_item(&ctx, e, prop.asset_id);
+        assert_eq!(
+            item,
+            RenderableItem {
+                asset_id: AssetId(7),
+                model: None,
+                mesh: Some(AssetId(10)),
+                material: Some(AssetId(20)),
+                texture: None,
+                cull_distance: 50.0,
+                is_dynamic: true,
+            }
+        );
+    }
+
+    // Same for a model entity: ModelRenderer fields, and with no dynamic tags the
+    // item is static.
+    #[test]
+    fn decomposed_renderable_item_matches_a_model_prop() {
+        use crate::assets::ModelRenderer;
+        use crate::blob::BlobData;
+        use crate::ecs::{ComponentStorage, PipelineContext, Resources};
+        use crate::gfx::profile::FrameProfile;
+
+        let mut prop = make_prop([0.0; 3]);
+        prop.asset_id = AssetId(8);
+        prop.model = Some(AssetId(100));
+        prop.cull_distance = 30.0;
+
+        let mut components = ComponentStorage::default();
+        let mut blob = BlobData::empty();
+        let mut profile = FrameProfile::default();
+        let mut resources = Resources::new();
+        let mut ctx = PipelineContext {
+            components: &mut components,
+            blob: &mut blob,
+            profile: &mut profile,
+            resources: &mut resources,
+        };
+
+        let e = ctx.components.spawn();
+        ctx.insert(
+            e,
+            ModelRenderer {
+                model: prop.model.unwrap(),
+                cull_distance: prop.cull_distance,
+            },
+        );
+
+        let item = decomposed_renderable_item(&ctx, e, prop.asset_id);
+        assert_eq!(
+            item,
+            RenderableItem {
+                asset_id: AssetId(8),
+                model: Some(AssetId(100)),
+                mesh: None,
+                material: None,
+                texture: None,
+                cull_distance: 30.0,
+                is_dynamic: false,
+            }
+        );
     }
 }

@@ -2,8 +2,8 @@
 // ticking, and the backend draw call.
 
 use crate::assets::{
-    Camera3D, FrameInput, HitRegion, LabelBox, LayoutContainer, Prop, SceneCommand, SettingCommand,
-    SettingOp, Sprite, TextLabel, WindowMode,
+    Camera3D, DespawnRequest, FrameInput, HitRegion, LabelBox, LayoutContainer, ReparentRequest,
+    SceneCommand, SettingCommand, SettingOp, Sprite, TextLabel, WindowMode,
 };
 use crate::ecs::asset_id::AssetId;
 use crate::ecs::{PipelineContext, StepResult};
@@ -234,20 +234,77 @@ impl GraphicsSystem {
                     return StepResult::Stop;
                 }
 
-                // push updated model matrices for any props that were mutated
-                // since the last frame (e.g. by Camera3DSystem on interact).
-                // World matrices are resolved top-down so parent transforms
-                // propagate correctly to all children.
-                {
-                    let props: Vec<_> = ctx.query::<Prop>().collect();
-                    let world_mats =
-                        draw_list::compute_world_matrices(props.as_slice(), &self.prop_parents);
-                    for (prop_idx, world_mat) in world_mats.iter().enumerate() {
-                        if let Some(draw_idxs) = self.prop_draw_indices.get(prop_idx) {
-                            for &draw_idx in draw_idxs {
-                                backend.update_model(draw_idx, *world_mat);
-                            }
+                // Runtime entity despawn: drain DespawnRequest events, resolve
+                // each name to its entity, hide that entity's draw slots, and
+                // remove it (and its descendants) from the ECS. Done before the
+                // transform push so a despawned entity is already gone from the
+                // GlobalTransform x RenderHandle join this frame and contributes
+                // nothing to any pass.
+                let despawn_names: Vec<AssetId> = match ctx.events::<DespawnRequest>() {
+                    Some(events) => events
+                        .read(&mut self.despawn_cmd_cursor)
+                        .into_iter()
+                        .map(|r| r.name)
+                        .collect(),
+                    None => Vec::new(),
+                };
+                if !despawn_names.is_empty() {
+                    // Clone the name index out so the ctx borrow ends before the
+                    // despawns, which take &mut ctx.
+                    let by_name = ctx
+                        .resource::<crate::ecs::decompose::EntityByName>()
+                        .map(|n| n.0.clone())
+                        .unwrap_or_default();
+                    for name in despawn_names {
+                        if let Some(&entity) = by_name.get(&name) {
+                            super::despawn::despawn_subtree(ctx, backend, entity);
                         }
+                    }
+                }
+
+                // Runtime re-parenting: drain ReparentRequest events, resolve the
+                // child + parent names to entities, and re-point the child's
+                // Parent edge (recomposing world matrices). After the despawn
+                // drain so a reparent naming a just-removed entity simply finds
+                // nothing to move.
+                let reparents: Vec<ReparentRequest> = match ctx.events::<ReparentRequest>() {
+                    Some(events) => events
+                        .read(&mut self.reparent_cmd_cursor)
+                        .into_iter()
+                        .copied()
+                        .collect(),
+                    None => Vec::new(),
+                };
+                if !reparents.is_empty() {
+                    let by_name = ctx
+                        .resource::<crate::ecs::decompose::EntityByName>()
+                        .map(|n| n.0.clone())
+                        .unwrap_or_default();
+                    for req in reparents {
+                        let Some(&child) = by_name.get(&req.child) else {
+                            continue;
+                        };
+                        let parent = req.parent.and_then(|p| by_name.get(&p).copied());
+                        // A named-but-unresolved parent skips, so a typo never
+                        // silently detaches the child to a root.
+                        if req.parent.is_some() && parent.is_none() {
+                            continue;
+                        }
+                        draw_list::reparent(ctx, child, parent);
+                    }
+                }
+
+                // Push updated model matrices for any entity whose transform
+                // changed since last frame (physics, camera interact, reparent):
+                // resolve each entity's GlobalTransform from Transform + Parent
+                // (top-down so parents propagate to children), then push it to the
+                // entity's GPU draw slots.
+                draw_list::propagate_transforms(ctx);
+                for (_entity, global, handle) in
+                    ctx.join2::<crate::assets::GlobalTransform, crate::assets::RenderHandle>()
+                {
+                    for &slot in &handle.draws {
+                        backend.update_model(slot as usize, global.0);
                     }
                 }
 
@@ -258,12 +315,29 @@ impl GraphicsSystem {
                     backend.update_skinned_pose(pose.skinned_index, &pose.joint_matrices);
                 }
 
-                // apply any imperative scene jumps pushed by UiInputSystem this tick
-                for cmd in ctx.drain::<SceneCommand>() {
+                // apply any imperative scene jumps sent by UiInputSystem this
+                // tick, copied out of the event queue so the borrow is released
+                // before the jump touches the backend
+                let scene_cmds: Vec<SceneCommand> = match ctx.events::<SceneCommand>() {
+                    Some(events) => events
+                        .read(&mut self.scene_cmd_cursor)
+                        .into_iter()
+                        .cloned()
+                        .collect(),
+                    None => Vec::new(),
+                };
+                // Source scene-jump visibility from the per-entity components,
+                // snapshotting once for the whole command batch.
+                let (draws, scenes) = if scene_cmds.is_empty() {
+                    (Vec::new(), Vec::new())
+                } else {
+                    super::scene::decomposed_visibility_snapshot(ctx)
+                };
+                for cmd in scene_cmds {
                     scene_reel::jump_to_scene(
                         &mut self.reel,
-                        &self.prop_draw_indices,
-                        &self.prop_scene,
+                        &draws,
+                        &scenes,
                         elapsed,
                         cmd.scene,
                         &cmd.transition,
@@ -271,10 +345,21 @@ impl GraphicsSystem {
                     );
                 }
 
-                // apply graphics settings changes pushed by UiInputSystem this
-                // tick: cycle the setting, apply it to the backend, refresh the
-                // value label, and persist the new value.
-                for cmd in ctx.drain::<SettingCommand>() {
+                // apply graphics settings changes UiInputSystem sent last tick:
+                // cycle the setting, apply it to the backend, refresh the value
+                // label, and persist the new value. Clone the commands out of
+                // the queue so the ctx borrow is released before the loop body,
+                // which needs &mut ctx (label/sprite updates, ControlsCommand /
+                // AudioCommand sends).
+                let setting_cmds: Vec<SettingCommand> = match ctx.events::<SettingCommand>() {
+                    Some(events) => events
+                        .read(&mut self.setting_cmd_cursor)
+                        .into_iter()
+                        .cloned()
+                        .collect(),
+                    None => Vec::new(),
+                };
+                for cmd in setting_cmds {
                     // Key-rebind settings (Controls tab) take a Rebind op: bind
                     // the named action to the captured key, swapping with whatever
                     // action held it, push the map to the backend, persist, and
@@ -357,12 +442,14 @@ impl GraphicsSystem {
                         }
                         // Mouse sensitivity is owned by the camera controller,
                         // not the renderer: hand the new radians/pixel value
-                        // across as a ControlsCommand the camera drains this tick
+                        // across as a ControlsCommand the camera reads this tick
                         // (live, no restart).
                         if cmd.setting == "mouse_sensitivity" {
-                            ctx.push(crate::assets::ControlsCommand {
-                                mouse_sensitivity: stored,
-                            });
+                            ctx.events_mut::<crate::assets::ControlsCommand>().send(
+                                crate::assets::ControlsCommand {
+                                    mouse_sensitivity: stored,
+                                },
+                            );
                         }
                         // Move the handle to the new fraction.
                         if let Some((handle_id, track_x, track_w, handle_w)) = geom {
@@ -481,9 +568,11 @@ impl GraphicsSystem {
                             let next = settings::cycle(cur, opts.len(), cmd.op);
                             let gain = settings::master_volume_at(next);
                             cfg.audio.master_volume = Some(gain);
-                            ctx.push(crate::assets::AudioCommand {
-                                master_volume: gain,
-                            });
+                            ctx.events_mut::<crate::assets::AudioCommand>().send(
+                                crate::assets::AudioCommand {
+                                    master_volume: gain,
+                                },
+                            );
                             Some(opts[next])
                         }
                         // Quality-feature toggles: flip the matching field on the
@@ -539,15 +628,12 @@ impl GraphicsSystem {
                     }
                 }
 
-                // advance SceneReel and apply fade / visibility changes
+                // advance SceneReel and apply fade / visibility changes, sourcing
+                // visibility from the live per-entity components; the snapshot is
+                // rebuilt each frame the reel exists.
                 if self.reel.is_some() {
-                    scene_reel::tick_reel(
-                        &mut self.reel,
-                        &self.prop_draw_indices,
-                        &self.prop_scene,
-                        elapsed,
-                        backend,
-                    );
+                    let (draws, scenes) = super::scene::decomposed_visibility_snapshot(ctx);
+                    scene_reel::tick_reel(&mut self.reel, &draws, &scenes, elapsed, backend);
                 }
 
                 // Drive albedo-texture streaming: re-score every slot by
@@ -784,7 +870,7 @@ impl GraphicsSystem {
                 // does not drift behind the menu; the UI still gets the cursor
                 // position, clicks, and Escape.
                 let gameplay = !menu_active;
-                ctx.push(FrameInput {
+                let frame_input = FrameInput {
                     forward: raw.forward && gameplay,
                     backward: raw.backward && gameplay,
                     left: raw.left && gameplay,
@@ -807,7 +893,12 @@ impl GraphicsSystem {
                     // Not gated by `gameplay`: the rebind capture works while the
                     // settings menu is open (the camera is what freezes behind it).
                     captured_key: raw.captured_key,
-                });
+                };
+                // Publish the same snapshot two ways: the resource readers can
+                // fetch by type, and the component column the camera and UI
+                // systems still drain/query.
+                ctx.insert_resource(frame_input.clone());
+                ctx.push(frame_input);
 
                 StepResult::Continue
             }

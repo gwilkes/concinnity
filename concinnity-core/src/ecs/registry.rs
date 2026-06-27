@@ -47,7 +47,6 @@ crate::define_components! {
         CameraShot        => assets::CameraShot,        23,
         Prefab            => assets::Prefab,            24,
         HitRegion         => assets::HitRegion,         25,
-        SceneCommand      => assets::SceneCommand,      26,
         File              => assets::File,              27,
         BlockType         => assets::BlockType,         28,
         VoxelChunk        => assets::VoxelChunk,        29,
@@ -66,7 +65,6 @@ crate::define_components! {
         Sprite            => assets::Sprite,            42,
         KeyBinding        => assets::KeyBinding,        43,
         View              => assets::View,              44,
-        ViewCommand       => assets::ViewCommand,       45,
         Decal             => assets::Decal,             46,
         VolumetricFog     => assets::VolumetricFog,     47,
         Joint             => assets::Joint,             48,
@@ -81,12 +79,21 @@ crate::define_components! {
         SceneImport       => assets::SceneImport,       57,
         MainMenu          => assets::MainMenu,          58,
         OptionSelect      => assets::OptionSelect,      59,
-        SettingCommand    => assets::SettingCommand,    60,
         Slider            => assets::Slider,            61,
         ScrollPanel       => assets::ScrollPanel,       62,
-        ControlsCommand   => assets::ControlsCommand,   63,
-        AudioCommand      => assets::AudioCommand,      64,
         ReflectionProbe   => assets::ReflectionProbe,   65,
+        Transform         => assets::Transform,         66,
+        MeshRenderer      => assets::MeshRenderer,      67,
+        ModelRenderer     => assets::ModelRenderer,     68,
+        Collider          => assets::Collider,          69,
+        Interactable      => assets::Interactable,      70,
+        Pickup            => assets::Pickup,            71,
+        Parent            => assets::Parent,            72,
+        Children          => assets::Children,          73,
+        SceneMember       => assets::SceneMember,       74,
+        GlobalTransform   => assets::GlobalTransform,   75,
+        RenderHandle      => assets::RenderHandle,      76,
+        Held              => assets::Held,              77,
 }
 
 #[cfg(test)]
@@ -121,8 +128,42 @@ mod tests {
             );
         }
     }
+
+    // The per-instance components an entity is composed from are RuntimeOnly:
+    // never authored in a world, never in the asset reference, and exempt from
+    // the declarable-args contract above. Guard that they stay that way so a
+    // stray `External` origin can't leak one into the authoring surface.
+    #[test]
+    fn per_instance_components_are_runtime_only() {
+        for ty in [
+            ComponentType::Transform,
+            ComponentType::MeshRenderer,
+            ComponentType::ModelRenderer,
+            ComponentType::Collider,
+            ComponentType::Interactable,
+            ComponentType::Pickup,
+            ComponentType::Parent,
+            ComponentType::Children,
+            ComponentType::SceneMember,
+            ComponentType::GlobalTransform,
+            ComponentType::RenderHandle,
+            ComponentType::Held,
+        ] {
+            assert!(
+                !ty.registration().addable(),
+                "{} must be RuntimeOnly (not declarable)",
+                ty.as_str()
+            );
+        }
+    }
 }
 
+// Retired component discriminants (0..128), stable on disk; never reuse. Each
+// is now an Events<T> queue, not a component; all were RuntimeOnly (never
+// serialized), so no blob references the gaps:
+//   26 SceneCommand, 45 ViewCommand, 60 SettingCommand, 63 ControlsCommand,
+//   64 AudioCommand
+//
 // Retired system discriminants (128..255), stable on disk; never reuse:
 //   130 GraphicsSystem, 131 FpsCounter, 141 Camera3DSystem, 142 PhysicsSystem,
 //   143 UiInputSystem, 145 AnimationSystem, 146 AudioSystem, 147 StatHud

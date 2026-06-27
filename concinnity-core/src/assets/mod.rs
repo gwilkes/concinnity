@@ -18,6 +18,7 @@ mod color_lut;
 mod controls_command;
 mod cubemap_texture;
 mod decal;
+mod despawn_request;
 mod directional_light;
 mod environment_map;
 mod file;
@@ -47,6 +48,7 @@ pub mod procedural_mesh;
 mod prop;
 mod prop_body;
 mod reflection_probe;
+mod reparent_request;
 mod rigid_body;
 mod room;
 mod scene;
@@ -72,6 +74,21 @@ mod voxel_world;
 mod water_surface;
 mod window;
 
+// Per-instance components an entity is composed from: its placement, render
+// description, collision, hierarchy, and gameplay tags.
+mod children;
+mod collider;
+mod global_transform;
+mod held;
+mod interactable;
+mod mesh_renderer;
+mod model_renderer;
+mod parent;
+mod pickup;
+mod render_handle;
+mod scene_member;
+mod transform;
+
 // HUD-overlay request components. Declaring one runs the matching internal
 // overlay behavior (in the client crate); both are pure data here.
 mod fps_counter;
@@ -88,6 +105,7 @@ pub use color_lut::ColorLut;
 pub use controls_command::ControlsCommand;
 pub use cubemap_texture::CubemapTexture;
 pub use decal::Decal;
+pub use despawn_request::DespawnRequest;
 pub use directional_light::DirectionalLight;
 pub use environment_map::EnvironmentMap;
 pub use file::{File, FileKind};
@@ -134,6 +152,7 @@ pub use prop::Prop;
 pub use prop::PropCollider;
 pub use prop_body::PropBody;
 pub use reflection_probe::ReflectionProbe;
+pub use reparent_request::ReparentRequest;
 pub use rigid_body::RigidBody;
 pub use room::Room;
 pub use scene::Scene;
@@ -168,6 +187,20 @@ pub use water_surface::WaterSurface;
 #[allow(unused_imports)]
 pub use water_surface::{MAX_WATER_WAVES, WaterWave};
 pub use window::{Window, WindowArgs, WindowMode};
+
+// Per-instance components an entity is composed from.
+pub use children::Children;
+pub use collider::Collider;
+pub use global_transform::GlobalTransform;
+pub use held::Held;
+pub use interactable::Interactable;
+pub use mesh_renderer::MeshRenderer;
+pub use model_renderer::ModelRenderer;
+pub use parent::Parent;
+pub use pickup::Pickup;
+pub use render_handle::RenderHandle;
+pub use scene_member::SceneMember;
+pub use transform::Transform;
 
 // HUD-overlay request components; their behavior lives in the client crate.
 pub use fps_counter::FpsCounter;

@@ -418,129 +418,6 @@ fn drain_pending_skeleton_updates_clears_the_queue() {
 }
 
 #[test]
-fn resolve_scene_from_name_picks_matching_scene_prefix() {
-    let scenes = vec!["day".to_string(), "night".to_string()];
-    let id = resolve_scene_from_name("day_castle", &scenes);
-    assert!(id.is_some());
-    assert_eq!(id.unwrap(), crate::ecs::asset_id::intern("day"));
-}
-
-#[test]
-fn resolve_scene_from_name_returns_none_when_no_prefix_matches() {
-    // Name has `_` but its prefix is not a declared scene → must NOT
-    // intern a stray id; that would assign the Prop to a phantom scene
-    // and (with SceneReel running) hide it forever.
-    let scenes = vec!["day".to_string(), "night".to_string()];
-    let id = resolve_scene_from_name("hero_anim", &scenes);
-    assert!(id.is_none());
-}
-
-#[test]
-fn resolve_scene_from_name_requires_underscore_separator() {
-    // Scene name "day" must not match a prop named "daytime": the build
-    // pipeline uses `starts_with("day_")`, not `starts_with("day")`.
-    let scenes = vec!["day".to_string()];
-    assert!(resolve_scene_from_name("daytime", &scenes).is_none());
-}
-
-#[test]
-fn resolve_scene_from_name_no_scenes_returns_none() {
-    // A world with no Scene assets must leave every prop unscoped, even
-    // those with `_` in their names. (No SceneReel means every prop is
-    // always visible regardless, but the diff log is cleaner this way.)
-    let scenes: Vec<String> = Vec::new();
-    assert!(resolve_scene_from_name("anything_else", &scenes).is_none());
-}
-
-#[test]
-fn resolve_material_or_texture_picks_material_over_texture() {
-    let mat_id = crate::ecs::asset_id::intern("mat_a");
-    let tex_id = crate::ecs::asset_id::intern("tex_b");
-    let mut state = crate::gfx::graphics_system::WorldReloadState {
-        material_map: std::collections::HashMap::new(),
-        texture_name_to_slot: std::collections::HashMap::new(),
-        model_map: std::collections::HashMap::new(),
-        mesh_id_to_draw: std::collections::HashMap::new(),
-        scene_names: Vec::new(),
-    };
-    state.material_map.insert(
-        mat_id,
-        (7, 3, crate::gfx::render_types::MaterialUniforms::DEFAULT),
-    );
-    state.texture_name_to_slot.insert(tex_id, 1);
-
-    let prop = crate::assets::Prop {
-        material: Some(mat_id),
-        texture: Some(tex_id),
-        ..Default::default()
-    };
-    let (tex_slot, nm_slot, _) = resolve_material_or_texture(&prop, &state).unwrap();
-    assert_eq!(tex_slot, 7);
-    assert_eq!(nm_slot, 3);
-}
-
-#[test]
-fn resolve_material_or_texture_falls_back_to_texture_slot() {
-    let tex_id = crate::ecs::asset_id::intern("tex_only");
-    let mut state = crate::gfx::graphics_system::WorldReloadState {
-        material_map: std::collections::HashMap::new(),
-        texture_name_to_slot: std::collections::HashMap::new(),
-        model_map: std::collections::HashMap::new(),
-        mesh_id_to_draw: std::collections::HashMap::new(),
-        scene_names: Vec::new(),
-    };
-    state.texture_name_to_slot.insert(tex_id, 5);
-
-    let prop = crate::assets::Prop {
-        material: None,
-        texture: Some(tex_id),
-        ..Default::default()
-    };
-    let (tex_slot, nm_slot, _) = resolve_material_or_texture(&prop, &state).unwrap();
-    assert_eq!(tex_slot, 5);
-    assert_eq!(nm_slot, 0); // No normal map without a Material
-}
-
-#[test]
-fn resolve_material_or_texture_defaults_with_no_refs() {
-    let state = crate::gfx::graphics_system::WorldReloadState {
-        material_map: std::collections::HashMap::new(),
-        texture_name_to_slot: std::collections::HashMap::new(),
-        model_map: std::collections::HashMap::new(),
-        mesh_id_to_draw: std::collections::HashMap::new(),
-        scene_names: Vec::new(),
-    };
-    let prop = crate::assets::Prop {
-        material: None,
-        texture: None,
-        ..Default::default()
-    };
-    let (tex_slot, nm_slot, _) = resolve_material_or_texture(&prop, &state).unwrap();
-    assert_eq!(tex_slot, 0);
-    assert_eq!(nm_slot, 0);
-}
-
-#[test]
-fn resolve_material_or_texture_returns_none_for_unknown_material() {
-    // Hot-reload cannot introduce new Material assets; a Prop newly
-    // referencing one not in the init `material_map` is reported as
-    // unresolvable (caller logs + skips the edit).
-    let unknown_mat = crate::ecs::asset_id::intern("never_declared");
-    let state = crate::gfx::graphics_system::WorldReloadState {
-        material_map: std::collections::HashMap::new(),
-        texture_name_to_slot: std::collections::HashMap::new(),
-        model_map: std::collections::HashMap::new(),
-        mesh_id_to_draw: std::collections::HashMap::new(),
-        scene_names: Vec::new(),
-    };
-    let prop = crate::assets::Prop {
-        material: Some(unknown_mat),
-        ..Default::default()
-    };
-    assert!(resolve_material_or_texture(&prop, &state).is_none());
-}
-
-#[test]
 fn procedural_mesh_source_map_round_trips_empty() {
     let m = ProceduralMeshSourceMap::new();
     assert!(m.is_empty());
@@ -629,20 +506,6 @@ fn state_with_only_procedural_meshes_still_spawns_a_watcher() {
     );
     assert_eq!(state.procedural_meshes.len(), 1);
     assert_eq!(state.procedural_meshes.entries[0].name, "box_mesh");
-}
-
-#[test]
-fn world_reload_result_default_is_all_zero() {
-    // The reload helper relies on `..Default::default()` to start counters
-    // at 0 and the added_props vec empty so the partial-failure rollback
-    // paths can decrement without underflowing.
-    let r = WorldReloadResult::default();
-    assert_eq!(r.transforms_applied, 0);
-    assert_eq!(r.added, 0);
-    assert_eq!(r.removed, 0);
-    assert_eq!(r.modified, 0);
-    assert_eq!(r.restart_required, 0);
-    assert!(r.added_props.is_empty());
 }
 
 #[test]
@@ -795,6 +658,7 @@ fn reload_shader_stages_on_empty_map_is_a_no_op() {
         }
         fn update_view(&mut self, _: [[f32; 4]; 4]) {}
         fn update_model(&mut self, _: usize, _: [[f32; 4]; 4]) {}
+        fn retire_draw_object(&mut self, _: usize) {}
         fn upload_skinned(
             &mut self,
             _: &[crate::gfx::mesh_payload::SkinnedVertex],

@@ -12,9 +12,7 @@ use crate::gfx::graphics_system::HotReloadApplyParts;
 use crate::gfx::graphics_system::hot_reload_sources::*;
 
 use super::decode::{poll_pending_assets, poll_pending_envmap, reload_assets};
-use super::passes::{
-    reload_procedural_meshes, reload_shader_stages, reload_volumetric_fog, reload_world,
-};
+use super::passes::{reload_procedural_meshes, reload_shader_stages, reload_volumetric_fog};
 use super::watcher::spawn_watcher;
 
 // A worker result still in flight: the receiving end of the channel a
@@ -312,7 +310,6 @@ impl AssetHotReloadState {
 // system borrow is released.
 pub(crate) struct FrameHotReloadEffects {
     pub skeleton_updates: Vec<PendingSkeletonUpdate>,
-    pub added_props: Vec<crate::assets::Prop>,
 }
 
 // Run every asset / shader / world.jsonl reload pass for one frame and return
@@ -329,7 +326,6 @@ pub(crate) fn run_frame(
 ) -> FrameHotReloadEffects {
     let mut effects = FrameHotReloadEffects {
         skeleton_updates: Vec::new(),
-        added_props: Vec::new(),
     };
 
     // Asset-payload poll. Pick up any completed off-thread work first so a
@@ -363,8 +359,9 @@ pub(crate) fn run_frame(
     }
 
     // world.jsonl reload poll: regenerate changed ProceduralMeshes first, then
-    // diff Props (transforms / adds / removes / material / cull / parent /
-    // scene), then re-apply VolumetricFog. Cheap when the flag is unset.
+    // re-apply VolumetricFog. Cheap when the flag is unset. (Prop diffing was
+    // dropped with the positional render path; reworking it onto the per-entity
+    // components is future work.)
     if super::pending::take_pending_world() {
         let path = state.world_jsonl_path.clone();
         if let Some(path) = path {
@@ -377,29 +374,6 @@ pub(crate) fn run_frame(
                     pm_result.unchanged,
                     pm_result.failed,
                 );
-            }
-            if apply.init_props.is_some() && apply.world_reload.is_some() {
-                let world_reload = apply.world_reload.as_ref().unwrap();
-                let tracked_props = apply.init_props.as_mut().unwrap();
-                let result = reload_world(
-                    &path,
-                    tracked_props,
-                    apply.prop_parents,
-                    apply.prop_draw_indices,
-                    apply.prop_scene,
-                    world_reload,
-                    apply.backend,
-                );
-                tracing::info!(
-                    "world.jsonl hot-reload: transforms={} added={} removed={} \
-                     modified={} restart_required={}",
-                    result.transforms_applied,
-                    result.added,
-                    result.removed,
-                    result.modified,
-                    result.restart_required,
-                );
-                effects.added_props = result.added_props;
             }
             let fog_result = reload_volumetric_fog(&path, apply.last_fog_settings, apply.backend);
             if fog_result.updated {

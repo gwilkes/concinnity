@@ -13,6 +13,7 @@
 // (`define_system_assets!`), and add a gated entry to the
 // `World::build_internal_systems` schedule below.
 
+pub(crate) mod decompose;
 mod registry;
 
 // Renderer-free metadata, registry types, the asset-construction API, and the
@@ -20,7 +21,7 @@ mod registry;
 // keeps its historical `crate::ecs::*` import paths.
 pub use concinnity_core::ecs::{
     BlobAssetDef, Component, ComponentAsset, ComponentSlot, ComponentStorage, ComponentType,
-    PayloadLocator, PipelineContext, asset_api, asset_id,
+    Entity, EventCursor, Events, PayloadLocator, PipelineContext, Resources, asset_api, asset_id,
 };
 
 // The `SystemAsset` value enum is generated client-side from each system's
@@ -103,6 +104,9 @@ pub struct World {
     systems: Vec<SystemAsset>,
     blob: BlobData,
     profile: FrameProfile,
+    // Type-keyed engine singletons (e.g. the per-frame FrameInput snapshot
+    // GraphicsSystem publishes) and the event queues.
+    resources: Resources,
     // Set once `build_internal_systems` has run, so a second `start()` on the
     // same world does not append the internal systems twice.
     internal_systems_built: bool,
@@ -124,6 +128,7 @@ impl World {
             systems: Vec::new(),
             blob,
             profile: FrameProfile::default(),
+            resources: Resources::new(),
             internal_systems_built: false,
         }
     }
@@ -199,7 +204,7 @@ impl World {
     // `SkeletonPose` components from outside the system step.
     #[allow(dead_code)]
     pub fn query_mut<C: ComponentSlot>(&mut self) -> std::slice::IterMut<'_, C> {
-        C::slot_mut(&mut self.components).iter_mut()
+        self.components.values_mut::<C>().iter_mut()
     }
 
     // Push a runtime-produced component into the matching typed slot. Mirror
@@ -207,12 +212,50 @@ impl World {
     // `Prop`s added by a world.jsonl hot-reload so subsequent systems see them.
     #[allow(dead_code)]
     pub fn push<C: ComponentSlot>(&mut self, c: C) {
-        C::slot_mut(&mut self.components).push(c);
+        self.components.push_typed(c);
+    }
+
+    // Read-only join over two component types, for code holding a `World`
+    // directly (the decomposition round-trip tests). Mirror of
+    // `PipelineContext::join2`.
+    #[allow(dead_code)]
+    pub fn join2<A: ComponentSlot, B: ComponentSlot>(
+        &self,
+    ) -> impl Iterator<Item = (Entity, &A, &B)> {
+        self.components.join2::<A, B>()
+    }
+
+    // Borrow the event queue for event type E, if any have been sent. Mirror of
+    // `PipelineContext::events`, for code holding a `World` directly (tests).
+    #[allow(dead_code)]
+    pub fn events<E: 'static>(&self) -> Option<&Events<E>> {
+        self.resources.get::<Events<E>>()
+    }
+
+    // Mutably borrow (creating if absent) the event queue for event type E.
+    // Mirror of `PipelineContext::events_mut`, for code holding a `World`
+    // directly: tests, and the editor's debug-driven command injection.
+    #[allow(dead_code)]
+    pub fn events_mut<E: 'static>(&mut self) -> &mut Events<E> {
+        if !self.resources.contains::<Events<E>>() {
+            self.resources.insert(Events::<E>::new());
+        }
+        self.resources
+            .get_mut::<Events<E>>()
+            .expect("Events<E> was just inserted")
     }
 
     #[allow(dead_code)]
     pub fn systems(&self) -> &[SystemAsset] {
         &self.systems
+    }
+
+    // Despawn an entity (all its components, recycling its id). Stands in for the
+    // GraphicsSystem-mediated despawn in system tests that need an entity gone
+    // before a later system step (e.g. physics-body reaping).
+    #[cfg(test)]
+    pub fn despawn(&mut self, entity: Entity) {
+        self.components.despawn(entity);
     }
 
     // Mutable view of the active systems. Mirror of `systems()`; lets the
@@ -237,7 +280,12 @@ impl World {
             components: &mut self.components,
             blob: &mut self.blob,
             profile: &mut self.profile,
+            resources: &mut self.resources,
         };
+        // Give each loaded Prop's entity its per-instance components before
+        // systems init. The Prop components remain; the decomposed ones ride
+        // alongside until a consumer switches over.
+        decompose::run(&mut ctx);
         for system in &mut self.systems {
             system.init(&mut ctx);
         }
@@ -376,16 +424,38 @@ impl World {
         &self.profile
     }
 
+    // Advance one event queue a frame so its two-frame retention holds for
+    // readers that run after the writer.
+    fn update_event_queue<E: 'static>(&mut self) {
+        if let Some(events) = self.resources.get_mut::<Events<E>>() {
+            events.update();
+        }
+    }
+
+    // Advance every migrated event queue once per frame, before systems run.
+    // Each migrated event type is listed here explicitly.
+    fn update_events(&mut self) {
+        self.update_event_queue::<crate::assets::SceneCommand>();
+        self.update_event_queue::<crate::assets::ViewCommand>();
+        self.update_event_queue::<crate::assets::SettingCommand>();
+        self.update_event_queue::<crate::assets::ControlsCommand>();
+        self.update_event_queue::<crate::assets::AudioCommand>();
+        self.update_event_queue::<crate::assets::DespawnRequest>();
+        self.update_event_queue::<crate::assets::ReparentRequest>();
+    }
+
     // Tick -- systems run in order, Done systems are removed.
     // Returns Done when no systems remain, Stop on hard halt.
     pub fn step(&mut self) -> StepResult {
         // Rotate the profiler's system-timing buffers so the frame that just
         // finished becomes the readable snapshot for this frame's readers.
         self.profile.begin_frame();
+        self.update_events();
         let mut ctx = PipelineContext {
             components: &mut self.components,
             blob: &mut self.blob,
             profile: &mut self.profile,
+            resources: &mut self.resources,
         };
         let mut i = 0;
         while i < self.systems.len() {

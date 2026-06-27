@@ -4,7 +4,7 @@
 use crate::assets::{
     BlockType, Camera3D, ColorLut, Decal, DirectionalLight, EnvironmentMap, Font, GlassPanel,
     GraphicsConfig, HitRegion, Material, Model, ParticleEmitter, PointLight, PostProcessConfig,
-    Prop, SdfVolume, ShaderKind, ShaderStage, StreamingConfig, TextLabel, Texture, VolumetricFog,
+    SdfVolume, ShaderKind, ShaderStage, StreamingConfig, TextLabel, Texture, VolumetricFog,
     VoxelWorld, WaterSurface, Window,
 };
 use crate::ecs::asset_id::AssetId;
@@ -1135,34 +1135,36 @@ impl GraphicsSystem {
         // taking Prop references because drain shifts the underlying Vec.
         let instanced_props = ctx.drain::<crate::assets::InstancedProp>();
 
-        // query rather than drain so Props remain in the world for Camera3DSystem
-        let props: Vec<_> = ctx.query::<Prop>().collect();
+        // Entities to render, in Prop-column order, so each gets a RenderHandle +
+        // GlobalTransform attached below. Enumerated through the Transform column
+        // (the decomposition gives every prop a Transform in Prop order); the Prop
+        // column itself was drained by the decomposition pass at load.
+        let prop_entities: Vec<crate::ecs::Entity> = ctx
+            .query_with_entity::<crate::assets::Transform>()
+            .map(|(entity, _)| entity)
+            .collect();
 
-        // Snapshot the Props now (as owned clones) for the world.jsonl
-        // hot-reload pass; we need a same-order `Vec<Prop>` later, but the
-        // `props: Vec<&Prop>` borrow above must not survive into the next
-        // `ctx.drain` call (which mutably re-borrows the same world). Stored
-        // unconditionally; the field is only consulted under `cn debug`.
-        let init_props_snapshot: Vec<Prop> = props.iter().map(|p| (*p).clone()).collect();
-
-        // build parent-index table: for each prop, record the index of its parent
-        // prop (if any) so world matrices can be resolved top-down each frame
-        {
-            let prop_id_to_idx: std::collections::HashMap<AssetId, usize> = props
-                .iter()
-                .enumerate()
-                .map(|(i, p)| (p.asset_id, i))
-                .collect();
-            self.prop_parents = props
-                .iter()
-                .map(|p| {
-                    p.parent
-                        .and_then(|parent_id| prop_id_to_idx.get(&parent_id).copied())
-                })
-                .collect();
+        // Build the draw-list inputs from each entity's per-instance components:
+        // renderer fields from MeshRenderer/ModelRenderer, world matrices from
+        // Transform/Parent. `items` / `world_mats` are column-aligned with
+        // `prop_entities`.
+        let resolved = draw_list::resolve_world_matrices(ctx);
+        let entity_name: std::collections::HashMap<crate::ecs::Entity, AssetId> = ctx
+            .resource::<crate::ecs::decompose::EntityByName>()
+            .map(|n| n.0.iter().map(|(&id, &e)| (e, id)).collect())
+            .unwrap_or_default();
+        let mut items = Vec::with_capacity(prop_entities.len());
+        let mut world_mats = Vec::with_capacity(prop_entities.len());
+        for &entity in &prop_entities {
+            let asset_id = entity_name.get(&entity).copied().unwrap_or_default();
+            items.push(draw_list::decomposed_renderable_item(ctx, entity, asset_id));
+            world_mats.push(
+                resolved
+                    .get(&entity)
+                    .copied()
+                    .unwrap_or(draw_list::IDENTITY4),
+            );
         }
-
-        let world_mats = draw_list::compute_world_matrices(props.as_slice(), &self.prop_parents);
 
         let (
             all_vertices,
@@ -1172,7 +1174,7 @@ impl GraphicsSystem {
             prop_draw_indices,
             mesh_id_to_draws,
         ) = match draw_list::build_draw_list(
-            &props,
+            &items,
             &instanced_props,
             &world_mats,
             &model_map,
@@ -1188,7 +1190,19 @@ impl GraphicsSystem {
                 return;
             }
         };
-        self.prop_draw_indices = prop_draw_indices;
+
+        // Give each prop entity a RenderHandle (its GPU draw slots) and a
+        // GlobalTransform (its init world matrix), so the per-frame push reads
+        // these. prop_entities is column-aligned with prop_draw_indices and
+        // world_mats; prop_draw_indices is consumed here and then dropped.
+        for (i, &entity) in prop_entities.iter().enumerate() {
+            let draws: Vec<u32> = prop_draw_indices[i]
+                .iter()
+                .map(|&slot| slot as u32)
+                .collect();
+            ctx.insert(entity, crate::assets::RenderHandle { draws });
+            ctx.insert(entity, crate::assets::GlobalTransform(world_mats[i]));
+        }
 
         // Asset hot-reload mesh map: cross-reference the file-backed source
         // metadata captured at drain time with the per-Mesh draw indices
@@ -1688,36 +1702,12 @@ impl GraphicsSystem {
                 shader_stages: shader_stage_source_map,
                 world_jsonl_path,
             });
-            // Snapshot the init-order Prop list so the world.jsonl reload
-            // pass can rebuild a same-order `Vec<Prop>` with the new
-            // transforms. The clone was taken earlier (before the
-            // `ctx.drain` mutations) so it doesn't tangle the borrow
-            // checker here.
-            self.init_props = Some(init_props_snapshot);
-            // Auxiliary asset-resolution tables for the world.jsonl reload
-            // pass, populated only when hot-reload is on, so a `cn run` does
-            // not pay the clone cost. `mesh_id_to_draw` keeps one example
-            // draw_idx per mesh so the clone-static-draw-object path has a
-            // geometry template to copy from. `scene_names` snapshots every
-            // declared Scene's raw name (reverse-looked-up from the interner)
-            // so the reload pass can replay the build-time `<scene>_*` prefix
-            // rule. We query (not drain) here so `setup_scene_reel` can still
-            // drain the Scene components on the next pass.
-            let mesh_id_to_draw: std::collections::HashMap<AssetId, usize> = mesh_id_to_draws
-                .iter()
-                .filter_map(|(id, draws)| draws.first().map(|&d| (*id, d)))
-                .collect();
-            let name_table = crate::ecs::asset_id::name_table();
-            let scene_names: Vec<String> = ctx
-                .query::<crate::assets::Scene>()
-                .filter_map(|s| name_table.get(s.asset_id.0 as usize).cloned())
-                .collect();
+            // The texture-name -> slot map for runtime decal / emitter spawn
+            // (`cn debug`), which resolves a Texture asset name to its live pool
+            // slot. Captured only when hot-reload is on, so a `cn run` skips the
+            // clone cost.
             self.world_reload = Some(super::WorldReloadState {
-                material_map: material_map.clone(),
                 texture_name_to_slot: texture_name_to_slot.clone(),
-                model_map: model_map.clone(),
-                mesh_id_to_draw,
-                scene_names,
             });
         }
 

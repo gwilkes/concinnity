@@ -5,11 +5,14 @@
 // `PhysicsConfig`, a `RigidBody`, or a `PropBody`, reading the optional
 // `PhysicsConfig` for the floor / terrain.
 
-use crate::assets::{Camera3D, Joint, PhysicsConfig, Prop, PropBody, RigidBody};
+use crate::assets::{
+    Camera3D, Collider, Held, Joint, PhysicsConfig, Pickup, PropBody, RigidBody, Transform,
+};
 use crate::ecs::asset_id::AssetId;
-use crate::ecs::{PipelineContext, StepResult, System};
+use crate::ecs::decompose::EntityByName;
+use crate::ecs::{Entity, PipelineContext, StepResult, System};
 use crate::physics::{BodyHandle, ColliderShape, PhysicsWorld};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 // Acceleration due to gravity in world units per second squared.
@@ -86,11 +89,11 @@ struct PlayerPhysics {
     grounded: bool,
 }
 
-// Links a Prop component to its body in the simulation.
+// Links a prop entity to its body in the simulation.
 #[derive(Debug)]
 struct PropPhysics {
-    // Index into the Prop component list (stable for the run).
-    prop_index: usize,
+    // The prop's entity, used to read/write its Transform and toggle its Held tag.
+    entity: Entity,
     handle: BodyHandle,
     // False for static (immovable) props.
     dynamic: bool,
@@ -99,6 +102,13 @@ struct PropPhysics {
 }
 
 impl PhysicsSystem {
+    // Number of rigid bodies the physics world holds. Test-only observable for
+    // the body-reaping path.
+    #[cfg(test)]
+    fn physics_body_count(&self) -> usize {
+        self.world.as_ref().map_or(0, |w| w.body_count())
+    }
+
     // Build the simulation from the world's `PhysicsConfig` (floor / terrain).
     // Bodies and colliders are added from the ECS in [`System::init`].
     pub fn new(config: PhysicsConfig) -> Self {
@@ -123,6 +133,84 @@ impl PhysicsSystem {
             player: None,
             prop_bodies: Vec::new(),
             held: None,
+        }
+    }
+
+    // Build one body per collider-bearing entity from its per-instance components
+    // (Transform + Collider + the Pickup tag), resolving PropBody owners through
+    // the name index and keying `body_handles` by AssetId (via the name index's
+    // inverse) so the joint wiring resolves.
+    fn build_prop_bodies(
+        &mut self,
+        ctx: &PipelineContext,
+        world: &mut PhysicsWorld,
+        body_handles: &mut HashMap<AssetId, BodyHandle>,
+    ) {
+        let (propbody_of, entity_name): (HashMap<Entity, PropBody>, HashMap<Entity, AssetId>) = {
+            let name_index = ctx.resource::<EntityByName>();
+            let inverse = name_index
+                .map(|n| n.0.iter().map(|(&id, &e)| (e, id)).collect())
+                .unwrap_or_default();
+            let owners = ctx
+                .query::<PropBody>()
+                .filter_map(|b| {
+                    let name = b.prop_name?;
+                    let entity = name_index?.get(name)?;
+                    Some((entity, b.clone()))
+                })
+                .collect();
+            (owners, inverse)
+        };
+
+        let pickup: HashSet<Entity> = ctx.query_with_entity::<Pickup>().map(|(e, _)| e).collect();
+        let snaps: Vec<(Entity, PropCollSnap)> = ctx
+            .join2::<Collider, Transform>()
+            .map(|(entity, collider, transform)| {
+                (
+                    entity,
+                    PropCollSnap {
+                        shape: crate::physics::collider_shape(&collider.0, transform.scale),
+                        position: transform.position,
+                        rotation_deg: transform.rotation_deg,
+                        pickup: pickup.contains(&entity),
+                    },
+                )
+            })
+            .collect();
+
+        for (entity, snap) in snaps {
+            let handle = if let Some(prop_body) = propbody_of.get(&entity) {
+                let handle = world.add_dynamic(
+                    &snap.shape,
+                    snap.position,
+                    snap.rotation_deg,
+                    crate::physics::dynamic_params(prop_body),
+                );
+                self.prop_bodies.push(PropPhysics {
+                    entity,
+                    handle,
+                    dynamic: true,
+                    pickup: snap.pickup,
+                });
+                handle
+            } else {
+                let handle = world.add_fixed(
+                    &snap.shape,
+                    snap.position,
+                    snap.rotation_deg,
+                    STATIC_FRICTION,
+                );
+                self.prop_bodies.push(PropPhysics {
+                    entity,
+                    handle,
+                    dynamic: false,
+                    pickup: false,
+                });
+                handle
+            };
+            if let Some(&id) = entity_name.get(&entity) {
+                body_handles.insert(id, handle);
+            }
         }
     }
 }
@@ -181,63 +269,10 @@ impl System for PhysicsSystem {
             }
         }
 
-        // one body per Prop that carries a collider
-        let prop_snaps: Vec<(AssetId, Option<PropCollSnap>)> = ctx
-            .query::<Prop>()
-            .map(|p| {
-                let snap = p.collider.as_ref().map(|c| PropCollSnap {
-                    shape: crate::physics::collider_shape(c, p.scale),
-                    position: p.position,
-                    rotation_deg: p.rotation_deg,
-                    pickup: p.pickup,
-                });
-                (p.asset_id, snap)
-            })
-            .collect();
-        let bodies: Vec<(Option<AssetId>, PropBody)> = ctx
-            .query::<PropBody>()
-            .map(|b| (b.prop_name, b.clone()))
-            .collect();
-
-        // Prop id -> BodyHandle, populated below alongside `self.prop_bodies`.
+        // Prop name -> BodyHandle, populated alongside `self.prop_bodies`.
         // Joints resolve their `body_a`/`body_b` references through this map.
         let mut body_handles: HashMap<AssetId, BodyHandle> = HashMap::new();
-        for (prop_index, (prop_id, snap)) in prop_snaps.into_iter().enumerate() {
-            let Some(snap) = snap else { continue };
-            let body = bodies
-                .iter()
-                .find(|(name, _)| name.is_some() && *name == Some(prop_id));
-            let handle = if let Some((_, prop_body)) = body {
-                let handle = world.add_dynamic(
-                    &snap.shape,
-                    snap.position,
-                    snap.rotation_deg,
-                    crate::physics::dynamic_params(prop_body),
-                );
-                self.prop_bodies.push(PropPhysics {
-                    prop_index,
-                    handle,
-                    dynamic: true,
-                    pickup: snap.pickup,
-                });
-                handle
-            } else {
-                let handle = world.add_fixed(
-                    &snap.shape,
-                    snap.position,
-                    snap.rotation_deg,
-                    STATIC_FRICTION,
-                );
-                self.prop_bodies.push(PropPhysics {
-                    prop_index,
-                    handle,
-                    dynamic: false,
-                    pickup: false,
-                });
-                handle
-            };
-            body_handles.insert(prop_id, handle);
-        }
+        self.build_prop_bodies(ctx, &mut world, &mut body_handles);
         tracing::debug!(
             "PhysicsSystem: {} prop bodies ({} dynamic)",
             self.prop_bodies.len(),
@@ -377,7 +412,12 @@ impl System for PhysicsSystem {
                 )
             })
             .unwrap_or(([0.0, self.floor_y, 0.0], 0.0, 0.0, [0.0; 3], false, false));
-        let prop_positions: Vec<[f32; 3]> = ctx.query::<Prop>().map(|p| p.position).collect();
+        // Entity positions for the pickup reach test, read from the Transform
+        // column.
+        let entity_positions: HashMap<Entity, [f32; 3]> = ctx
+            .query_with_entity::<Transform>()
+            .map(|(e, t)| (e, t.position))
+            .collect();
 
         // camera-space basis vectors
         let fwd_flat = [-cam_yaw.sin(), 0.0, -cam_yaw.cos()];
@@ -389,8 +429,33 @@ impl System for PhysicsSystem {
 
         let world = self.world.as_mut().expect("world checked above");
 
-        // pickup / drop on the interact edge
-        let mut held_changed: Option<(usize, bool)> = None; // (prop_index, is_held)
+        // Reap bodies whose entity was despawned: GraphicsSystem runs before
+        // PhysicsSystem and removes the entity from the ECS, so a body left behind
+        // would keep simulating - and colliding with live bodies - invisibly.
+        // Remove it from Rapier and drop its record before the step, keeping
+        // self.held a valid index into the compacted list.
+        let dead: Vec<BodyHandle> = self
+            .prop_bodies
+            .iter()
+            .filter(|p| !ctx.is_alive(p.entity))
+            .map(|p| p.handle)
+            .collect();
+        if !dead.is_empty() {
+            let held_entity = self
+                .held
+                .and_then(|i| self.prop_bodies.get(i))
+                .map(|p| p.entity);
+            for handle in dead {
+                world.remove_body(handle);
+            }
+            self.prop_bodies.retain(|p| ctx.is_alive(p.entity));
+            self.held =
+                held_entity.and_then(|e| self.prop_bodies.iter().position(|p| p.entity == e));
+        }
+
+        // pickup / drop on the interact edge; held_changed carries the entity to
+        // toggle the Held tag on in the write-back.
+        let mut held_changed: Option<(Entity, bool)> = None;
         if interact_req {
             if let Some(held_idx) = self.held.take() {
                 // drop: hand the prop back to dynamic simulation with a throw.
@@ -401,7 +466,7 @@ impl System for PhysicsSystem {
                     fwd_full[2] * THROW_SPEED,
                 ];
                 world.make_dynamic(pp.handle, throw);
-                held_changed = Some((pp.prop_index, false));
+                held_changed = Some((pp.entity, false));
             } else {
                 // pickup: nearest carriable prop within reach the player faces.
                 let mut best: Option<(f32, usize)> = None;
@@ -409,10 +474,7 @@ impl System for PhysicsSystem {
                     if !pp.pickup {
                         continue;
                     }
-                    let pos = prop_positions
-                        .get(pp.prop_index)
-                        .copied()
-                        .unwrap_or(cam_pos);
+                    let pos = entity_positions.get(&pp.entity).copied().unwrap_or(cam_pos);
                     let dx = pos[0] - cam_pos[0];
                     let dz = pos[2] - cam_pos[2];
                     let dist = (dx * dx + dz * dz).sqrt();
@@ -427,7 +489,7 @@ impl System for PhysicsSystem {
                 if let Some((_, idx)) = best {
                     let pp = &self.prop_bodies[idx];
                     world.make_kinematic(pp.handle);
-                    held_changed = Some((pp.prop_index, true));
+                    held_changed = Some((pp.entity, true));
                     self.held = Some(idx);
                 }
             }
@@ -481,30 +543,32 @@ impl System for PhysicsSystem {
         // advance the simulation
         world.step(dt);
 
-        // read dynamic prop transforms back out
-        let prop_updates: Vec<(usize, [f32; 3], [f32; 3])> = self
+        // read dynamic prop transforms back out, keyed by entity
+        let prop_updates: Vec<(Entity, [f32; 3], [f32; 3])> = self
             .prop_bodies
             .iter()
             .filter(|p| p.dynamic)
             .map(|p| {
                 let (pos, rot) = world.body_pose(p.handle);
-                (p.prop_index, pos, rot)
+                (p.entity, pos, rot)
             })
             .collect();
 
-        // write Prop transforms + held flags
-        {
-            let mut props: Vec<&mut Prop> = ctx.query_mut::<Prop>().collect();
-            for (idx, pos, rot) in prop_updates {
-                if let Some(prop) = props.get_mut(idx) {
-                    prop.position = pos;
-                    prop.rotation_deg = rot;
-                }
+        // write the simulated pose back to each entity's Transform, and the
+        // carried flag to its Held tag.
+        for (entity, pos, rot) in prop_updates {
+            if let Some(t) = ctx.get_mut::<Transform>(entity) {
+                t.position = pos;
+                t.rotation_deg = rot;
             }
-            if let Some((idx, is_held)) = held_changed
-                && let Some(prop) = props.get_mut(idx)
-            {
-                prop.is_held = is_held;
+        }
+        if let Some((entity, is_held)) = held_changed {
+            if is_held {
+                if ctx.get::<Held>(entity).is_none() {
+                    ctx.insert(entity, Held);
+                }
+            } else {
+                ctx.remove::<Held>(entity);
             }
         }
 
@@ -655,7 +719,7 @@ fn lcg_hash(mut v: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::assets::CameraController;
+    use crate::assets::{CameraController, Prop};
     use crate::ecs::World;
 
     #[test]
@@ -746,5 +810,155 @@ mod tests {
         world.start().unwrap();
         let names: Vec<&str> = world.systems().iter().map(|s| s.name()).collect();
         assert_eq!(names, ["PhysicsSystem", "Camera3DSystem"]);
+    }
+
+    use crate::assets::PropCollider;
+    use crate::ecs::asset_id::AssetId;
+
+    // A dynamic, gravity-affected ball prop above the floor.
+    fn ball_prop(id: AssetId, position: [f32; 3], pickup: bool) -> Prop {
+        Prop {
+            asset_id: id,
+            position,
+            pickup,
+            collider: Some(PropCollider {
+                shape: "ball".to_string(),
+                half_extents: [0.5; 3],
+                radius: 0.5,
+                half_height: 0.0,
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn ball_body(id: AssetId) -> PropBody {
+        PropBody {
+            prop_name: Some(id),
+            mass: 1.0,
+            friction: 0.5,
+            restitution: 0.0,
+            gravity_scale: 1.0,
+            linear_damping: 0.0,
+        }
+    }
+
+    // A camera looking down -Z with the interact field latched on, so the
+    // PhysicsSystem (which reads Camera3D.interact_requested) triggers a pickup.
+    fn interacting_camera(position: [f32; 3]) -> Camera3D {
+        Camera3D {
+            interact_requested: true,
+            controller: None,
+            position,
+            ..controlled_camera()
+        }
+    }
+
+    // The simulated pose is written to the prop's Transform; the Prop column was
+    // drained at load.
+    #[test]
+    fn dynamic_prop_writes_transform() {
+        use std::{thread, time::Duration};
+        let id = AssetId(1);
+        let mut world = World::new_empty();
+        world.add_component(PhysicsConfig::default());
+        world.add_component(ball_prop(id, [0.0, 5.0, 0.0], false));
+        world.add_component(ball_body(id));
+        world.start().unwrap();
+
+        for _ in 0..3 {
+            thread::sleep(Duration::from_millis(20));
+            world.step();
+        }
+
+        let transform_y = world.query::<Transform>().next().unwrap().position[1];
+        assert!(
+            transform_y < 5.0,
+            "the simulated pose falls the Transform (y={transform_y})"
+        );
+        // The Prop column is drained at load, so the pose can only have gone to
+        // the Transform.
+        assert_eq!(
+            world.query::<Prop>().count(),
+            0,
+            "the Prop column is drained at load"
+        );
+    }
+
+    // Bodies held by the active PhysicsSystem's world (test observable).
+    fn body_count(world: &World) -> usize {
+        world
+            .systems()
+            .iter()
+            .find_map(|s| match s {
+                crate::ecs::SystemAsset::PhysicsSystem(p) => Some(p.physics_body_count()),
+                _ => None,
+            })
+            .expect("physics system present")
+    }
+
+    // Despawning a decomposed prop reaps its Rapier body, so it stops simulating
+    // (and colliding) once its entity is gone.
+    #[test]
+    fn despawning_a_prop_reaps_its_physics_body() {
+        use std::{thread, time::Duration};
+        let id = AssetId(1);
+        let mut world = World::new_empty();
+        world.add_component(PhysicsConfig::default());
+        world.add_component(ball_prop(id, [0.0, 5.0, 0.0], false));
+        world.add_component(ball_body(id));
+        world.start().unwrap();
+
+        // Settle so the body is live and falling.
+        for _ in 0..2 {
+            thread::sleep(Duration::from_millis(20));
+            world.step();
+        }
+        let before = body_count(&world);
+        let ball = world
+            .join2::<crate::assets::Collider, Transform>()
+            .next()
+            .map(|(e, _, _)| e)
+            .expect("ball entity");
+
+        // Despawn the ball (stand-in for GraphicsSystem) and step: PhysicsSystem
+        // reaps the orphaned body.
+        world.despawn(ball);
+        thread::sleep(Duration::from_millis(20));
+        world.step();
+        let after = body_count(&world);
+        assert_eq!(after, before - 1, "the despawned prop's body was removed");
+
+        // The sim keeps running cleanly with the body gone (no further removals).
+        thread::sleep(Duration::from_millis(20));
+        world.step();
+        assert_eq!(body_count(&world), after, "no further bodies removed");
+    }
+
+    // Picking up a carriable prop tags its entity with Held; the Prop column is
+    // drained, so the carried state lives only on the Held tag.
+    #[test]
+    fn pickup_sets_held_tag() {
+        use std::{thread, time::Duration};
+        let id = AssetId(1);
+        let mut world = World::new_empty();
+        world.add_component(PhysicsConfig::default());
+        world.add_component(ball_prop(id, [0.0, 1.0, -2.0], true));
+        world.add_component(ball_body(id));
+        world.add_component(interacting_camera([0.0, 1.0, 0.0]));
+        world.start().unwrap();
+
+        thread::sleep(Duration::from_millis(5));
+        world.step();
+
+        assert_eq!(
+            world.query::<Held>().count(),
+            1,
+            "pickup inserts the Held tag on the entity"
+        );
+        assert_eq!(
+            world.query::<Prop>().count(),
+            0,
+            "the Prop column is drained at load"
+        );
     }
 }

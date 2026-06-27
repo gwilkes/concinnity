@@ -415,6 +415,80 @@ pub(super) fn handle_rebind(text: &str) -> String {
     }
 }
 
+// Despawn an authored placement by its declared name.
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct DespawnCmdRequest {
+    #[serde(skip)]
+    _cmd: String,
+    name: String,
+}
+
+// Remove an authored placement (and its descendants) live by name: enqueue a
+// Despawn command the per-frame drive forwards to `dispatch_despawn`, which
+// sends a `DespawnRequest` the GraphicsSystem applies on its next step (hide the
+// draw slots + despawn the entity, cascading to children). `cn debug` only; lets
+// a headless harness remove an entity and screenshot it gone. The reply fires
+// once the command is queued.
+pub(super) fn handle_despawn(text: &str) -> String {
+    let req: DespawnCmdRequest = match serde_json::from_str(text) {
+        Ok(r) => r,
+        Err(e) => return error_reply(&format!("despawn: {e}")),
+    };
+    if req.name.trim().is_empty() {
+        return error_reply("despawn: missing 'name'");
+    }
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    super::runtime_spawn::enqueue(super::runtime_spawn::RuntimeCommand::Despawn {
+        name: req.name,
+        reply: tx,
+    });
+    match rx.recv_timeout(SPAWN_REPLY_TIMEOUT) {
+        Ok(Ok(())) => serde_json::json!({ "ok": true, "queued": true }).to_string(),
+        Ok(Err(e)) => error_reply(&e),
+        Err(_) => error_reply("despawn: timed out waiting for engine"),
+    }
+}
+
+// Re-parent an authored placement. `child` is moved under `parent`; a null or
+// omitted `parent` detaches the child to a root.
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct ReparentCmdRequest {
+    #[serde(skip)]
+    _cmd: String,
+    child: String,
+    parent: Option<String>,
+}
+
+// Re-parent an authored placement live by name: enqueue a Reparent command the
+// per-frame drive forwards to `dispatch_reparent`, which sends a
+// `ReparentRequest` the GraphicsSystem applies on its next step (re-point the
+// Parent edge + recompose world matrices). `cn debug` only; lets a headless
+// harness move an entity under a new parent and screenshot the result. The reply
+// fires once queued.
+pub(super) fn handle_reparent(text: &str) -> String {
+    let req: ReparentCmdRequest = match serde_json::from_str(text) {
+        Ok(r) => r,
+        Err(e) => return error_reply(&format!("reparent: {e}")),
+    };
+    if req.child.trim().is_empty() {
+        return error_reply("reparent: missing 'child'");
+    }
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    super::runtime_spawn::enqueue(super::runtime_spawn::RuntimeCommand::Reparent {
+        child: req.child,
+        // An empty / whitespace parent name detaches the child to a root.
+        parent: req.parent.filter(|p| !p.trim().is_empty()),
+        reply: tx,
+    });
+    match rx.recv_timeout(SPAWN_REPLY_TIMEOUT) {
+        Ok(Ok(())) => serde_json::json!({ "ok": true, "queued": true }).to_string(),
+        Ok(Err(e)) => error_reply(&e),
+        Err(_) => error_reply("reparent: timed out waiting for engine"),
+    }
+}
+
 // Move the active camera by a per-frame delta over a span of frames. All delta
 // fields default to 0 and `frames` to 0 (an indefinite hold cleared by
 // `camera-stop`); a profiling harness can then sustain motion mid-screenshot to
@@ -565,5 +639,36 @@ mod tests {
             serde_json::from_str::<CameraMoveRequest>(r#"{"cmd":"camera-move","frames":"lots"}"#)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn despawn_request_parses_name() {
+        let req: DespawnCmdRequest =
+            serde_json::from_str(r#"{"cmd":"despawn","name":"crate_a"}"#).expect("valid parses");
+        assert_eq!(req.name, "crate_a");
+    }
+
+    #[test]
+    fn despawn_request_defaults_to_empty_name() {
+        let req: DespawnCmdRequest =
+            serde_json::from_str(r#"{"cmd":"despawn"}"#).expect("bare command parses");
+        assert!(req.name.is_empty());
+    }
+
+    #[test]
+    fn reparent_request_parses_child_and_parent() {
+        let req: ReparentCmdRequest =
+            serde_json::from_str(r#"{"cmd":"reparent","child":"box_a","parent":"frame"}"#)
+                .expect("valid parses");
+        assert_eq!(req.child, "box_a");
+        assert_eq!(req.parent.as_deref(), Some("frame"));
+    }
+
+    #[test]
+    fn reparent_request_parent_optional() {
+        let req: ReparentCmdRequest = serde_json::from_str(r#"{"cmd":"reparent","child":"box_a"}"#)
+            .expect("bare parent parses");
+        assert_eq!(req.child, "box_a");
+        assert!(req.parent.is_none());
     }
 }

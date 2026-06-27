@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "concinnity-eas",
     "concinnity-core",
     "concinnity-cook",
     "concinnity-toolchain",
@@ -12,6 +13,7 @@ members = [
 ]
 
 default-members = [
+    "concinnity-eas",
     "concinnity-core",
     "concinnity-cook",
     "concinnity-toolchain",
@@ -21,7 +23,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 authors = ["Grant Wilkes <grant@concinnity.gg>"]
 edition = "2024"
 license = "MIT"

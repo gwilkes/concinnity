@@ -33,7 +33,7 @@ use super::context::VkContext;
 
 impl VkContext {
     // Bring the toggle-controlled features to match `q`, applied between frames
-    // (the GraphicsSystem drains the SettingCommand before the next draw_frame).
+    // (the GraphicsSystem reads the SettingCommand before the next draw_frame).
     // A build failure logs and leaves the prior state intact.
     pub(crate) fn apply_quality_settings(&mut self, q: QualitySettings) {
         if let Err(e) = self.apply_quality_settings_inner(q) {

@@ -76,17 +76,20 @@ pub struct GraphicsSystem {
     // frame.rs / streaming.rs / scene.rs runs as one cfg-free path across
     // Metal, DirectX, and Vulkan.
     backend: Option<Box<dyn RenderBackend>>,
-    // maps the i-th Prop (in world order) to its DrawObject index/indices in the
-    // backend, used to push updated model matrices when props are mutated at runtime.
-    // A model-backed prop has multiple entries (one per sub-mesh); a mesh-backed
-    // prop has exactly one.
-    prop_draw_indices: Vec<Vec<usize>>,
-    // parent index (into the same prop list) for each prop; None = world-space root.
-    prop_parents: Vec<Option<usize>>,
-    // scene each prop belongs to (resolved at build time), or None = always visible.
-    prop_scene: Vec<Option<AssetId>>,
     // active SceneReel bookkeeping; None when no SceneReel was declared.
     reel: Option<scene_reel::ReelState>,
+    // Cursor into the Events<SceneCommand> queue, tracking which scene jumps
+    // this system has already applied.
+    scene_cmd_cursor: crate::ecs::EventCursor,
+    // Cursor into the Events<SettingCommand> queue (settings-menu changes:
+    // graphics toggles, sliders, key rebinds, volume).
+    setting_cmd_cursor: crate::ecs::EventCursor,
+    // Cursor into the Events<DespawnRequest> queue (runtime entity despawn:
+    // cn debug `despawn`, and gameplay-driven removal once that path exists).
+    despawn_cmd_cursor: crate::ecs::EventCursor,
+    // Cursor into the Events<ReparentRequest> queue (runtime re-parenting:
+    // cn debug `reparent`, and gameplay-driven moves once that path exists).
+    reparent_cmd_cursor: crate::ecs::EventCursor,
     // Font atlas data, keyed by asset id, built during init().
     loaded_fonts: std::collections::HashMap<AssetId, text::LoadedFont>,
     // Asset-streaming subsystem for the albedo texture pool. Some only when a
@@ -122,21 +125,9 @@ pub struct GraphicsSystem {
     // `take_hot_reload_sources`. `cn run` never captures these; production
     // reads asset payloads from the compiled blob and never re-touches disk.
     pending_hot_reload_sources: Option<hot_reload_sources::HotReloadSources>,
-    // Init-time owned clones of every `Prop`, in the order they were queried
-    // by the draw-list builder. `Some` only under `cn debug`, captured so a
-    // world.jsonl edit can rebuild a same-order `Vec<Prop>` with the new
-    // transforms and feed it back into `compute_world_matrices`. `None`
-    // means hot-reload was off at init.
-    //
-    // The vec grows with `ctx.push(Prop)` when a hot-reloaded world.jsonl
-    // adds a Prop. `prop_parents` / `prop_draw_indices` / `prop_scene` are
-    // grown in lockstep so the per-frame transform loop indexes correctly.
-    init_props: Option<Vec<crate::assets::Prop>>,
-    // Auxiliary maps captured at init for the world.jsonl hot-reload pass to
-    // resolve a new Prop's material / texture / mesh / model references
-    // without re-running the build pipeline. `Some` only under `cn debug`.
-    // Read-only after init; new assets in the world.jsonl reload are rejected
-    // (those need a process restart).
+    // Texture-name map captured at init for runtime decal / emitter spawn to
+    // resolve an authored Texture name to its live pool slot. `Some` only under
+    // `cn debug`; read-only after init.
     world_reload: Option<WorldReloadState>,
     // Last `VolumetricFog` settings pushed to the backend, used by the
     // world.jsonl reload pass to dedupe: if the resolved value matches what's
@@ -222,44 +213,24 @@ struct SliderViz {
 // so its fields read as dead under `cargo check --lib`.
 #[allow(dead_code)]
 pub struct WorldReloadState {
-    pub material_map: std::collections::HashMap<
-        AssetId,
-        (usize, usize, crate::gfx::render_types::MaterialUniforms),
-    >,
+    // Texture asset name -> live pool slot, so runtime decal / emitter spawn
+    // (`cn debug`) can resolve an authored Texture name to its slot.
     pub texture_name_to_slot: std::collections::HashMap<AssetId, usize>,
-    pub model_map: std::collections::HashMap<AssetId, Vec<crate::assets::SubMeshRef>>,
-    // One example draw slot per mesh AssetId; the clone-static-draw-object
-    // path copies geometry (vertex/index regions, base_vertex, LOD slices)
-    // from this draw to seed a new prop's draw, so any draw that came from
-    // the same mesh works as a template.
-    pub mesh_id_to_draw: std::collections::HashMap<AssetId, usize>,
-    // Scene names declared at init (raw strings, in declaration order).
-    // Used by world.jsonl hot-reload to apply the same `<scene>_*` prefix
-    // resolution that [`crate::build::pipeline::resolve_scene_refs`] does at
-    // build time, so a hot-reload-added Prop ends up in the right scene.
-    pub scene_names: Vec<String>,
 }
 
 // Disjoint mutable view of the `GraphicsSystem` fields the hot-reload passes
-// edit in one tick: the active backend, plus the Prop-tracking + fog
-// bookkeeping the world.jsonl reload pass mutates in place. Returned by
-// [`GraphicsSystem::hot_reload_apply_parts`] so the binary-only
-// `DebugHook::tick` drive can apply the reload passes from outside the
-// per-system step without the library depending on it. The reload catalogue +
-// in-flight state live on the debug side (`crate::debug::hot_reload`), built
+// edit in one tick: the active backend, the texture-name map for runtime
+// decal / emitter spawn, and the fog bookkeeping the world.jsonl reload pass
+// dedupes against. Returned by [`GraphicsSystem::hot_reload_apply_parts`] so the
+// binary-only `DebugHook::tick` drive can apply the reload passes from outside
+// the per-system step without the library depending on it. The reload catalogue
+// + in-flight state live on the debug side (`crate::debug::hot_reload`), built
 // from [`HotReloadSources`]. The library never constructs this; hence the
 // `dead_code` allowance (the fields are read only from the `cn debug` binary's
 // drive, never under `cargo check --lib`).
 #[allow(dead_code)]
 pub struct HotReloadApplyParts<'a> {
     pub backend: &'a mut dyn RenderBackend,
-    // Init-order Prop snapshot the world.jsonl diff rebuilds against. Grows
-    // with the diff's adds; `prop_parents` / `prop_draw_indices` /
-    // `prop_scene` grow in lockstep.
-    pub init_props: &'a mut Option<Vec<crate::assets::Prop>>,
-    pub prop_parents: &'a mut Vec<Option<usize>>,
-    pub prop_draw_indices: &'a mut Vec<Vec<usize>>,
-    pub prop_scene: &'a mut Vec<Option<AssetId>>,
     pub world_reload: &'a Option<WorldReloadState>,
     pub last_fog_settings: &'a mut Option<crate::gfx::volumetric_fog::FogSettings>,
 }
@@ -332,10 +303,11 @@ impl GraphicsSystem {
             menu_mode: false,
             render_scale: crate::assets::UpscaleQuality::default(),
             backend: None,
-            prop_draw_indices: Vec::new(),
-            prop_parents: Vec::new(),
-            prop_scene: Vec::new(),
             reel: None,
+            scene_cmd_cursor: crate::ecs::EventCursor::default(),
+            setting_cmd_cursor: crate::ecs::EventCursor::default(),
+            despawn_cmd_cursor: crate::ecs::EventCursor::default(),
+            reparent_cmd_cursor: crate::ecs::EventCursor::default(),
             loaded_fonts: std::collections::HashMap::new(),
             texture_streamer: None,
             normal_map_streamer: None,
@@ -343,7 +315,6 @@ impl GraphicsSystem {
             mesh_stream_draw_indices: Vec::new(),
             chunk_stream: None,
             pending_hot_reload_sources: None,
-            init_props: None,
             world_reload: None,
             last_fog_settings: None,
             post_process: crate::gfx::render_types::PostProcessParams::DEFAULT,
@@ -395,7 +366,7 @@ impl GraphicsSystem {
         }
     }
 
-    // Disjoint mutable view of the backend + Prop-tracking fields the
+    // Disjoint mutable view of the backend + hot-reload bookkeeping the
     // binary-only `DebugHook::tick` reload drive applies changes through.
     // `None` until the backend is constructed. The library never calls this
     // (the asset hot-reload drive lives in the `cn debug` binary), so it reads
@@ -405,10 +376,6 @@ impl GraphicsSystem {
         let backend = self.backend.as_deref_mut()?;
         Some(HotReloadApplyParts {
             backend,
-            init_props: &mut self.init_props,
-            prop_parents: &mut self.prop_parents,
-            prop_draw_indices: &mut self.prop_draw_indices,
-            prop_scene: &mut self.prop_scene,
             world_reload: &self.world_reload,
             last_fog_settings: &mut self.last_fog_settings,
         })
@@ -489,6 +456,7 @@ pub(super) fn derive_quality_settings(
     }
 }
 
+mod despawn;
 mod frame;
 mod helpers;
 pub mod hot_reload_sources;

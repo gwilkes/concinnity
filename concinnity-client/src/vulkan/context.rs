@@ -349,9 +349,6 @@ pub(super) struct VkChunkStream {
     // mesh-streaming allocators.
     pub(super) vtx_alloc: crate::gfx::range_alloc::RangeAllocator,
     pub(super) idx_alloc: crate::gfx::range_alloc::RangeAllocator,
-    // `draw_objects` slots vacated by removed chunks, reused by the next
-    // `add_chunk_mesh` so the draw list does not grow without bound.
-    pub(super) free_slots: Vec<usize>,
     // Dedicated pool + one shared (albedo, normal) descriptor set for streamed
     // chunks.
     pub(super) descriptor_pool: Option<vk::DescriptorPool>,
@@ -1175,8 +1172,14 @@ pub struct VkContext {
     pub(super) clone_descriptor_pool: Option<vk::DescriptorPool>,
     // Per-clone (albedo, normal) descriptor sets, indexed by clone offset.
     // Empty until the first `clone_static_draw_object` runs; bounded by
-    // `MAX_CLONE_DRAWS` from `gfx::clone::MAX_CLONE_DRAWS`.
+    // `MAX_CLONE_DRAWS` from `gfx::clone::MAX_CLONE_DRAWS`. A set whose offset is
+    // in `clone_free_offsets` is allocated but unreferenced, ready for the next
+    // clone to reuse (re-pointed only if its textures differ).
     pub(super) clone_object_sets: Vec<vk::DescriptorSet>,
+    // Clone offsets vacated by a retired clone, popped by the next
+    // `clone_static_draw_object` so steady spawn/despawn churn reuses descriptor
+    // sets instead of exhausting the `MAX_CLONE_DRAWS` pool.
+    pub(super) clone_free_offsets: Vec<usize>,
     // `draw_idx → clone_offset` lookup the legacy main pass uses to pick
     // the right per-clone descriptor set when drawing an entry past
     // `n_objects` (chunks fall through to `chunk_object_set` instead).
@@ -1192,6 +1195,11 @@ pub struct VkContext {
 
     // Skinned (skeletally animated) mesh rendering. See `VkSkinned`.
     pub(super) skinned: VkSkinned,
+    // Free pool for the pre-reserved skinned instance slots a runtime skinned
+    // spawn claims. Seeded once from `seed_skinned_instance_pool` with the hidden
+    // bind-pose copies `upload_skinned` uploaded; empty for a world with no
+    // skinned mesh opting into runtime spawning.
+    pub(super) skinned_pool: crate::gfx::skinned_pool::SkinnedInstancePool,
 
     // Main-pass view (per-frame) + light (shared) uniform buffers. See
     // `VkUniforms`.
@@ -1213,6 +1221,16 @@ pub struct VkContext {
     pub(super) draw_objects: Vec<DrawObject>,
     pub(super) cull_bvh: crate::gfx::bvh::Bvh,
     pub(super) always_draw: Vec<u32>,
+    // Parallel to `draw_objects`: true where that slot is a member of
+    // `always_draw`, so `ensure_always_draw` adds a recycled slot at most once.
+    pub(super) always_draw_member: Vec<bool>,
+    // Free-list allocator over `draw_objects` slots. `retire_draw_object` /
+    // `remove_chunk_mesh` push a vacated slot; `clone_static_draw_object` /
+    // `add_chunk_mesh` pop one before growing the vec, so runtime spawn/despawn
+    // and chunk streaming reuse slots instead of leaking them. Indices stay
+    // stable (RenderHandle stores raw indices into draw_objects), so this is a
+    // free-list, never a compaction.
+    pub(super) draw_slots: crate::gfx::draw_slot::DrawSlotAllocator,
     // Per-frame scratch for the legacy CPU draw path's visible set
     // (BVH-culled cullables + always_draw fallback). `mem::take`d at the
     // top of record_frame and returned at the bottom so the heap allocation
@@ -1384,6 +1402,17 @@ impl VkContext {
             .sum();
         let objects =
             (self.draw_objects.len() + instanced_total + self.skinned.draw_objects.len()) as u32;
+        // Live skinned count: authored meshes plus runtime-spawned instances,
+        // excluding the hidden pre-reserved pool slots. `objects` above counts the
+        // whole pool and so stays flat across skinned spawn/despawn; this tracks
+        // the visible count, so a spawn bumps it and a despawn drops it.
+        let skinned_visible = self
+            .skinned
+            .draw_objects
+            .iter()
+            .filter(|o| o.visible)
+            .count() as u32;
+        let skinned_pool_free = self.skinned_pool.total_free() as u32;
         // GPU timing for the most-recently completed block on this frame slot:
         // the whole-frame pair plus one (start, end) pair per render pass. The
         // fence wait above guarantees the previous trip's writes have retired, so
@@ -1444,6 +1473,8 @@ impl VkContext {
         self.frame_stats.set(crate::gfx::profile::RenderStats {
             draw_calls: 0,
             objects,
+            skinned_visible,
+            skinned_pool_free,
             gpu_frame_us,
             vram_bytes,
             pass_times_us,
@@ -1605,13 +1636,44 @@ impl VkContext {
         }
     }
 
-    // Retire a draw object for a despawned entity: drop it from every pass and
-    // the ray-tracing acceleration structure. The slot stays allocated; it is
-    // not yet recycled. No-op if the index is out of range.
+    // Retire a draw object for a despawned entity: clear `visible` (drops it
+    // from the main / shadow / velocity passes) and `resident` (drops it from
+    // the ray-tracing BLAS / geometry-table rebuild), so it leaves no ghost in
+    // any pass, then return its slot to the free list so the next runtime clone
+    // (or streamed chunk) recycles it. The geometry buffers stay allocated. If
+    // the slot held a runtime clone, its descriptor-pool offset is freed too so
+    // a steady spawn/despawn cadence does not exhaust the clone pool. No-op if
+    // the index is out of range.
     pub fn retire_draw_object(&mut self, index: usize) {
         if let Some(obj) = self.draw_objects.get_mut(index) {
             obj.visible = false;
             obj.resident = false;
+            if let Some(offset) = self.clone_slot_by_draw_idx.remove(&index) {
+                self.clone_free_offsets.push(offset);
+            }
+            // Only the runtime-append region (streamed chunks + spawned clones,
+            // `index >= n_objects`) recycles its draw slots. A build-time slot
+            // stays allocated when hidden: the init-time cull BVH and the RT
+            // acceleration structure's `object_indices` are keyed to fixed
+            // build-time slot indices and cannot refit, so reusing one would
+            // mis-key them. (Metal recycles build-time slots too because its
+            // per-frame RT topology refresh re-admits them; Vulkan has no such
+            // refresh -- tracked as the RT incremental topology parity item.)
+            if index >= self.n_objects {
+                self.draw_slots.free(index);
+            }
+        }
+    }
+
+    // Add a draw slot to `always_draw` if it is not already a member. Runtime
+    // draws (chunks, spawned clones) are drawn unconditionally because the
+    // init-time BVH cannot refit to admit them; a slot recycled from a culled
+    // static prop is not yet in `always_draw` and must be added, while one
+    // recycled from another chunk / clone already is.
+    pub(super) fn ensure_always_draw(&mut self, slot: usize) {
+        if !self.always_draw_member[slot] {
+            self.always_draw.push(slot as u32);
+            self.always_draw_member[slot] = true;
         }
     }
 

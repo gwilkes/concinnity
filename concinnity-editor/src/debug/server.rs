@@ -19,6 +19,7 @@ use super::commands::{
     error_reply, handle_anim_crossfade, handle_camera_move, handle_camera_set, handle_camera_stop,
     handle_decal_add, handle_decal_remove, handle_despawn, handle_emitter_add,
     handle_emitter_remove, handle_quality_set, handle_rebind, handle_reparent, handle_screenshot,
+    handle_spawn,
 };
 use super::{hot_reload, runtime_spawn};
 // The world snapshot rebuilt by `tick`. The asset/system lists are not cheap
@@ -168,6 +169,7 @@ impl DebugServer {
                                     | runtime_spawn::RuntimeCommand::Rebind { .. }
                                     | runtime_spawn::RuntimeCommand::Despawn { .. }
                                     | runtime_spawn::RuntimeCommand::Reparent { .. }
+                                    | runtime_spawn::RuntimeCommand::Spawn { .. }
                             ) {
                                 deferred_ecs_cmds.push(cmd);
                             } else {
@@ -216,6 +218,9 @@ impl DebugServer {
                 }
                 runtime_spawn::RuntimeCommand::Reparent { .. } => {
                     runtime_spawn::dispatch_reparent(cmd, world);
+                }
+                runtime_spawn::RuntimeCommand::Spawn { .. } => {
+                    runtime_spawn::dispatch_spawn(cmd, world);
                 }
                 runtime_spawn::RuntimeCommand::CameraMove { args, reply } => {
                     // Accept the motion only when a camera exists, so the client
@@ -511,6 +516,8 @@ fn handle_request(text: &str, shared: &Arc<Mutex<DebugState>>) -> String {
                 "render": {
                     "draw_calls": r.draw_calls,
                     "objects": r.objects,
+                    "skinned_visible": r.skinned_visible,
+                    "skinned_pool_free": r.skinned_pool_free,
                     "gpu_frame_us": r.gpu_frame_us,
                     "vram_bytes": r.vram_bytes,
                     "auto_exposure_ev": r.auto_exposure_ev,
@@ -662,6 +669,12 @@ fn handle_request(text: &str, shared: &Arc<Mutex<DebugState>>) -> String {
             // drop the snapshot lock before blocking, like `despawn` above.
             drop(state);
             return handle_reparent(text);
+        }
+        "spawn" => {
+            // Runtime mutation (instantiate a copy of an authored placement):
+            // drop the snapshot lock before blocking, like `despawn` above.
+            drop(state);
+            return handle_spawn(text);
         }
         other => return error_reply(&format!("unknown cmd '{other}'")),
     };

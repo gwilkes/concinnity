@@ -138,9 +138,9 @@ fn passes_text(slots: &[PassTiming]) -> String {
 //
 // `EV` is the adapted exposure value the auto-exposure EMA settled on for
 // the most recent frame (the multiplier the post-process stack uses is
-// `2^ev`). Filled on every backend (Metal, DirectX, Vulkan) when the world's
-// `PostProcessConfig` enables auto-exposure; the chip stays blank otherwise so
-// a world without auto-exposure has no orphan reading.
+// `2^ev`). Filled when the world's `PostProcessConfig` enables auto-exposure;
+// the chip stays blank otherwise so a world without auto-exposure has no orphan
+// reading.
 //
 // `EDR` is the active panel's maximum extended-range colour-component
 // multiplier (e.g. `EDR x2.0` on an HDR400 panel, `x8.0` on HDR1000).

@@ -77,6 +77,10 @@ impl RenderBackend for MtlContext {
         fn retire_draw_object(&mut self, draw_idx: usize);
         fn upload_skinned(&mut self, vertices: &[SkinnedVertex], indices: &[u16], draw_objects: Vec<SkinnedDrawObject>, vert_bytes: &[u8], frag_bytes: &[u8], shadow_bytes: &[u8]) -> Result<(), String>;
         fn update_skinned_pose(&mut self, skinned_index: usize, matrices: &[[[f32; 4]; 4]]);
+        fn seed_skinned_instance_pool(&mut self, reservations: Vec<(usize, usize)>);
+        fn spawn_skinned_instance(&mut self, template_skinned_index: usize, model: [[f32; 4]; 4]) -> Option<usize>;
+        fn retire_skinned_draw_object(&mut self, skinned_index: usize);
+        fn update_skinned_model(&mut self, skinned_index: usize, model: [[f32; 4]; 4]);
         fn evict_texture_slot(&mut self, slot: usize) -> Result<(), String>;
         fn update_texture_slot(&mut self, slot: usize, w: u32, h: u32, px: &[u8]) -> Result<(), String>;
         fn evict_normal_map_slot(&mut self, slot: usize) -> Result<(), String>;
@@ -98,7 +102,7 @@ impl RenderBackend for MtlContext {
         fn update_skinned_mesh_geometry(&mut self, skinned_index: usize, vertex_base: u16, verts: &[crate::gfx::mesh_payload::SkinnedVertex], idxs: &[u16]) -> Result<(), String>;
         fn rebuild_skinned_geometry(&mut self, changes: Vec<crate::gfx::backend::SkinnedDrawGeometryUpdate>) -> Result<Vec<crate::gfx::backend::SkinnedSlotLayout>, String>;
         fn update_skinned_skeleton(&mut self, skinned_index: usize, new_joint_count: usize) -> Result<(), String>;
-        fn clone_static_draw_object(&mut self, src_draw_idx: usize, model: [[f32; 4]; 4], texture_slot: usize, normal_map_slot: usize, material: MaterialUniforms, cull_distance: f32) -> Result<usize, String>;
+        fn clone_static_draw_object(&mut self, src_draw_idx: usize, model: [[f32; 4]; 4]) -> Result<usize, String>;
         fn set_draw_material(&mut self, draw_idx: usize, material: MaterialUniforms, texture_slot: usize, normal_map_slot: usize);
         fn set_draw_cull_distance(&mut self, draw_idx: usize, cull_distance: f32);
         fn add_decal(&mut self, record: crate::gfx::decal::DecalRecord) -> Result<usize, String>;

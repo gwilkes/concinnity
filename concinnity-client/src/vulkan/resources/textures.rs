@@ -446,24 +446,21 @@ impl VkContext {
         &mut self,
         src_draw_idx: usize,
         model: [[f32; 4]; 4],
-        texture_slot: usize,
-        normal_map_slot: usize,
-        material: crate::gfx::render_types::MaterialUniforms,
-        cull_distance: f32,
     ) -> Result<usize, String> {
         use super::super::context::MAX_CLONE_DRAWS;
 
-        if self.clone_object_sets.len() >= MAX_CLONE_DRAWS {
-            return Err(format!(
-                "clone_static_draw_object: MAX_CLONE_DRAWS ({MAX_CLONE_DRAWS}) exceeded"
-            ));
-        }
         let src = self.draw_objects.get(src_draw_idx).ok_or_else(|| {
             format!(
                 "clone_static_draw_object: src draw {} out of range",
                 src_draw_idx
             )
         })?;
+        // A runtime spawn duplicates the template, swapping only the transform:
+        // copy the source's material, pool slots, and cull distance.
+        let texture_slot = src.texture_slot;
+        let normal_map_slot = src.normal_map_slot;
+        let material = src.material;
+        let cull_distance = src.cull_distance;
         let obj = crate::gfx::render_types::DrawObject {
             vertex_offset: src.vertex_offset,
             vertex_count: src.vertex_count,
@@ -485,49 +482,90 @@ impl VkContext {
             lod_alternates: src.lod_alternates.clone(),
         };
 
-        // Lazily build the clone descriptor pool on first call. Sized for
-        // MAX_CLONE_DRAWS (albedo, normal) sets: two samplers each.
-        let pool = match self.clone_descriptor_pool {
-            Some(p) => p,
-            None => {
-                let pool_sizes = [vk::DescriptorPoolSize::default()
-                    .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                    .descriptor_count((MAX_CLONE_DRAWS * 2) as u32)];
-                let pool = unsafe {
-                    self.device.create_descriptor_pool(
-                        &vk::DescriptorPoolCreateInfo::default()
-                            .pool_sizes(&pool_sizes)
-                            .max_sets(MAX_CLONE_DRAWS as u32),
-                        None,
-                    )
-                }
-                .map_err(|e| format!("clone descriptor pool: {e}"))?;
-                self.clone_descriptor_pool = Some(pool);
-                pool
-            }
-        };
-
-        let alloc_info = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(pool)
-            .set_layouts(std::slice::from_ref(&self.descriptors.object_set_layout));
-        let set = unsafe { self.device.allocate_descriptor_sets(&alloc_info) }
-            .map_err(|e| format!("allocate clone descriptor set: {e}"))?[0];
-
         let last_tex = self.textures.len().saturating_sub(1);
         let last_nm = self.normal_map_textures.len().saturating_sub(1);
         let albedo_view = self.textures[texture_slot.min(last_tex)].view;
         let normal_view = self.normal_map_textures[normal_map_slot.min(last_nm)].view;
-        self.write_object_image(set, 0, albedo_view);
-        self.write_object_image(set, 1, normal_view);
 
-        let clone_offset = self.clone_object_sets.len();
-        self.clone_object_sets.push(set);
-        self.clone_texture_slots.push(texture_slot);
-        self.clone_normal_map_slots.push(normal_map_slot);
+        // Reuse a vacated clone descriptor set, else allocate a fresh one up to
+        // the pool cap. A reused set may still be referenced by an in-flight frame
+        // (its prior occupant was drawn before being retired), so drain the GPU
+        // before re-pointing it, then always overwrite its (albedo, normal)
+        // bindings with this clone's views.
+        let clone_offset = if let Some(offset) = self.clone_free_offsets.pop() {
+            self.wait_idle();
+            let set = self.clone_object_sets[offset];
+            self.write_object_image(set, 0, albedo_view);
+            self.write_object_image(set, 1, normal_view);
+            self.clone_texture_slots[offset] = texture_slot;
+            self.clone_normal_map_slots[offset] = normal_map_slot;
+            offset
+        } else {
+            if self.clone_object_sets.len() >= MAX_CLONE_DRAWS {
+                return Err(format!(
+                    "clone_static_draw_object: MAX_CLONE_DRAWS ({MAX_CLONE_DRAWS}) exceeded"
+                ));
+            }
+            // Lazily build the clone descriptor pool on first call. Sized for
+            // MAX_CLONE_DRAWS (albedo, normal) sets: two samplers each.
+            let pool = match self.clone_descriptor_pool {
+                Some(p) => p,
+                None => {
+                    let pool_sizes = [vk::DescriptorPoolSize::default()
+                        .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                        .descriptor_count((MAX_CLONE_DRAWS * 2) as u32)];
+                    let pool = unsafe {
+                        self.device.create_descriptor_pool(
+                            &vk::DescriptorPoolCreateInfo::default()
+                                .pool_sizes(&pool_sizes)
+                                .max_sets(MAX_CLONE_DRAWS as u32),
+                            None,
+                        )
+                    }
+                    .map_err(|e| format!("clone descriptor pool: {e}"))?;
+                    self.clone_descriptor_pool = Some(pool);
+                    pool
+                }
+            };
 
-        self.draw_objects.push(obj);
-        let new_idx = self.draw_objects.len() - 1;
-        self.always_draw.push(new_idx as u32);
+            let alloc_info = vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(pool)
+                .set_layouts(std::slice::from_ref(&self.descriptors.object_set_layout));
+            let set = unsafe { self.device.allocate_descriptor_sets(&alloc_info) }
+                .map_err(|e| format!("allocate clone descriptor set: {e}"))?[0];
+            self.write_object_image(set, 0, albedo_view);
+            self.write_object_image(set, 1, normal_view);
+
+            let offset = self.clone_object_sets.len();
+            self.clone_object_sets.push(set);
+            self.clone_texture_slots.push(texture_slot);
+            self.clone_normal_map_slots.push(normal_map_slot);
+            offset
+        };
+
+        // Recycle a vacated draw slot when one is free, else append.
+        let new_idx = match self.draw_slots.allocate() {
+            crate::gfx::draw_slot::SlotAlloc::Reuse(slot) => {
+                self.draw_objects[slot] = obj;
+                // Seed the velocity prepass's previous-model snapshot so a
+                // recycled slot does not ghost from the prior occupant's
+                // transform for one frame. A slot past the snapshot's end (one
+                // appended beyond the build-time object count) falls back to its
+                // own current model in the prepass, so the guard is enough.
+                if let Some(gb) = &mut self.gbuffer
+                    && slot < gb.prev_models.len()
+                {
+                    gb.prev_models[slot] = model;
+                }
+                slot
+            }
+            crate::gfx::draw_slot::SlotAlloc::Append(slot) => {
+                self.draw_objects.push(obj);
+                self.always_draw_member.push(false);
+                slot
+            }
+        };
+        self.ensure_always_draw(new_idx);
         self.clone_slot_by_draw_idx.insert(new_idx, clone_offset);
         Ok(new_idx)
     }

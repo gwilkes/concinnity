@@ -75,9 +75,14 @@ impl VkContext {
     // Chunk geometry already lives in the shared VB/IB, so chunks fold into the
     // static+instance prefix indirect draw as plain records (with their own
     // `base_vertex` + flat-pool material). Runtime clones (in `clone_slot_by_draw_idx`)
-    // are skipped -- they keep the legacy per-object path. Bounded by the chunk
-    // reserve `n_chunk`. Returns the number of chunk records emitted (so the caller
-    // can disable the unused reserve tail). Mirrors `directx/draw_iter.rs`.
+    // are skipped -- they keep the legacy per-object path. Non-resident slots are
+    // skipped too: chunks and clones now share the draw-slot free list, so a retired
+    // clone leaves a non-resident gap in this tail (no longer in
+    // `clone_slot_by_draw_idx`); counting those gaps toward `k` could push a live
+    // chunk past `n_chunk` and silently drop it. Only resident chunks consume a
+    // reserve index, bounded by the streaming window (<= `n_chunk`). Returns the
+    // number of chunk records emitted (so the caller can disable the unused reserve
+    // tail). Mirrors `directx/draw_iter.rs`.
     pub(in crate::vulkan) fn for_each_chunk_record<F>(&self, mut emit: F) -> usize
     where
         F: FnMut(usize, &crate::gfx::render_types::DrawObject),
@@ -89,6 +94,9 @@ impl VkContext {
         for (i, obj) in self.draw_objects.iter().enumerate().skip(self.n_objects) {
             if self.clone_slot_by_draw_idx.contains_key(&i) {
                 continue; // runtime clone -> legacy per-object path
+            }
+            if !obj.resident {
+                continue; // retired chunk / clone gap -- not a live chunk
             }
             if k >= self.n_chunk {
                 break;

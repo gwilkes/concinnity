@@ -90,6 +90,12 @@ pub struct GraphicsSystem {
     // Cursor into the Events<ReparentRequest> queue (runtime re-parenting:
     // cn debug `reparent`, and gameplay-driven moves once that path exists).
     reparent_cmd_cursor: crate::ecs::EventCursor,
+    // Cursor into the Events<SpawnRequest> queue (runtime entity spawn: cn debug
+    // `spawn`, and gameplay-driven spawning once that path exists).
+    spawn_cmd_cursor: crate::ecs::EventCursor,
+    // Cumulative elapsed seconds at the previous step, so the step can derive a
+    // per-frame dt for the Lifetime countdown.
+    prev_elapsed: f32,
     // Font atlas data, keyed by asset id, built during init().
     loaded_fonts: std::collections::HashMap<AssetId, text::LoadedFont>,
     // Asset-streaming subsystem for the albedo texture pool. Some only when a
@@ -308,6 +314,8 @@ impl GraphicsSystem {
             setting_cmd_cursor: crate::ecs::EventCursor::default(),
             despawn_cmd_cursor: crate::ecs::EventCursor::default(),
             reparent_cmd_cursor: crate::ecs::EventCursor::default(),
+            spawn_cmd_cursor: crate::ecs::EventCursor::default(),
+            prev_elapsed: 0.0,
             loaded_fonts: std::collections::HashMap::new(),
             texture_streamer: None,
             normal_map_streamer: None,
@@ -462,4 +470,5 @@ mod helpers;
 pub mod hot_reload_sources;
 mod init;
 mod scene;
+mod spawn;
 mod streaming;

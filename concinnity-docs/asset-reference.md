@@ -926,6 +926,33 @@ obstacle.
 - `gravity_scale`: A float. Multiplier applied to world gravity for this body. 1.0 is normal. Defaults to `1.0`.
 - `linear_damping`: A float. Linear velocity damping, modelling air drag. Defaults to `0.05`.
 
+### Spawner
+
+Periodically instantiates copies of an existing placement at this entity's
+position.
+
+A spawner clones `template` (the name of another placement in the world)
+every `interval` seconds, giving each copy a `lifetime` after which it is
+automatically removed. Pairing a short lifetime with a short interval keeps a
+bounded population churning (an enemy wave, a particle of debris, a fountain
+of props) and is what exercises GPU draw-slot recycling: each expiry frees a
+slot the next spawn reuses.
+
+The spawner's own `Transform` (its position) is where copies appear, so place
+the spawner where you want the stream to originate.
+
+```jsonl
+{"name":"crate","type":"Prop","args":{"mesh":"box_mesh","material":"mat_brick","position":[0.0,1.0,-6.0]}}
+{"name":"fountain","type":"Prop","args":{"mesh":"box_mesh","position":[0.0,1.0,-3.0]}}
+{"name":"fountain_spawner","type":"Spawner","args":{"template":"crate","interval":0.5,"lifetime":2.0}}
+```
+
+#### Parameters
+
+- `template`: A string. Name of the placement to copy on each spawn.
+- `interval`: A float. Seconds between spawns. Defaults to `1.0`.
+- `lifetime`: A float. Seconds each spawned copy lives before auto-removal; 0 keeps it forever. Defaults to `0.0`.
+
 ## Animation
 
 ### Animation
@@ -1057,6 +1084,7 @@ supply them.
 - `scale`: An array of 3 floats. World scale.
 - `lod_levels`: An integer. Number of level-of-detail versions to generate, including the original. `1` (the default) generates none; values are clamped to `[1, 8]`.
 - `lod_distances`: An array of floats. Camera distances at which to switch to each lower-detail version. When non-empty, must have exactly `lod_levels - 1` entries; empty lets the build choose defaults.
+- `max_instances`: An integer. How many runtime copies of this mesh may exist at once beyond the authored one. `0` (the default) means the mesh is not runtime-spawnable. A non-zero value pre-reserves that many extra instance slots at load: the engine appends that many hidden bind-pose copies to the skinned geometry so a runtime spawn can claim one without growing any GPU buffer, and a despawn returns it to the pool. Spawns past the reserve are dropped (a warning is logged). Capped at 4096.
 
 ## Audio
 

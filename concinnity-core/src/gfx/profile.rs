@@ -28,6 +28,16 @@ pub struct RenderStats {
     // Renderable objects in the scene this frame: static draw objects, every
     // instanced-cluster instance, and skinned meshes.
     pub objects: u32,
+    // Visible skinned objects this frame: the authored skinned meshes plus any
+    // live runtime-spawned instances, excluding the hidden pre-reserved
+    // instance-pool slots. Unlike `objects` (which counts the whole pre-reserved
+    // pool and so stays flat across skinned spawn/despawn), this tracks the live
+    // count, so a spawn bumps it and a despawn drops it.
+    pub skinned_visible: u32,
+    // Free slots remaining in the pre-reserved skinned instance pool across all
+    // templates. Drains by one when a skinned instance spawns and refills when
+    // one despawns, so a probe can watch the free-list recycle directly.
+    pub skinned_pool_free: u32,
     // GPU execution time of the most recently completed frame, in
     // microseconds. Reported one or more frames late: the GPU timestamps are
     // only known once that frame's command buffer completion handler fires.
@@ -65,6 +75,8 @@ impl Default for RenderStats {
         Self {
             draw_calls: 0,
             objects: 0,
+            skinned_visible: 0,
+            skinned_pool_free: 0,
             gpu_frame_us: 0,
             vram_bytes: 0,
             pass_times_us: [("", 0); MAX_PASS_TIMINGS],

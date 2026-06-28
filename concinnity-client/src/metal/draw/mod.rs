@@ -108,6 +108,17 @@ impl MtlContext {
             .sum();
         self.frame_stats.objects =
             (self.draw_objects.len() + instanced_total + self.skinned.draw_objects.len()) as u32;
+        // Live skinned count: authored meshes plus runtime-spawned instances,
+        // excluding the hidden pre-reserved pool slots. `objects` above counts
+        // the whole pool and so stays flat across skinned spawn/despawn; this
+        // tracks the visible count, so a spawn bumps it and a despawn drops it.
+        self.frame_stats.skinned_visible = self
+            .skinned
+            .draw_objects
+            .iter()
+            .filter(|o| o.visible)
+            .count() as u32;
+        self.frame_stats.skinned_pool_free = self.skinned_pool.total_free() as u32;
         // Current GPU memory footprint. On Apple Silicon's unified memory this
         // is the Metal device's allocation within system RAM.
         self.frame_stats.vram_bytes = self.device.currentAllocatedSize() as u64;

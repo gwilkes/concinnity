@@ -489,6 +489,58 @@ pub(super) fn handle_reparent(text: &str) -> String {
     }
 }
 
+// Spawn a runtime copy of an authored placement. `template` names the existing
+// placement to copy; `name` is the new instance's identity. `position` /
+// `rotation_deg` / `scale` place it (scale defaults to unit). A non-null
+// `lifetime` (seconds) makes the instance auto-despawn after that long, which
+// is what exercises draw-slot recycling.
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct SpawnCmdRequest {
+    #[serde(skip)]
+    _cmd: String,
+    template: String,
+    name: String,
+    position: [f32; 3],
+    rotation_deg: [f32; 3],
+    scale: [f32; 3],
+    lifetime: Option<f32>,
+}
+
+// Instantiate a copy of an authored placement live by name: enqueue a Spawn
+// command the per-frame drive forwards to `dispatch_spawn`, which sends a
+// `SpawnRequest` the GraphicsSystem applies on its next step (cloning the
+// template's draw slots into recycled slots and building the new entity).
+// `cn debug` only; lets a headless harness spawn an instance and screenshot it,
+// then watch its Lifetime expire. The reply fires once the command is queued.
+pub(super) fn handle_spawn(text: &str) -> String {
+    let req: SpawnCmdRequest = match serde_json::from_str(text) {
+        Ok(r) => r,
+        Err(e) => return error_reply(&format!("spawn: {e}")),
+    };
+    if req.template.trim().is_empty() {
+        return error_reply("spawn: missing 'template'");
+    }
+    if req.name.trim().is_empty() {
+        return error_reply("spawn: missing 'name'");
+    }
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    super::runtime_spawn::enqueue(super::runtime_spawn::RuntimeCommand::Spawn {
+        template: req.template,
+        name: req.name,
+        position: req.position,
+        rotation_deg: req.rotation_deg,
+        scale: req.scale,
+        lifetime: req.lifetime,
+        reply: tx,
+    });
+    match rx.recv_timeout(SPAWN_REPLY_TIMEOUT) {
+        Ok(Ok(())) => serde_json::json!({ "ok": true, "queued": true }).to_string(),
+        Ok(Err(e)) => error_reply(&e),
+        Err(_) => error_reply("spawn: timed out waiting for engine"),
+    }
+}
+
 // Move the active camera by a per-frame delta over a span of frames. All delta
 // fields default to 0 and `frames` to 0 (an indefinite hold cleared by
 // `camera-stop`); a profiling harness can then sustain motion mid-screenshot to

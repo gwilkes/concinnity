@@ -71,6 +71,10 @@ impl RenderBackend for VkContext {
         fn update_model(&mut self, index: usize, model: [[f32; 4]; 4]);
         fn retire_draw_object(&mut self, draw_idx: usize);
         fn update_skinned_pose(&mut self, skinned_index: usize, matrices: &[[[f32; 4]; 4]]);
+        fn seed_skinned_instance_pool(&mut self, reservations: Vec<(usize, usize)>);
+        fn spawn_skinned_instance(&mut self, template_skinned_index: usize, model: [[f32; 4]; 4]) -> Option<usize>;
+        fn retire_skinned_draw_object(&mut self, skinned_index: usize);
+        fn update_skinned_model(&mut self, skinned_index: usize, model: [[f32; 4]; 4]);
         fn evict_texture_slot(&mut self, slot: usize) -> Result<(), String>;
         fn update_texture_slot(&mut self, slot: usize, w: u32, h: u32, px: &[u8]) -> Result<(), String>;
         fn evict_normal_map_slot(&mut self, slot: usize) -> Result<(), String>;
@@ -95,7 +99,7 @@ impl RenderBackend for VkContext {
         fn update_skinned_skeleton(&mut self, skinned_index: usize, new_joint_count: usize) -> Result<(), String>;
         fn rebuild_static_geometry(&mut self, changes: Vec<crate::gfx::backend::DrawGeometryUpdate>) -> Result<(), String>;
         fn rebuild_skinned_geometry(&mut self, changes: Vec<crate::gfx::backend::SkinnedDrawGeometryUpdate>) -> Result<Vec<crate::gfx::backend::SkinnedSlotLayout>, String>;
-        fn clone_static_draw_object(&mut self, src_draw_idx: usize, model: [[f32; 4]; 4], texture_slot: usize, normal_map_slot: usize, material: crate::gfx::render_types::MaterialUniforms, cull_distance: f32) -> Result<usize, String>;
+        fn clone_static_draw_object(&mut self, src_draw_idx: usize, model: [[f32; 4]; 4]) -> Result<usize, String>;
     }
 
     // Non-1:1 forwarders kept explicit.

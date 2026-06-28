@@ -94,6 +94,8 @@ crate::define_components! {
         GlobalTransform   => assets::GlobalTransform,   75,
         RenderHandle      => assets::RenderHandle,      76,
         Held              => assets::Held,              77,
+        Lifetime          => assets::Lifetime,          78,
+        Spawner           => assets::Spawner,           79,
 }
 
 #[cfg(test)]

@@ -335,9 +335,35 @@ impl GraphicsSystem {
                         super::spawn::spawn_from_template(
                             ctx,
                             template,
-                            req.name,
+                            Some(req.name),
                             req.transform,
                             req.lifetime_secs,
+                            |src, model| backend.clone_static_draw_object(src, model).ok(),
+                        );
+                    }
+                }
+
+                // Cadence-driven spawn: advance every Spawner's clock and
+                // instantiate the copies now due, at the spawner's position.
+                // Transient (unnamed) and Lifetime-bounded, so a steady spawner
+                // churns through recycled draw slots. After the SpawnRequest
+                // drain so both spawn paths reuse slots freed this frame.
+                let due_spawns = super::spawn::tick_spawners(ctx, dt);
+                if !due_spawns.is_empty() {
+                    let by_name = ctx
+                        .resource::<crate::ecs::decompose::EntityByName>()
+                        .map(|n| n.0.clone())
+                        .unwrap_or_default();
+                    for due in due_spawns {
+                        let Some(&template) = by_name.get(&due.template) else {
+                            continue;
+                        };
+                        super::spawn::spawn_from_template(
+                            ctx,
+                            template,
+                            None,
+                            due.transform,
+                            due.lifetime,
                             |src, model| backend.clone_static_draw_object(src, model).ok(),
                         );
                     }

@@ -6,7 +6,9 @@
 // invalidating every later index. Instead the allocator hands out a vacated
 // slot before growing the vec: `retire` pushes a freed index, the next runtime
 // spawn pops it. Streamed chunks were the first consumer (one freed chunk's
-// slot reused by the next); runtime entity spawn/despawn is the second.
+// slot reused by the next); runtime entity spawn/despawn is the second. All
+// three backends (Metal, DirectX, Vulkan) route their draw-slot allocation
+// through this.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlotAlloc {

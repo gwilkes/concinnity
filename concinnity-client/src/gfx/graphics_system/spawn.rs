@@ -8,7 +8,7 @@
 // instances so their freed draw slots can be recycled by the next spawn.
 
 use crate::assets::{
-    GlobalTransform, Lifetime, MeshRenderer, ModelRenderer, RenderHandle, Transform,
+    GlobalTransform, Lifetime, MeshRenderer, ModelRenderer, RenderHandle, Spawner, Transform,
 };
 use crate::ecs::asset_id::AssetId;
 use crate::ecs::decompose::EntityByName;
@@ -20,13 +20,15 @@ use crate::ecs::{Entity, PipelineContext};
 // placement, and an optional Lifetime. `clone_slot(src_draw_idx, model)`
 // returns the new backend slot index (a vacated slot reused, or a freshly
 // appended one); it is the seam the test drives with a DrawSlotAllocator
-// instead of a live backend. The new entity is registered under `name` so it
-// can later be addressed by name like an authored placement. Returns the new
-// entity, or None when the template has no draw slots to copy or a clone fails.
+// instead of a live backend. When `name` is Some the new entity is registered
+// under it so it can later be addressed by name like an authored placement;
+// transient spawns (a Spawner's churn) pass None to avoid interning a name per
+// spawn. Returns the new entity, or None when the template has no draw slots to
+// copy or a clone fails.
 pub(super) fn spawn_from_template(
     ctx: &mut PipelineContext,
     template: Entity,
-    name: AssetId,
+    name: Option<AssetId>,
     transform: Transform,
     lifetime: Option<f32>,
     mut clone_slot: impl FnMut(usize, [[f32; 4]; 4]) -> Option<usize>,
@@ -59,10 +61,54 @@ pub(super) fn spawn_from_template(
     if let Some(secs) = lifetime {
         ctx.insert(entity, Lifetime { remaining: secs });
     }
-    if let Some(by_name) = ctx.resource_mut::<EntityByName>() {
+    if let Some(name) = name
+        && let Some(by_name) = ctx.resource_mut::<EntityByName>()
+    {
         by_name.0.insert(name, entity);
     }
     Some(entity)
+}
+
+// One spawn a Spawner is due to emit this step: the template to copy, where to
+// place it, and how long the copy should live. Returned by `tick_spawners` for
+// the caller to route through `spawn_from_template` with the live backend, the
+// same way `tick_lifetimes` returns expiries for the caller to despawn.
+pub(super) struct DueSpawn {
+    pub template: AssetId,
+    pub transform: Transform,
+    pub lifetime: Option<f32>,
+}
+
+// Advance every Spawner's clock by `dt` and return the spawns now due. A
+// spawner emits one copy per whole `interval` elapsed (so a long frame that
+// crosses several intervals catches up), at the spawner entity's own Transform.
+// A non-positive interval is inert (never spawns). A zero `lifetime` means the
+// copy is not auto-removed; otherwise it carries that countdown.
+pub(super) fn tick_spawners(ctx: &mut PipelineContext, dt: f32) -> Vec<DueSpawn> {
+    let spawners: Vec<(Entity, AssetId, f32, f32)> = ctx
+        .query_with_entity::<Spawner>()
+        .map(|(entity, s)| (entity, s.template, s.interval, s.lifetime))
+        .collect();
+    let mut due = Vec::new();
+    for (entity, template, interval, lifetime) in spawners {
+        if interval <= 0.0 {
+            continue;
+        }
+        let transform = ctx.get::<Transform>(entity).copied().unwrap_or_default();
+        if let Some(spawner) = ctx.get_mut::<Spawner>(entity) {
+            spawner.elapsed += dt;
+            while spawner.elapsed >= interval {
+                spawner.elapsed -= interval;
+                spawner.count += 1;
+                due.push(DueSpawn {
+                    template,
+                    transform,
+                    lifetime: (lifetime > 0.0).then_some(lifetime),
+                });
+            }
+        }
+    }
+    due
 }
 
 // Decrement every Lifetime by `dt` and return the entities whose countdown
@@ -148,7 +194,7 @@ mod tests {
             let first = spawn_from_template(
                 ctx,
                 template,
-                AssetId(1),
+                Some(AssetId(1)),
                 Transform::default(),
                 Some(0.5),
                 |_src, _model| Some(alloc_slot(&mut alloc)),
@@ -172,7 +218,7 @@ mod tests {
             let second = spawn_from_template(
                 ctx,
                 template,
-                AssetId(2),
+                Some(AssetId(2)),
                 Transform::default(),
                 None,
                 |_src, _model| Some(alloc_slot(&mut alloc)),
@@ -198,7 +244,7 @@ mod tests {
             let spawned = spawn_from_template(
                 ctx,
                 template,
-                AssetId(42),
+                Some(AssetId(42)),
                 Transform::default(),
                 None,
                 |_src, _model| Some(alloc_slot(&mut alloc)),
@@ -207,6 +253,62 @@ mod tests {
 
             let by_name = ctx.resource::<EntityByName>().unwrap();
             assert_eq!(by_name.get(AssetId(42)), Some(spawned));
+        });
+    }
+
+    #[test]
+    fn spawner_emits_one_copy_per_interval_elapsed() {
+        run(|ctx| {
+            let spawner = ctx.components.spawn();
+            ctx.insert(
+                spawner,
+                Transform {
+                    position: [1.0, 2.0, 3.0],
+                    ..Transform::default()
+                },
+            );
+            ctx.insert(
+                spawner,
+                Spawner {
+                    template: AssetId(7),
+                    interval: 1.0,
+                    lifetime: 2.0,
+                    elapsed: 0.0,
+                    count: 0,
+                },
+            );
+
+            // Below the interval: nothing due, but the clock advances.
+            assert!(tick_spawners(ctx, 0.5).is_empty());
+            // Crossing the interval emits one, carrying the lifetime + template
+            // and the spawner's own position.
+            let due = tick_spawners(ctx, 0.6);
+            assert_eq!(due.len(), 1);
+            assert_eq!(due[0].template, AssetId(7));
+            assert_eq!(due[0].lifetime, Some(2.0));
+            assert_eq!(due[0].transform.position, [1.0, 2.0, 3.0]);
+            // A long frame crossing several intervals catches up.
+            assert_eq!(tick_spawners(ctx, 2.5).len(), 2);
+            assert_eq!(ctx.get::<Spawner>(spawner).unwrap().count, 3);
+        });
+    }
+
+    #[test]
+    fn spawner_with_nonpositive_interval_is_inert() {
+        run(|ctx| {
+            let spawner = ctx.components.spawn();
+            ctx.insert(spawner, Transform::default());
+            ctx.insert(
+                spawner,
+                Spawner {
+                    template: AssetId(7),
+                    interval: 0.0,
+                    lifetime: 0.0,
+                    elapsed: 0.0,
+                    count: 0,
+                },
+            );
+            assert!(tick_spawners(ctx, 100.0).is_empty());
         });
     }
 

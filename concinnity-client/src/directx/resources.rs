@@ -557,22 +557,19 @@ impl DxContext {
         &mut self,
         src_draw_idx: usize,
         model: [[f32; 4]; 4],
-        texture_slot: usize,
-        normal_map_slot: usize,
-        material: MaterialUniforms,
-        cull_distance: f32,
     ) -> Result<usize, String> {
-        if self.clone.count >= MAX_CLONE_DRAWS {
-            return Err(format!(
-                "clone_static_draw_object: MAX_CLONE_DRAWS ({MAX_CLONE_DRAWS}) exceeded"
-            ));
-        }
         let src = self.draw_objects.get(src_draw_idx).ok_or_else(|| {
             format!(
                 "clone_static_draw_object: src draw {} out of range",
                 src_draw_idx
             )
         })?;
+        // A runtime spawn duplicates the template, swapping only the transform:
+        // copy the source's material, pool slots, and cull distance.
+        let texture_slot = src.texture_slot;
+        let normal_map_slot = src.normal_map_slot;
+        let material = src.material;
+        let cull_distance = src.cull_distance;
         let obj = DrawObject {
             vertex_offset: src.vertex_offset,
             vertex_count: src.vertex_count,
@@ -594,7 +591,33 @@ impl DxContext {
             lod_alternates: src.lod_alternates.clone(),
         };
 
-        let clone_offset = self.clone.count;
+        // Reuse a vacated clone descriptor-pool offset, else grow the pool up to
+        // its cap. `count` is the high-water mark of distinct offsets handed out.
+        let mut reused_offset = false;
+        let clone_offset = if let Some(offset) = self.clone.free_offsets.pop() {
+            reused_offset = true;
+            offset
+        } else if self.clone.count < MAX_CLONE_DRAWS {
+            let offset = self.clone.count;
+            self.clone.count += 1;
+            offset
+        } else {
+            return Err(format!(
+                "clone_static_draw_object: MAX_CLONE_DRAWS ({MAX_CLONE_DRAWS}) exceeded"
+            ));
+        };
+
+        // Always (re)point the offset's (albedo, normal) SRV pair at this clone's
+        // textures. A reused offset's pair may still be referenced by an in-flight
+        // command list (its prior occupant was drawn before being retired) AND its
+        // texture pool slot may have been stream-swapped to a new resource while
+        // the offset sat free -- `rewrite_albedo_slot` only refreshes offsets still
+        // live in `slot_by_draw_idx`, so a freed offset's baked SRV can dangle at a
+        // released resource -- so drain the GPU first on reuse, then overwrite with
+        // the live resource. A fresh offset was never bound, so no drain is needed.
+        if reused_offset {
+            self.wait_idle();
+        }
         let albedo_slot = self.clone.srv_base_slot + clone_offset * 2;
         let normal_slot = albedo_slot + 1;
         let last_tex = self.descriptors.textures.len().saturating_sub(1);
@@ -610,11 +633,31 @@ impl DxContext {
             self.srv_slot_cpu(normal_slot),
         );
 
-        self.draw_objects.push(obj);
-        let new_idx = self.draw_objects.len() - 1;
-        self.always_draw.push(new_idx as u32);
+        // Recycle a vacated draw slot when one is free, else append.
+        let new_idx = match self.draw_slots.allocate() {
+            crate::gfx::draw_slot::SlotAlloc::Reuse(slot) => {
+                self.draw_objects[slot] = obj;
+                // Seed the velocity prepass's previous-model snapshot so a
+                // recycled slot does not ghost from the prior occupant's
+                // transform for one frame. A slot past the snapshot's end (one
+                // appended beyond the build-time object count) falls back to its
+                // own current model in the prepass, so the guard is enough.
+                if let Some(gbuffer) = &self.gbuffer {
+                    let mut prev = gbuffer.prev_models.borrow_mut();
+                    if slot < prev.len() {
+                        prev[slot] = model;
+                    }
+                }
+                slot
+            }
+            crate::gfx::draw_slot::SlotAlloc::Append(slot) => {
+                self.draw_objects.push(obj);
+                self.always_draw_member.push(false);
+                slot
+            }
+        };
+        self.ensure_always_draw(new_idx);
         self.clone.slot_by_draw_idx.insert(new_idx, clone_offset);
-        self.clone.count += 1;
         Ok(new_idx)
     }
 
@@ -1184,17 +1227,22 @@ impl DxContext {
             lod_alternates: Vec::new(),
         };
 
-        // Reuse a vacated chunk slot when one is free, else append. A reused
-        // slot is already in `always_draw`; a fresh one must be added.
-        let draw_idx = if let Some(slot) = self.chunk_stream.free_slots.pop() {
-            self.draw_objects[slot] = obj;
-            slot
-        } else {
-            self.draw_objects.push(obj);
-            let idx = self.draw_objects.len() - 1;
-            self.always_draw.push(idx as u32);
-            idx
+        // Reuse a vacated draw slot when one is free, else append. A slot
+        // recycled from a culled static prop is not yet in `always_draw`;
+        // `ensure_always_draw` adds it, while one recycled from another chunk /
+        // clone already is.
+        let draw_idx = match self.draw_slots.allocate() {
+            crate::gfx::draw_slot::SlotAlloc::Reuse(slot) => {
+                self.draw_objects[slot] = obj;
+                slot
+            }
+            crate::gfx::draw_slot::SlotAlloc::Append(slot) => {
+                self.draw_objects.push(obj);
+                self.always_draw_member.push(false);
+                slot
+            }
         };
+        self.ensure_always_draw(draw_idx);
         // Seed the G-buffer pre-pass's previous-model snapshot for a recycled
         // slot so a fresh chunk does not inherit the removed chunk's transform
         // and ghost for one frame. A fresh append is past the snapshot's end
@@ -1232,7 +1280,7 @@ impl DxContext {
         let obj = &mut self.draw_objects[draw_idx];
         obj.visible = false;
         obj.resident = false;
-        self.chunk_stream.free_slots.push(draw_idx);
+        self.draw_slots.free(draw_idx);
         Ok(())
     }
 

@@ -95,7 +95,7 @@ impl RenderBackend for VkContext {
         fn update_skinned_skeleton(&mut self, skinned_index: usize, new_joint_count: usize) -> Result<(), String>;
         fn rebuild_static_geometry(&mut self, changes: Vec<crate::gfx::backend::DrawGeometryUpdate>) -> Result<(), String>;
         fn rebuild_skinned_geometry(&mut self, changes: Vec<crate::gfx::backend::SkinnedDrawGeometryUpdate>) -> Result<Vec<crate::gfx::backend::SkinnedSlotLayout>, String>;
-        fn clone_static_draw_object(&mut self, src_draw_idx: usize, model: [[f32; 4]; 4], texture_slot: usize, normal_map_slot: usize, material: crate::gfx::render_types::MaterialUniforms, cull_distance: f32) -> Result<usize, String>;
+        fn clone_static_draw_object(&mut self, src_draw_idx: usize, model: [[f32; 4]; 4]) -> Result<usize, String>;
     }
 
     // Non-1:1 forwarders kept explicit.

@@ -216,15 +216,22 @@ impl VkContext {
             lod_alternates: Vec::new(),
         };
 
-        let draw_idx = if let Some(slot) = self.chunk_stream.free_slots.pop() {
-            self.draw_objects[slot] = obj;
-            slot
-        } else {
-            self.draw_objects.push(obj);
-            let idx = self.draw_objects.len() - 1;
-            self.always_draw.push(idx as u32);
-            idx
+        // Reuse a vacated draw slot when one is free, else append. A slot
+        // recycled from a culled static prop is not yet in `always_draw`;
+        // `ensure_always_draw` adds it, while one recycled from another chunk /
+        // clone already is.
+        let draw_idx = match self.draw_slots.allocate() {
+            crate::gfx::draw_slot::SlotAlloc::Reuse(slot) => {
+                self.draw_objects[slot] = obj;
+                slot
+            }
+            crate::gfx::draw_slot::SlotAlloc::Append(slot) => {
+                self.draw_objects.push(obj);
+                self.always_draw_member.push(false);
+                slot
+            }
         };
+        self.ensure_always_draw(draw_idx);
         // Seed the streamed-chunk previous transform onto the unified G-buffer's
         // velocity bookkeeping so a chunk that streams in does not ghost from
         // IDENTITY on its first frame.
@@ -252,7 +259,7 @@ impl VkContext {
         let obj = &mut self.draw_objects[draw_idx];
         obj.visible = false;
         obj.resident = false;
-        self.chunk_stream.free_slots.push(draw_idx);
+        self.draw_slots.free(draw_idx);
         Ok(())
     }
 

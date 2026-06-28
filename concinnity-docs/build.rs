@@ -77,7 +77,14 @@ const CATEGORIES: &[(&str, &[&str])] = &[
     ("Camera", &["Camera3D", "CameraShot"]),
     (
         "Objects",
-        &["Prop", "InstancedProp", "Prefab", "RigidBody", "PropBody"],
+        &[
+            "Prop",
+            "InstancedProp",
+            "Prefab",
+            "RigidBody",
+            "PropBody",
+            "Spawner",
+        ],
     ),
     ("Animation", &["Animation", "Joint", "SkinnedMesh"]),
     ("Audio", &["AudioClip", "AudioEmitter"]),

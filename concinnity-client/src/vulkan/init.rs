@@ -3250,6 +3250,19 @@ impl VkContext {
 
         let (cull_bvh, always_draw) = crate::gfx::bvh::partition_draw_objects(&draw_objects);
 
+        // Membership flags parallel to `draw_objects` so a recycled draw slot is
+        // added to `always_draw` at most once. The free-list allocator starts
+        // with every build-time slot already in use; runtime spawns and streamed
+        // chunks pop a vacated slot before appending past this count.
+        let always_draw_member = {
+            let mut member = vec![false; draw_objects.len()];
+            for &i in &always_draw {
+                member[i as usize] = true;
+            }
+            member
+        };
+        let draw_slots = crate::gfx::draw_slot::DrawSlotAllocator::with_len(draw_objects.len());
+
         let shadow_pipeline_layout_field = if shadow_pipeline_opt.is_some() {
             Some(shadow_pipeline_layout)
         } else {
@@ -3471,7 +3484,6 @@ impl VkContext {
             chunk_stream: VkChunkStream {
                 vtx_alloc: crate::gfx::range_alloc::RangeAllocator::new(),
                 idx_alloc: crate::gfx::range_alloc::RangeAllocator::new(),
-                free_slots: Vec::new(),
                 descriptor_pool: None,
                 object_set: None,
                 texture_slot: None,
@@ -3490,6 +3502,7 @@ impl VkContext {
             n_skinned: 0,
             clone_descriptor_pool: None,
             clone_object_sets: Vec::new(),
+            clone_free_offsets: Vec::new(),
             clone_slot_by_draw_idx: std::collections::HashMap::new(),
             clone_texture_slots: Vec::new(),
             clone_normal_map_slots: Vec::new(),
@@ -3543,6 +3556,8 @@ impl VkContext {
             },
             cull_bvh,
             always_draw,
+            always_draw_member,
+            draw_slots,
             visible_scratch: Vec::new(),
             draw_objects,
             clear_color,

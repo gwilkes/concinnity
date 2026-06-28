@@ -1700,6 +1700,19 @@ impl DxContext {
 
         let (cull_bvh, always_draw) = crate::gfx::bvh::partition_draw_objects(&draw_objects);
 
+        // Membership flags parallel to `draw_objects` so a recycled draw slot is
+        // added to `always_draw` at most once. The free-list allocator starts
+        // with every build-time slot already in use; runtime spawns and streamed
+        // chunks pop a vacated slot before appending past this count.
+        let always_draw_member = {
+            let mut member = vec![false; draw_objects.len()];
+            for &i in &always_draw {
+                member[i as usize] = true;
+            }
+            member
+        };
+        let draw_slots = crate::gfx::draw_slot::DrawSlotAllocator::with_len(draw_objects.len());
+
         // Per-frame instance upload buffers. One persistently-mapped buffer
         // per (frame, cluster). Sized to hold cluster.instances.len() float4x4
         // matrices, which is fixed at init time.
@@ -1993,7 +2006,6 @@ impl DxContext {
             chunk_stream: super::context::ChunkStreamState {
                 vtx_alloc: crate::gfx::range_alloc::RangeAllocator::new(),
                 idx_alloc: crate::gfx::range_alloc::RangeAllocator::new(),
-                free_slots: Vec::new(),
                 srv_base_slot: chunk_srv_base_slot,
             },
             skinned: SkinnedState {
@@ -2114,6 +2126,7 @@ impl DxContext {
                 srv_base_slot: clone_srv_base_slot,
                 count: 0,
                 slot_by_draw_idx: std::collections::HashMap::new(),
+                free_offsets: Vec::new(),
             },
             commands: DxCommands {
                 command_allocators,
@@ -2133,6 +2146,8 @@ impl DxContext {
             current_frame: 0,
             cull_bvh,
             always_draw,
+            always_draw_member,
+            draw_slots,
             visible_scratch: RefCell::new(Vec::new()),
             draw_objects,
             instanced: DxInstanced {

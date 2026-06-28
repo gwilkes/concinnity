@@ -145,6 +145,14 @@ pub struct SkinnedMesh {
     /// build choose defaults.
     #[serde(default)]
     pub lod_distances: Vec<f32>,
+    /// How many runtime copies of this mesh may exist at once beyond the
+    /// authored one. `0` (the default) means the mesh is not runtime-spawnable.
+    /// A non-zero value pre-reserves that many extra instance slots at load: the
+    /// engine appends that many hidden bind-pose copies to the skinned geometry
+    /// so a runtime spawn can claim one without growing any GPU buffer, and a
+    /// despawn returns it to the pool. Spawns past the reserve are dropped (a
+    /// warning is logged). Capped at 4096.
+    pub max_instances: u32,
     /// Injected at load time from the compiled blob payload.
     #[serde(skip)]
     pub locator: Option<PayloadLocator>,
@@ -184,6 +192,10 @@ impl Component for SkinnedMesh {
             args.lod_levels = 1;
         }
         args.lod_levels = args.lod_levels.min(8);
+        // A runaway reserve would pre-expand the skinned vertex buffer without
+        // bound; cap it. The skinned index buffer is u16, so init applies a
+        // further per-mesh limit when the copies would overflow that.
+        args.max_instances = args.max_instances.min(4096);
         args
     }
 

@@ -1731,6 +1731,61 @@ impl DxContext {
         }
     }
 
+    // Seed the skinned instance pool from `(template_index, instance_index)`
+    // pairs built at load, each instance being a hidden bind-pose copy of its
+    // template that `upload_skinned` already uploaded (its own vertex region,
+    // joint buffer, and SRV pair). Called once after `upload_skinned`, before any
+    // runtime skinned spawn. With no skinned mesh opting into runtime spawning the
+    // list is empty and the pool stays empty. Mirrors the Metal path.
+    pub fn seed_skinned_instance_pool(&mut self, reservations: Vec<(usize, usize)>) {
+        for (template, instance) in reservations {
+            self.skinned_pool.reserve(template, instance);
+        }
+    }
+
+    // Claim a free pre-reserved copy of the skinned object at
+    // `template_skinned_index`, reveal it at `model`, and reset its joint palette
+    // to the bind pose so it does not flash its previous occupant's last frame
+    // (the owning `SkeletonPose`'s first pose push replaces it next frame). The
+    // copy's deformed region is already valid because `encode_skin` folds every
+    // pre-reserved copy each frame. Returns the claimed slot's skinned index, or
+    // `None` when the template reserved no pool or the pool is exhausted.
+    pub fn spawn_skinned_instance(
+        &mut self,
+        template_skinned_index: usize,
+        model: [[f32; 4]; 4],
+    ) -> Option<usize> {
+        let slot = self.skinned_pool.acquire(template_skinned_index)?;
+        let obj = self.skinned.draw_objects.get_mut(slot)?;
+        obj.model = model;
+        obj.visible = true;
+        if let Some(palette) = self.skinned.joint_matrices.get_mut(slot) {
+            palette.iter_mut().for_each(|m| *m = IDENTITY4);
+        }
+        Some(slot)
+    }
+
+    // Hide a skinned object and, if it was a pre-reserved instance, return its
+    // slot to the pool so a later spawn can claim it. An authored template slot
+    // is simply hidden (it owns no pool entry). A no-op if the index is out of
+    // range. Mirrors the Metal path.
+    pub fn retire_skinned_draw_object(&mut self, skinned_index: usize) {
+        if let Some(obj) = self.skinned.draw_objects.get_mut(skinned_index) {
+            obj.visible = false;
+        }
+        self.skinned_pool.release(skinned_index);
+    }
+
+    // Push a skinned object's model-to-world matrix (it animates in place unless
+    // something moves it). The per-frame cull records and the legacy skinned draw
+    // both read `obj.model` directly, so this only writes the field. A no-op if
+    // the index is out of range.
+    pub fn update_skinned_model(&mut self, skinned_index: usize, model: [[f32; 4]; 4]) {
+        if let Some(obj) = self.skinned.draw_objects.get_mut(skinned_index) {
+            obj.model = model;
+        }
+    }
+
     // Copy this frame's skinning matrices into the per-frame joint buffers.
     // Called from `record_frame` before the skinned shadow + main passes.
     pub(super) fn upload_joint_matrices(&self, frame_idx: usize) {

@@ -193,6 +193,41 @@ pub trait RenderBackend: SceneControl + Send {
     ) -> Result<(), String>;
     fn update_skinned_pose(&mut self, skinned_index: usize, matrices: &[[[f32; 4]; 4]]);
 
+    // Runtime skinned spawn (pre-reserved instance pool): a backend pre-reserves
+    // hidden bind-pose copies at load (`SkinnedMesh.max_instances`) and reveals
+    // one per skinned SpawnRequest. The default no-op implementations are a
+    // fallback for a backend that has not wired runtime skinned spawn, where a
+    // skinned SpawnRequest finds nothing to claim and is dropped.
+
+    // Seed the backend's skinned instance pool from `(template_index,
+    // instance_index)` pairs built at load, where each instance is a hidden
+    // bind-pose copy of its template. Lets a later `spawn_skinned_instance`
+    // claim a copy without growing any GPU buffer.
+    fn seed_skinned_instance_pool(&mut self, _reservations: Vec<(usize, usize)>) {}
+
+    // Claim a free pre-reserved copy of the skinned object at
+    // `template_skinned_index`, reveal it at `model`, reset its pose to bind,
+    // and return the claimed slot's skinned index. `None` when the template
+    // reserved no pool or the pool is exhausted.
+    fn spawn_skinned_instance(
+        &mut self,
+        _template_skinned_index: usize,
+        _model: [[f32; 4]; 4],
+    ) -> Option<usize> {
+        None
+    }
+
+    // Hide a live skinned instance and return its slot to the pool so a later
+    // spawn can claim it. A no-op if the index is out of range or was not a
+    // pre-reserved instance slot.
+    fn retire_skinned_draw_object(&mut self, _skinned_index: usize) {}
+
+    // Push a skinned object's model-to-world matrix (it animates in place
+    // unless something moves it). Cheap: the per-frame cull rebuild (and the
+    // legacy skinned draw) reads the object's model directly, so this just
+    // writes the field. A no-op if the index is out of range.
+    fn update_skinned_model(&mut self, _skinned_index: usize, _model: [[f32; 4]; 4]) {}
+
     // Texture streaming.
     fn evict_texture_slot(&mut self, slot: usize) -> Result<(), String>;
     fn update_texture_slot(&mut self, slot: usize, w: u32, h: u32, px: &[u8])

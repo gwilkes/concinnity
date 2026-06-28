@@ -1195,6 +1195,11 @@ pub struct VkContext {
 
     // Skinned (skeletally animated) mesh rendering. See `VkSkinned`.
     pub(super) skinned: VkSkinned,
+    // Free pool for the pre-reserved skinned instance slots a runtime skinned
+    // spawn claims. Seeded once from `seed_skinned_instance_pool` with the hidden
+    // bind-pose copies `upload_skinned` uploaded; empty for a world with no
+    // skinned mesh opting into runtime spawning.
+    pub(super) skinned_pool: crate::gfx::skinned_pool::SkinnedInstancePool,
 
     // Main-pass view (per-frame) + light (shared) uniform buffers. See
     // `VkUniforms`.
@@ -1397,6 +1402,17 @@ impl VkContext {
             .sum();
         let objects =
             (self.draw_objects.len() + instanced_total + self.skinned.draw_objects.len()) as u32;
+        // Live skinned count: authored meshes plus runtime-spawned instances,
+        // excluding the hidden pre-reserved pool slots. `objects` above counts the
+        // whole pool and so stays flat across skinned spawn/despawn; this tracks
+        // the visible count, so a spawn bumps it and a despawn drops it.
+        let skinned_visible = self
+            .skinned
+            .draw_objects
+            .iter()
+            .filter(|o| o.visible)
+            .count() as u32;
+        let skinned_pool_free = self.skinned_pool.total_free() as u32;
         // GPU timing for the most-recently completed block on this frame slot:
         // the whole-frame pair plus one (start, end) pair per render pass. The
         // fence wait above guarantees the previous trip's writes have retired, so
@@ -1457,6 +1473,8 @@ impl VkContext {
         self.frame_stats.set(crate::gfx::profile::RenderStats {
             draw_calls: 0,
             objects,
+            skinned_visible,
+            skinned_pool_free,
             gpu_frame_us,
             vram_bytes,
             pass_times_us,

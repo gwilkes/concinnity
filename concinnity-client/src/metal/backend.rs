@@ -77,6 +77,10 @@ impl RenderBackend for MtlContext {
         fn retire_draw_object(&mut self, draw_idx: usize);
         fn upload_skinned(&mut self, vertices: &[SkinnedVertex], indices: &[u16], draw_objects: Vec<SkinnedDrawObject>, vert_bytes: &[u8], frag_bytes: &[u8], shadow_bytes: &[u8]) -> Result<(), String>;
         fn update_skinned_pose(&mut self, skinned_index: usize, matrices: &[[[f32; 4]; 4]]);
+        fn seed_skinned_instance_pool(&mut self, reservations: Vec<(usize, usize)>);
+        fn spawn_skinned_instance(&mut self, template_skinned_index: usize, model: [[f32; 4]; 4]) -> Option<usize>;
+        fn retire_skinned_draw_object(&mut self, skinned_index: usize);
+        fn update_skinned_model(&mut self, skinned_index: usize, model: [[f32; 4]; 4]);
         fn evict_texture_slot(&mut self, slot: usize) -> Result<(), String>;
         fn update_texture_slot(&mut self, slot: usize, w: u32, h: u32, px: &[u8]) -> Result<(), String>;
         fn evict_normal_map_slot(&mut self, slot: usize) -> Result<(), String>;

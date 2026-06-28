@@ -516,6 +516,8 @@ fn handle_request(text: &str, shared: &Arc<Mutex<DebugState>>) -> String {
                 "render": {
                     "draw_calls": r.draw_calls,
                     "objects": r.objects,
+                    "skinned_visible": r.skinned_visible,
+                    "skinned_pool_free": r.skinned_pool_free,
                     "gpu_frame_us": r.gpu_frame_us,
                     "vram_bytes": r.vram_bytes,
                     "auto_exposure_ev": r.auto_exposure_ev,

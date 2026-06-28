@@ -2027,6 +2027,7 @@ impl DxContext {
                 deformed_buffers: Vec::new(),
                 deformed_vbvs: Vec::new(),
             },
+            skinned_pool: crate::gfx::skinned_pool::SkinnedInstancePool::new(),
             uniforms: DxUniforms {
                 view_ubo_resources,
                 view_ubo_ptrs,

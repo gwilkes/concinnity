@@ -422,6 +422,12 @@ pub struct MtlContext {
     // `clone_static_draw_object` so the draw list does not grow without bound as
     // the camera roams or entities churn at runtime.
     pub(super) draw_slots: crate::gfx::draw_slot::DrawSlotAllocator,
+    // Free pool of pre-reserved skinned instance slots, keyed by template.
+    // Seeded at load from `SkinnedMesh.max_instances` (one entry per hidden
+    // bind-pose copy expanded into the skinned geometry); a runtime skinned
+    // spawn claims one, a despawn returns it. Empty when no skinned mesh opted
+    // into runtime spawning.
+    pub(super) skinned_pool: crate::gfx::skinned_pool::SkinnedInstancePool,
     // None in embedded mode (no separate NSWindow is created).
     pub(super) window: Option<Retained<NSWindow>>,
     // MTKView with isPaused=true and enableSetNeedsDisplay=false so its internal

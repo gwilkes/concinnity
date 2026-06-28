@@ -1178,6 +1178,9 @@ impl MtlContext {
             chunk_vtx_alloc: crate::gfx::range_alloc::RangeAllocator::new(),
             chunk_idx_alloc: crate::gfx::range_alloc::RangeAllocator::new(),
             draw_slots,
+            // Seeded later by `seed_skinned_instance_pool` once skinned geometry
+            // (with its pre-reserved copies) has been uploaded.
+            skinned_pool: crate::gfx::skinned_pool::SkinnedInstancePool::new(),
             window,
             mtk_view,
             window_closed: false,

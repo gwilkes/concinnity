@@ -332,14 +332,28 @@ impl GraphicsSystem {
                         let Some(&template) = by_name.get(&req.template) else {
                             continue;
                         };
-                        super::spawn::spawn_from_template(
-                            ctx,
-                            template,
-                            Some(req.name),
-                            req.transform,
-                            req.lifetime_secs,
-                            |src, model| backend.clone_static_draw_object(src, model).ok(),
-                        );
+                        // A skinned template (a SkeletonPose entity) claims a
+                        // pre-reserved instance slot; a static one clones a draw
+                        // slot. Dispatch on which the template carries.
+                        if ctx.get::<crate::assets::SkeletonPose>(template).is_some() {
+                            super::spawn::spawn_skinned_from_template(
+                                ctx,
+                                template,
+                                Some(req.name),
+                                req.transform,
+                                req.lifetime_secs,
+                                |tmpl, model| backend.spawn_skinned_instance(tmpl, model),
+                            );
+                        } else {
+                            super::spawn::spawn_from_template(
+                                ctx,
+                                template,
+                                Some(req.name),
+                                req.transform,
+                                req.lifetime_secs,
+                                |src, model| backend.clone_static_draw_object(src, model).ok(),
+                            );
+                        }
                     }
                 }
 
@@ -358,14 +372,25 @@ impl GraphicsSystem {
                         let Some(&template) = by_name.get(&due.template) else {
                             continue;
                         };
-                        super::spawn::spawn_from_template(
-                            ctx,
-                            template,
-                            None,
-                            due.transform,
-                            due.lifetime,
-                            |src, model| backend.clone_static_draw_object(src, model).ok(),
-                        );
+                        if ctx.get::<crate::assets::SkeletonPose>(template).is_some() {
+                            super::spawn::spawn_skinned_from_template(
+                                ctx,
+                                template,
+                                None,
+                                due.transform,
+                                due.lifetime,
+                                |tmpl, model| backend.spawn_skinned_instance(tmpl, model),
+                            );
+                        } else {
+                            super::spawn::spawn_from_template(
+                                ctx,
+                                template,
+                                None,
+                                due.transform,
+                                due.lifetime,
+                                |src, model| backend.clone_static_draw_object(src, model).ok(),
+                            );
+                        }
                     }
                 }
 
@@ -388,6 +413,15 @@ impl GraphicsSystem {
                 // tick; the one-frame lag is invisible at animation rates.
                 for pose in ctx.query::<crate::assets::SkeletonPose>() {
                     backend.update_skinned_pose(pose.skinned_index, &pose.joint_matrices);
+                }
+                // Push the model matrix for skinned instances that carry a
+                // Transform (the runtime-spawned ones), so a moved instance
+                // follows it. The authored templates have no Transform and keep
+                // the model baked into their draw object at load.
+                for (_entity, pose, transform) in
+                    ctx.join2::<crate::assets::SkeletonPose, crate::assets::Transform>()
+                {
+                    backend.update_skinned_model(pose.skinned_index, transform.model_matrix());
                 }
 
                 // apply any imperative scene jumps sent by UiInputSystem this

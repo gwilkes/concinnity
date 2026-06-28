@@ -1084,6 +1084,7 @@ supply them.
 - `scale`: An array of 3 floats. World scale.
 - `lod_levels`: An integer. Number of level-of-detail versions to generate, including the original. `1` (the default) generates none; values are clamped to `[1, 8]`.
 - `lod_distances`: An array of floats. Camera distances at which to switch to each lower-detail version. When non-empty, must have exactly `lod_levels - 1` entries; empty lets the build choose defaults.
+- `max_instances`: An integer. How many runtime copies of this mesh may exist at once beyond the authored one. `0` (the default) means the mesh is not runtime-spawnable. A non-zero value pre-reserves that many extra instance slots at load: the engine appends that many hidden bind-pose copies to the skinned geometry so a runtime spawn can claim one without growing any GPU buffer, and a despawn returns it to the pool. Spawns past the reserve are dropped (a warning is logged). Capped at 4096.
 
 ## Audio
 

@@ -44,6 +44,9 @@ pub(crate) mod cursor;
 pub mod decal;
 pub mod draw_list;
 pub(crate) mod draw_slot;
+// Free pool for pre-reserved skinned instance slots, consumed by the runtime
+// skinned-spawn path.
+pub(crate) mod skinned_pool;
 // The renderer driver. An internal system (not a declarable asset), constructed
 // by `World::start` when the world declares a `GraphicsConfig`.
 pub mod graphics_system;

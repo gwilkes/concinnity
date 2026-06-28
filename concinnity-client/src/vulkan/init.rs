@@ -3528,6 +3528,7 @@ impl VkContext {
                 deformed: Vec::new(),
                 deformed_primed: std::sync::atomic::AtomicBool::new(false),
             },
+            skinned_pool: crate::gfx::skinned_pool::SkinnedInstancePool::new(),
             uniforms: VkUniforms {
                 view_ubo_buffers,
                 view_ubo_memories,

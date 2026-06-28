@@ -5,7 +5,7 @@
 // contributed lingers in any pass. Driven by DespawnRequest events the
 // GraphicsSystem drains each step (see frame.rs).
 
-use crate::assets::{Children, RenderHandle};
+use crate::assets::{Children, RenderHandle, SkeletonPose};
 use crate::ecs::{Entity, PipelineContext};
 use crate::gfx::backend::RenderBackend;
 
@@ -28,16 +28,28 @@ pub(super) fn collect_subtree(ctx: &PipelineContext, root: Entity) -> Vec<Entity
     out
 }
 
-// Despawn an entity and its descendants: retire every draw slot each one owns
-// (via `retire`), then remove it from every component column and recycle its
-// id. The slots are hidden, not yet reclaimed for reuse. `retire` is the slot
-// sink so the cascade is testable without a full backend; `despawn_subtree`
-// passes the backend's `retire_draw_object`. Returns the number of entities
-// removed.
+// A GPU slot retired by the despawn cascade: a static draw slot (from a
+// RenderHandle) or a skinned instance slot (from a SkeletonPose). One sink
+// covers both so the cascade keeps a single `&mut backend` borrow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RetiredSlot {
+    Draw(usize),
+    Skinned(usize),
+}
+
+// Despawn an entity and its descendants: retire every GPU slot each one owns,
+// then remove it from every component column and recycle its id. A static
+// renderable's slots come from its RenderHandle (RetiredSlot::Draw); a skinned
+// entity has no RenderHandle but a SkeletonPose whose `skinned_index` is a
+// RetiredSlot::Skinned (its pooled instance slot returns to the reserve, or an
+// authored template is just hidden). The slots are hidden, not compacted.
+// `retire` is the slot sink so the cascade is testable without a full backend;
+// `despawn_subtree` dispatches it to the backend's retire methods. Returns the
+// number of entities removed.
 fn despawn_collected(
     ctx: &mut PipelineContext,
     root: Entity,
-    mut retire: impl FnMut(usize),
+    mut retire: impl FnMut(RetiredSlot),
 ) -> usize {
     let entities = collect_subtree(ctx, root);
     for &entity in &entities {
@@ -47,21 +59,28 @@ fn despawn_collected(
             .map(|h| h.draws.clone())
             .unwrap_or_default();
         for slot in slots {
-            retire(slot as usize);
+            retire(RetiredSlot::Draw(slot as usize));
+        }
+        if let Some(skinned_index) = ctx.get::<SkeletonPose>(entity).map(|p| p.skinned_index) {
+            retire(RetiredSlot::Skinned(skinned_index));
         }
         ctx.despawn(entity);
     }
     entities.len()
 }
 
-// Despawn `root` and its descendants, hiding each entity's GPU draw slots
-// through the backend. Returns the number of entities removed.
+// Despawn `root` and its descendants, hiding each entity's GPU slots (static
+// draw slots and skinned instance slots) through the backend. Returns the
+// number of entities removed.
 pub(super) fn despawn_subtree(
     ctx: &mut PipelineContext,
     backend: &mut dyn RenderBackend,
     root: Entity,
 ) -> usize {
-    despawn_collected(ctx, root, |slot| backend.retire_draw_object(slot))
+    despawn_collected(ctx, root, |slot| match slot {
+        RetiredSlot::Draw(i) => backend.retire_draw_object(i),
+        RetiredSlot::Skinned(i) => backend.retire_skinned_draw_object(i),
+    })
 }
 
 #[cfg(test)]
@@ -140,7 +159,11 @@ mod tests {
             ctx.insert(other, RenderHandle { draws: vec![99] });
 
             let mut retired: Vec<usize> = Vec::new();
-            let removed = despawn_collected(ctx, parent, |slot| retired.push(slot));
+            let removed = despawn_collected(ctx, parent, |slot| {
+                if let RetiredSlot::Draw(i) = slot {
+                    retired.push(i);
+                }
+            });
 
             assert_eq!(removed, 2, "parent + child removed");
             retired.sort_unstable();
@@ -166,12 +189,42 @@ mod tests {
             let e = ctx.components.spawn();
             ctx.insert(e, Transform::default());
 
-            let mut retired: Vec<usize> = Vec::new();
+            let mut retired: Vec<RetiredSlot> = Vec::new();
             let removed = despawn_collected(ctx, e, |slot| retired.push(slot));
 
             assert_eq!(removed, 1);
             assert!(retired.is_empty(), "no slots to retire");
             assert!(ctx.get::<Transform>(e).is_none(), "entity despawned");
+        });
+    }
+
+    #[test]
+    fn despawn_retires_a_skinned_instance_slot() {
+        use crate::assets::SkeletonPose;
+        use crate::ecs::asset_id::AssetId;
+        use crate::gfx::skinning::Skeleton;
+        run(|ctx| {
+            // A skinned entity carries a SkeletonPose (no RenderHandle); its
+            // skinned_index is the slot to retire.
+            let skinned = ctx.components.spawn();
+            ctx.insert(
+                skinned,
+                SkeletonPose::new(AssetId(1), 4, Skeleton::new(Vec::new())),
+            );
+
+            let mut retired: Vec<RetiredSlot> = Vec::new();
+            let removed = despawn_collected(ctx, skinned, |slot| retired.push(slot));
+
+            assert_eq!(removed, 1);
+            assert_eq!(
+                retired,
+                vec![RetiredSlot::Skinned(4)],
+                "the skinned_index was retired, and there were no draw slots"
+            );
+            assert!(
+                ctx.get::<SkeletonPose>(skinned).is_none(),
+                "entity despawned"
+            );
         });
     }
 }

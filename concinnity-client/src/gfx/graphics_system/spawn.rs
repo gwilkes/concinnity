@@ -8,7 +8,8 @@
 // instances so their freed draw slots can be recycled by the next spawn.
 
 use crate::assets::{
-    GlobalTransform, Lifetime, MeshRenderer, ModelRenderer, RenderHandle, Spawner, Transform,
+    GlobalTransform, Lifetime, MeshRenderer, ModelRenderer, RenderHandle, SkeletonPose, Spawner,
+    Transform,
 };
 use crate::ecs::asset_id::AssetId;
 use crate::ecs::decompose::EntityByName;
@@ -58,6 +59,46 @@ pub(super) fn spawn_from_template(
     } else if let Some(renderer) = model_renderer {
         ctx.insert(entity, renderer);
     }
+    if let Some(secs) = lifetime {
+        ctx.insert(entity, Lifetime { remaining: secs });
+    }
+    if let Some(name) = name
+        && let Some(by_name) = ctx.resource_mut::<EntityByName>()
+    {
+        by_name.0.insert(name, entity);
+    }
+    Some(entity)
+}
+
+// Instantiate a runtime copy of a skinned `template` (a SkinnedMesh's
+// SkeletonPose entity) at `transform`. Unlike the static path, a skinned
+// instance is not a cloned draw slot: it claims one of the template's
+// pre-reserved hidden bind-pose copies through `acquire_slot`, which reveals it
+// and returns its skinned index. The new entity carries its own SkeletonPose
+// (so AnimationSystem drives it, keyed on the shared mesh id, in lockstep with
+// the template), a Transform (so the per-frame model push can move it), and an
+// optional Lifetime. `acquire_slot(template_skinned_index, model)` is the seam
+// the test drives with a pool instead of a live backend. When `name` is Some
+// the instance is registered so it can be addressed (e.g. despawned) by name.
+// Returns the new entity, or None when the template is not skinned or its
+// instance pool is exhausted.
+pub(super) fn spawn_skinned_from_template(
+    ctx: &mut PipelineContext,
+    template: Entity,
+    name: Option<AssetId>,
+    transform: Transform,
+    lifetime: Option<f32>,
+    mut acquire_slot: impl FnMut(usize, [[f32; 4]; 4]) -> Option<usize>,
+) -> Option<Entity> {
+    let (mesh_id, template_index, skeleton) = ctx
+        .get::<SkeletonPose>(template)
+        .map(|p| (p.mesh_id, p.skinned_index, p.skeleton.clone()))?;
+    let model = transform.model_matrix();
+    let skinned_index = acquire_slot(template_index, model)?;
+
+    let entity = ctx.components.spawn();
+    ctx.insert(entity, transform);
+    ctx.insert(entity, SkeletonPose::new(mesh_id, skinned_index, skeleton));
     if let Some(secs) = lifetime {
         ctx.insert(entity, Lifetime { remaining: secs });
     }
@@ -229,6 +270,92 @@ mod tests {
                 second_slot, freed,
                 "the freed draw slot must be recycled by the next spawn"
             );
+        });
+    }
+
+    #[test]
+    fn skinned_spawn_claims_and_recycles_a_pooled_slot() {
+        use crate::ecs::asset_id::AssetId;
+        use crate::gfx::skinned_pool::SkinnedInstancePool;
+        use crate::gfx::skinning::Skeleton;
+        run(|ctx| {
+            ctx.insert_resource(EntityByName::default());
+
+            // A skinned template at draw slot 0 with two pre-reserved hidden
+            // copies (slots 1 and 2) in the pool.
+            let template = ctx.components.spawn();
+            ctx.insert(
+                template,
+                SkeletonPose::new(AssetId(10), 0, Skeleton::new(Vec::new())),
+            );
+            let mut pool = SkinnedInstancePool::new();
+            pool.reserve(0, 1);
+            pool.reserve(0, 2);
+
+            // The spawn claims a pooled copy and the new entity points at it.
+            let first = spawn_skinned_from_template(
+                ctx,
+                template,
+                Some(AssetId(11)),
+                Transform::default(),
+                Some(0.5),
+                |template_idx, _model| pool.acquire(template_idx),
+            )
+            .expect("first skinned spawn");
+            let first_slot = ctx.get::<SkeletonPose>(first).unwrap().skinned_index;
+            assert_eq!(
+                ctx.get::<SkeletonPose>(first).unwrap().mesh_id,
+                AssetId(10),
+                "the instance shares the template's mesh id so it animates with it"
+            );
+
+            // Its Lifetime expires; the expiry releases the slot to the pool like
+            // a despawn's retire does, then despawns the entity.
+            let expired = tick_lifetimes(ctx, 1.0);
+            assert_eq!(expired, vec![first]);
+            pool.release(first_slot);
+            ctx.despawn(first);
+
+            // The next spawn recycles the freed slot instead of a fresh one.
+            let second = spawn_skinned_from_template(
+                ctx,
+                template,
+                None,
+                Transform::default(),
+                None,
+                |template_idx, _model| pool.acquire(template_idx),
+            )
+            .expect("second skinned spawn");
+            assert_eq!(
+                ctx.get::<SkeletonPose>(second).unwrap().skinned_index,
+                first_slot,
+                "the freed skinned slot must be recycled by the next spawn"
+            );
+        });
+    }
+
+    #[test]
+    fn skinned_spawn_with_exhausted_pool_returns_none() {
+        use crate::ecs::asset_id::AssetId;
+        use crate::gfx::skinned_pool::SkinnedInstancePool;
+        use crate::gfx::skinning::Skeleton;
+        run(|ctx| {
+            let template = ctx.components.spawn();
+            ctx.insert(
+                template,
+                SkeletonPose::new(AssetId(10), 0, Skeleton::new(Vec::new())),
+            );
+            // A template that reserved no instances has nothing to claim.
+            let mut pool = SkinnedInstancePool::new();
+            let spawned = spawn_skinned_from_template(
+                ctx,
+                template,
+                None,
+                Transform::default(),
+                None,
+                |template_idx, _model| pool.acquire(template_idx),
+            );
+            assert!(spawned.is_none(), "an exhausted pool drops the spawn");
         });
     }
 

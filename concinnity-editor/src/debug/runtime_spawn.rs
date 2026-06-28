@@ -304,6 +304,22 @@ pub(crate) enum RuntimeCommand {
         parent: Option<String>,
         reply: std::sync::mpsc::SyncSender<Result<(), String>>,
     },
+    // Spawn a runtime copy of an authored placement `template` at a new
+    // transform, registered under `name`, optionally with a `lifetime` after
+    // which it auto-despawns. ECS-side like `Despawn`: it sends a `SpawnRequest`
+    // event the GraphicsSystem drains on its next step (cloning the template's
+    // draw slots into recycled slots and building the new entity), so the
+    // per-frame drive routes it to `dispatch_spawn` once the `systems_mut`
+    // borrow ends.
+    Spawn {
+        template: String,
+        name: String,
+        position: [f32; 3],
+        rotation_deg: [f32; 3],
+        scale: [f32; 3],
+        lifetime: Option<f32>,
+        reply: std::sync::mpsc::SyncSender<Result<(), String>>,
+    },
 }
 
 static QUEUE: Mutex<Vec<RuntimeCommand>> = Mutex::new(Vec::new());
@@ -451,6 +467,10 @@ pub(crate) fn dispatch_runtime_spawn(
             // ECS-side like CameraSet; routed to `dispatch_reparent`.
             let _ = reply.send(Err("reparent: misrouted to backend dispatch".to_string()));
         }
+        RuntimeCommand::Spawn { reply, .. } => {
+            // ECS-side like CameraSet; routed to `dispatch_spawn`.
+            let _ = reply.send(Err("spawn: misrouted to backend dispatch".to_string()));
+        }
     }
 }
 
@@ -578,6 +598,53 @@ pub(crate) fn dispatch_reparent(cmd: RuntimeCommand, world: &mut crate::ecs::Wor
         .send(crate::assets::ReparentRequest {
             child: child_id,
             parent: parent_id,
+        });
+    let _ = reply.send(Ok(()));
+}
+
+// Apply a drained `Spawn` command by resolving the template name to its
+// AssetId, interning the new instance name, and sending a `SpawnRequest` event
+// into the ECS. GraphicsSystem reads it on its next step, clones the template's
+// draw slots into recycled slots, and builds the new entity. Routed here (like
+// `Despawn`) because it mutates the ECS, not the backend. The reply fires once
+// the event is queued; an unknown template is a clean error.
+pub(crate) fn dispatch_spawn(cmd: RuntimeCommand, world: &mut crate::ecs::World) {
+    let RuntimeCommand::Spawn {
+        template,
+        name,
+        position,
+        rotation_deg,
+        scale,
+        lifetime,
+        reply,
+    } = cmd
+    else {
+        return;
+    };
+    let table = crate::ecs::asset_id::name_table();
+    let Some(template_id) = table
+        .iter()
+        .position(|n| n == &template)
+        .map(|i| crate::ecs::asset_id::AssetId(i as u32))
+    else {
+        let _ = reply.send(Err(format!("spawn: template '{template}' not found")));
+        return;
+    };
+    // A zero scale (the array default when the request omits it) would make the
+    // instance invisible; treat it as unit scale.
+    let scale = if scale == [0.0; 3] { [1.0; 3] } else { scale };
+    let name_id = crate::ecs::asset_id::intern(&name);
+    world
+        .events_mut::<crate::assets::SpawnRequest>()
+        .send(crate::assets::SpawnRequest {
+            template: template_id,
+            name: name_id,
+            transform: crate::assets::Transform {
+                position,
+                rotation_deg,
+                scale,
+            },
+            lifetime_secs: lifetime,
         });
     let _ = reply.send(Ok(()));
 }

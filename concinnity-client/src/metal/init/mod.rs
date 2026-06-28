@@ -869,6 +869,15 @@ impl MtlContext {
 
         let (cull_bvh, always_draw) = crate::gfx::bvh::partition_draw_objects(&draw_objects);
 
+        // Seed the draw-slot allocator and the always_draw membership map from
+        // the initial draw set so runtime spawn/despawn can recycle vacated
+        // slots and add a recycled slot to always_draw exactly once.
+        let draw_slots = crate::gfx::draw_slot::DrawSlotAllocator::with_len(draw_objects.len());
+        let mut always_draw_member = vec![false; draw_objects.len()];
+        for &idx in &always_draw {
+            always_draw_member[idx as usize] = true;
+        }
+
         // Snapshot each object's initial model matrix as its "previous" frame
         // so the velocity pre-pass sees zero motion until the first update.
         let prev_draw_models: Vec<[[f32; 4]; 4]> = draw_objects.iter().map(|o| o.model).collect();
@@ -1041,6 +1050,7 @@ impl MtlContext {
             draw_objects,
             cull_bvh,
             always_draw,
+            always_draw_member,
             visible_scratch: Vec::new(),
             instanced_clusters,
             n_instances,
@@ -1167,7 +1177,7 @@ impl MtlContext {
             mesh_idx_alloc: crate::gfx::range_alloc::RangeAllocator::new(),
             chunk_vtx_alloc: crate::gfx::range_alloc::RangeAllocator::new(),
             chunk_idx_alloc: crate::gfx::range_alloc::RangeAllocator::new(),
-            chunk_free_slots: Vec::new(),
+            draw_slots,
             window,
             mtk_view,
             window_closed: false,

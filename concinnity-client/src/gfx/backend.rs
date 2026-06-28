@@ -174,9 +174,10 @@ pub trait RenderBackend: SceneControl + Send {
 
     // Retire a draw object: hide it from every pass (main, shadow, velocity)
     // and exclude it from the ray-tracing acceleration structure, so a
-    // despawned entity's slot leaves no ghost. The slot stays allocated (its
-    // geometry buffers are untouched); reclaiming it for reuse is a later step.
-    // A no-op if the index is out of range.
+    // despawned entity's slot leaves no ghost. The slot's geometry buffers are
+    // untouched, but the slot index is returned to the draw-slot free list so
+    // the next `clone_static_draw_object` can recycle it. A no-op if the index
+    // is out of range.
     fn retire_draw_object(&mut self, draw_idx: usize);
 
     // Skinning. `vert_bytes` and `shadow_bytes` are Metal-only payloads;
@@ -563,34 +564,24 @@ pub trait RenderBackend: SceneControl + Send {
         Err("screenshot capture not supported on this backend".to_string())
     }
 
-    // Append a new draw object that re-uses an existing draw slot's geometry
-    // region (`vertex_offset` / `vertex_count` / `index_offset` / `index_count`
-    // / `base_vertex` / `lod_alternates`) with a fresh model matrix, texture
-    // slots, material, and cull distance. Returned index is the new
-    // `DrawObject` slot. Driven by `world.jsonl` hot-reload (`cn debug` only)
-    // when an authored Prop is added to a mesh / model that already has at
-    // least one draw in the world. The clone is non-cullable (sentinel AABB)
-    // since the init-time BVH cannot refit; the dynamically added prop is
-    // drawn every frame regardless of camera position, like a streamed chunk.
+    // Instantiate a runtime copy of an existing draw object at a new transform:
+    // re-use the source slot's geometry region (`vertex_offset` / `vertex_count`
+    // / `index_offset` / `index_count` / `base_vertex` / `lod_alternates`) and
+    // copy its texture slots, material, and cull distance, swapping only the
+    // model matrix. The new slot reuses one freed by `retire_draw_object` before
+    // growing the draw-object vec. Returned index is the new `DrawObject` slot.
+    // Driven by runtime entity spawn (`SpawnRequest`). The copy is non-cullable
+    // (sentinel AABB) and drawn every frame, since the init-time BVH cannot
+    // refit to admit a slot added at runtime; moving copies (the common case)
+    // opt out of the static BVH exactly like streamed chunks and held items.
     // Default no-op (returns `Err`): backends without an implementation leave
-    // the add path logged + skipped at the caller.
+    // the spawn path logged + skipped at the caller.
     fn clone_static_draw_object(
         &mut self,
         src_draw_idx: usize,
         model: [[f32; 4]; 4],
-        texture_slot: usize,
-        normal_map_slot: usize,
-        material: MaterialUniforms,
-        cull_distance: f32,
     ) -> Result<usize, String> {
-        let _ = (
-            src_draw_idx,
-            model,
-            texture_slot,
-            normal_map_slot,
-            material,
-            cull_distance,
-        );
+        let _ = (src_draw_idx, model);
         Err("clone_static_draw_object: not implemented on this backend".to_string())
     }
 

@@ -141,19 +141,24 @@ impl MtlContext {
             lod_alternates: Vec::new(),
         };
 
-        // Reuse a vacated chunk slot when one is free, else append. A reused
-        // slot is already in `always_draw`; a fresh one must be added.
-        let draw_idx = if let Some(slot) = self.chunk_free_slots.pop() {
-            self.draw_objects[slot] = obj;
-            self.prev_draw_models[slot] = model;
-            slot
-        } else {
-            self.draw_objects.push(obj);
-            self.prev_draw_models.push(model);
-            let idx = self.draw_objects.len() - 1;
-            self.always_draw.push(idx as u32);
-            idx
+        // Recycle a vacated slot when one is free, else append. ensure_always_draw
+        // adds a slot recycled from a culled static prop (not yet a member); a
+        // slot reused from another chunk is already in always_draw and is left
+        // alone.
+        let draw_idx = match self.draw_slots.allocate() {
+            crate::gfx::draw_slot::SlotAlloc::Reuse(slot) => {
+                self.draw_objects[slot] = obj;
+                self.prev_draw_models[slot] = model;
+                slot
+            }
+            crate::gfx::draw_slot::SlotAlloc::Append(slot) => {
+                self.draw_objects.push(obj);
+                self.prev_draw_models.push(model);
+                self.always_draw_member.push(false);
+                slot
+            }
         };
+        self.ensure_always_draw(draw_idx);
         // A new resident chunk changes the RT-relevant draw set; the next RT
         // update folds it into the BVH (building just this chunk's BLAS).
         self.rt.topology_dirty = true;
@@ -184,7 +189,7 @@ impl MtlContext {
             .free(v_off as u64, v_len as u64, retire_frame);
         self.chunk_idx_alloc
             .free(i_off as u64, i_len as u64, retire_frame);
-        self.chunk_free_slots.push(draw_idx);
+        self.draw_slots.free(draw_idx);
         // The removed chunk leaves the RT-relevant draw set; the next RT update
         // drops its BLAS (deferred-freed once in-flight traces retire).
         self.rt.topology_dirty = true;

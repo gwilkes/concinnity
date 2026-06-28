@@ -3,7 +3,7 @@
 
 use crate::assets::{
     Camera3D, DespawnRequest, FrameInput, HitRegion, LabelBox, LayoutContainer, ReparentRequest,
-    SceneCommand, SettingCommand, SettingOp, Sprite, TextLabel, WindowMode,
+    SceneCommand, SettingCommand, SettingOp, SpawnRequest, Sprite, TextLabel, WindowMode,
 };
 use crate::ecs::asset_id::AssetId;
 use crate::ecs::{PipelineContext, StepResult};
@@ -123,6 +123,10 @@ impl GraphicsSystem {
             .start_time
             .map(|t| t.elapsed().as_secs_f32())
             .unwrap_or(0.0);
+        // Per-frame delta for time-based countdowns (Lifetime). Clamped to
+        // non-negative so a clock reset never rushes an expiry.
+        let dt = (elapsed - self.prev_elapsed).max(0.0);
+        self.prev_elapsed = elapsed;
 
         // read projection and view from Camera3D; view_matrix was written by
         // Camera3DSystem on the previous tick
@@ -234,6 +238,16 @@ impl GraphicsSystem {
                     return StepResult::Stop;
                 }
 
+                // Timed despawn: decrement every Lifetime by this frame's dt and
+                // despawn the entities whose countdown reached zero, through the
+                // same cascade a DespawnRequest uses. This is the churn that
+                // returns draw slots to the free list for the spawn drain below
+                // to recycle.
+                let expired = super::spawn::tick_lifetimes(ctx, dt);
+                for entity in expired {
+                    super::despawn::despawn_subtree(ctx, backend, entity);
+                }
+
                 // Runtime entity despawn: drain DespawnRequest events, resolve
                 // each name to its entity, hide that entity's draw slots, and
                 // remove it (and its descendants) from the ECS. Done before the
@@ -291,6 +305,41 @@ impl GraphicsSystem {
                             continue;
                         }
                         draw_list::reparent(ctx, child, parent);
+                    }
+                }
+
+                // Runtime entity spawn: drain SpawnRequest events, resolve each
+                // template name to its entity, and instantiate a copy at the
+                // requested transform. Each cloned draw slot reuses one freed by
+                // an earlier despawn / Lifetime expiry before the backend grows
+                // its draw_objects, so steady spawn/despawn churn does not leak
+                // slots. After the despawn / reparent drains so a spawn can reuse
+                // slots freed this same frame.
+                let spawn_reqs: Vec<SpawnRequest> = match ctx.events::<SpawnRequest>() {
+                    Some(events) => events
+                        .read(&mut self.spawn_cmd_cursor)
+                        .into_iter()
+                        .copied()
+                        .collect(),
+                    None => Vec::new(),
+                };
+                if !spawn_reqs.is_empty() {
+                    let by_name = ctx
+                        .resource::<crate::ecs::decompose::EntityByName>()
+                        .map(|n| n.0.clone())
+                        .unwrap_or_default();
+                    for req in spawn_reqs {
+                        let Some(&template) = by_name.get(&req.template) else {
+                            continue;
+                        };
+                        super::spawn::spawn_from_template(
+                            ctx,
+                            template,
+                            req.name,
+                            req.transform,
+                            req.lifetime_secs,
+                            |src, model| backend.clone_static_draw_object(src, model).ok(),
+                        );
                     }
                 }
 

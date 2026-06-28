@@ -43,6 +43,7 @@ pub(crate) mod csm;
 pub(crate) mod cursor;
 pub mod decal;
 pub mod draw_list;
+pub(crate) mod draw_slot;
 // The renderer driver. An internal system (not a declarable asset), constructed
 // by `World::start` when the world declares a `GraphicsConfig`.
 pub mod graphics_system;

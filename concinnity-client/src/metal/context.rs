@@ -959,6 +959,12 @@ impl MtlContext {
         }
     }
 
+    // Coarse GPU performance profile for default-quality selection, read live
+    // from the MTLDevice (cheap; the same kind of device query as capabilities).
+    pub fn gpu_profile(&self) -> crate::gfx::backend::GpuProfile {
+        super::gpu_profile::device_profile(&self.device)
+    }
+
     // Render statistics for the most recent `draw_frame`, for the profiler
     // overlay. The GPU frame time is the last value reported by a completed
     // command buffer, so it may lag the draw counts by a frame or two.

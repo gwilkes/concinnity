@@ -1858,6 +1858,17 @@ impl GraphicsSystem {
         if let Some(backend) = self.backend.as_deref_mut() {
             // Capability flags drive the settings-menu gating below.
             device_caps = backend.capabilities();
+            // Detected GPU performance profile, logged once at init so the
+            // classified tier is verifiable on each device.
+            let gpu = backend.gpu_profile();
+            tracing::info!(
+                "GPU profile: vendor={:?} tier={:?} memory_budget={} MB unified={} discrete={}",
+                gpu.vendor,
+                gpu.tier,
+                gpu.memory_budget_bytes / (1 << 20),
+                gpu.unified_memory,
+                gpu.discrete,
+            );
             backend.set_menu_mode(self.menu_mode);
             // Push the effective ambient scale (world value or persisted
             // override). The backend already seeds the world value at its own

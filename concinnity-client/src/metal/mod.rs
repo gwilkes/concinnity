@@ -10,6 +10,7 @@ mod draw;
 mod fog;
 mod frame_pacing;
 mod glass;
+mod gpu_profile;
 mod graph_exec;
 mod hiz;
 mod hot_reload;

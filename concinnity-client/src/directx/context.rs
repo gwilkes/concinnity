@@ -1848,6 +1848,44 @@ impl DxContext {
         }
     }
 
+    // Coarse GPU performance profile for default-quality selection, read live
+    // from the adapter description (vendor id + dedicated VRAM). `UNKNOWN` when
+    // the adapter does not expose the v3 interface or the desc query fails.
+    pub fn gpu_profile(&self) -> crate::gfx::backend::GpuProfile {
+        use crate::gfx::backend::{GpuClassInput, GpuProfile, GpuVendor, classify_tier};
+        let Some(adapter) = self.adapter.as_ref() else {
+            return GpuProfile::UNKNOWN;
+        };
+        let desc = match unsafe { adapter.GetDesc1() } {
+            Ok(d) => d,
+            Err(_) => return GpuProfile::UNKNOWN,
+        };
+        let vendor = match desc.VendorId {
+            0x10DE => GpuVendor::Nvidia,
+            0x1002 => GpuVendor::Amd,
+            0x8086 => GpuVendor::Intel,
+            _ => GpuVendor::Other,
+        };
+        let dedicated = desc.DedicatedVideoMemory as u64;
+        // A discrete GPU has dedicated VRAM; an integrated part reports little or
+        // none (and large shared system memory). A small floor keeps a few MB of
+        // carve-out from reading as discrete.
+        let discrete = dedicated >= (256u64 << 20);
+        let tier = classify_tier(&GpuClassInput {
+            vendor,
+            memory_budget_bytes: dedicated,
+            discrete,
+            apple_family: 0,
+        });
+        GpuProfile {
+            vendor,
+            tier,
+            memory_budget_bytes: dedicated,
+            unified_memory: !discrete,
+            discrete,
+        }
+    }
+
     // GPU descriptor handle for the per-object (albedo, normal) SRV pair.
     pub(super) fn object_srv_gpu(&self, obj_idx: usize) -> D3D12_GPU_DESCRIPTOR_HANDLE {
         let srv_gpu_base = unsafe {

@@ -1881,6 +1881,52 @@ impl VkContext {
             ray_tracing: self.rt_capable,
         }
     }
+
+    // Coarse GPU performance profile for default-quality selection, read live
+    // from the physical device: vendor id, discrete / integrated device type,
+    // and the summed DEVICE_LOCAL heap size as the VRAM budget (the true heap
+    // size, unlike the residency chip which sums live usage).
+    pub fn gpu_profile(&self) -> crate::gfx::backend::GpuProfile {
+        use crate::gfx::backend::{GpuClassInput, GpuProfile, GpuVendor, classify_tier};
+        let props = unsafe {
+            self.instance
+                .get_physical_device_properties(self.physical_device)
+        };
+        let vendor = match props.vendor_id {
+            0x10DE => GpuVendor::Nvidia,
+            0x1002 => GpuVendor::Amd,
+            0x8086 => GpuVendor::Intel,
+            0x106B => GpuVendor::Apple, // Apple / MoltenVK
+            _ => GpuVendor::Other,
+        };
+        let discrete = props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU;
+        let unified = props.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU;
+        let mem = unsafe {
+            self.instance
+                .get_physical_device_memory_properties(self.physical_device)
+        };
+        let budget: u64 = (0..mem.memory_heap_count as usize)
+            .filter(|&i| {
+                mem.memory_heaps[i]
+                    .flags
+                    .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
+            })
+            .map(|i| mem.memory_heaps[i].size)
+            .sum();
+        let tier = classify_tier(&GpuClassInput {
+            vendor,
+            memory_budget_bytes: budget,
+            discrete,
+            apple_family: 0,
+        });
+        GpuProfile {
+            vendor,
+            tier,
+            memory_budget_bytes: budget,
+            unified_memory: unified,
+            discrete,
+        }
+    }
 }
 
 impl crate::gfx::scene_reel::SceneControl for VkContext {

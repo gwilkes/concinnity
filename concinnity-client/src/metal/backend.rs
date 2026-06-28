@@ -92,6 +92,7 @@ impl RenderBackend for MtlContext {
         fn remove_chunk_mesh(&mut self, draw_idx: usize, retire_frame: u64) -> Result<(), String>;
         fn set_chunk_model(&mut self, draw_idx: usize, model: [[f32; 4]; 4]) -> Result<(), String>;
         fn capabilities(&self) -> crate::gfx::backend::DeviceCapabilities;
+        fn gpu_profile(&self) -> crate::gfx::backend::GpuProfile;
         fn logical_size(&self) -> (f32, f32);
         fn render_stats(&self) -> RenderStats;
         fn update_color_lut(&mut self, size: u32, data: &[u8]) -> Result<(), String>;

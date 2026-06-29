@@ -8,7 +8,7 @@
 // row can only target a setting the engine actually knows how to apply.
 
 use crate::assets::{
-    ReflectionBlurResolution, SettingOp, SsgiResolution, UpscaleQuality, WindowMode,
+    ReflectionBlurResolution, SettingOp, ShadowUpdate, SsgiResolution, UpscaleQuality, WindowMode,
 };
 
 // Ordered option labels for `vsync`: index 0 is off, index 1 is on.
@@ -73,6 +73,18 @@ const SSGI_STEPS_COUNTS: [u32; 4] = [8, 12, 24, 48];
 // Reflection blur resolution options, finest-first (matches the enum).
 const REFLECTION_BLUR_OPTIONS: [&str; 3] = ["Full", "Half", "Quarter"];
 
+// Shadow-map cascade resolution options (texels), in cycle order. "Off" disables
+// shadows (size 0); the rest are the per-cascade texel dimensions. Indices map
+// via the `shadow_resolution_*` helpers below (an authored size off the discrete
+// levels snaps to the nearest). Restart-required (the shadow map array is sized
+// once at backend init).
+const SHADOW_RESOLUTION_OPTIONS: [&str; 4] = ["Off", "1024", "2048", "4096"];
+const SHADOW_RESOLUTION_SIZES: [u32; 4] = [0, 1024, 2048, 4096];
+// Shadow re-render cadence options, best (most expensive) first: "Every Frame"
+// re-renders every cascade each frame, "Hybrid" amortizes the far cascades.
+// Applied live (the cascade scheduler reads the policy each frame).
+const SHADOW_UPDATE_OPTIONS: [&str; 2] = ["Every Frame", "Hybrid"];
+
 // The cycle (dropdown) quality knobs governed by the preset ceiling like the
 // boolean QUALITY_TOGGLE_KEYS. Each rides the feature's live-reinit rebuild
 // (`apply_quality_settings`) -- the sub-tunable travels in its settings payload,
@@ -126,6 +138,8 @@ pub(crate) fn options(key: &str) -> Option<&'static [&'static str]> {
         "ssgi_rays" => Some(&SSGI_RAYS_OPTIONS),
         "ssgi_steps" => Some(&SSGI_STEPS_OPTIONS),
         "reflection_blur_resolution" => Some(&REFLECTION_BLUR_OPTIONS),
+        "shadow_map_size" => Some(&SHADOW_RESOLUTION_OPTIONS),
+        "shadow_update" => Some(&SHADOW_UPDATE_OPTIONS),
         // Display-output / upscaling preference toggles (Off/On).
         "temporal_upscaling" | "hdr_display" | "hdr_pq" => Some(&OFF_ON_OPTIONS),
         key if is_quality_toggle(key) => Some(&OFF_ON_OPTIONS),
@@ -235,6 +249,33 @@ pub(crate) fn reflection_blur_index(res: ReflectionBlurResolution) -> usize {
         ReflectionBlurResolution::Full => 0,
         ReflectionBlurResolution::Half => 1,
         ReflectionBlurResolution::Quarter => 2,
+    }
+}
+
+// Shadow-map resolution (texels) for an option index, and the menu index nearest
+// an authored size (the world may author a size off the discrete levels; the row
+// then shows the closest one). The default fallback is the world default (2048).
+pub(crate) fn shadow_resolution_at(index: usize) -> u32 {
+    *SHADOW_RESOLUTION_SIZES
+        .get(index)
+        .unwrap_or(&SHADOW_RESOLUTION_SIZES[2])
+}
+pub(crate) fn shadow_resolution_index(size: u32) -> usize {
+    nearest_count_index(&SHADOW_RESOLUTION_SIZES, size)
+}
+
+// Shadow re-render cadence for an option index, and the index for a cadence.
+// Order matches SHADOW_UPDATE_OPTIONS (EveryFrame first).
+pub(crate) fn shadow_update_at(index: usize) -> ShadowUpdate {
+    match index {
+        0 => ShadowUpdate::EveryFrame,
+        _ => ShadowUpdate::Hybrid,
+    }
+}
+pub(crate) fn shadow_update_index(update: ShadowUpdate) -> usize {
+    match update {
+        ShadowUpdate::EveryFrame => 0,
+        ShadowUpdate::Hybrid => 1,
     }
 }
 
@@ -607,6 +648,34 @@ mod tests {
                 "{key} is not a quality cycle knob"
             );
         }
+    }
+
+    #[test]
+    fn shadow_resolution_round_trips_and_snaps() {
+        // Each discrete level round-trips through its index.
+        for i in 0..SHADOW_RESOLUTION_SIZES.len() {
+            assert_eq!(shadow_resolution_index(shadow_resolution_at(i)), i);
+        }
+        // "Off" is size 0 at index 0; the world default 2048 is index 2.
+        assert_eq!(shadow_resolution_at(0), 0);
+        assert_eq!(shadow_resolution_index(2048), 2);
+        // An authored size off the discrete levels snaps to the nearest, and a
+        // size above the top level snaps down to it.
+        assert_eq!(shadow_resolution_index(1500), 1); // 1500 -> 1024
+        assert_eq!(shadow_resolution_index(8192), 3); // 8192 -> 4096
+        // It is a cycle row, not a slider.
+        assert!(options("shadow_map_size").is_some());
+        assert!(slider_range("shadow_map_size").is_none());
+    }
+
+    #[test]
+    fn shadow_update_round_trips() {
+        for u in [ShadowUpdate::EveryFrame, ShadowUpdate::Hybrid] {
+            assert_eq!(shadow_update_at(shadow_update_index(u)), u);
+        }
+        // EveryFrame leads the cycle (best / most expensive first).
+        assert_eq!(shadow_update_at(0), ShadowUpdate::EveryFrame);
+        assert_eq!(options("shadow_update").map(|o| o.len()), Some(2));
     }
 
     #[test]

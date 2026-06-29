@@ -145,6 +145,15 @@ pub struct GraphicsSettings {
     // the SSGI sub-quality above (only bites when a reflection feature is on).
     #[serde(default)]
     pub reflection_blur_resolution: Option<crate::assets::ReflectionBlurResolution>,
+    // Shadow quality: cascade map resolution in texels (0 disables shadows) and
+    // re-render cadence (`GraphicsConfig.shadow_map_size` / `shadow_update`).
+    // `None` uses the world's value. Resolution is restart-required (the shadow
+    // map array is sized once at backend init); cadence is applied live on Metal.
+    // Both are governed by the quality preset ceiling like the toggles above.
+    #[serde(default)]
+    pub shadow_map_size: Option<u32>,
+    #[serde(default)]
+    pub shadow_update: Option<crate::assets::ShadowUpdate>,
     // Display-output / upscaling preferences. Unlike the quality knobs above,
     // these are independent of the master preset (a user choice, not a tier), and
     // each is restart-required: the swapchain format / render targets are sized
@@ -377,6 +386,8 @@ mod tests {
                 ssgi_rays: Some(16),
                 ssgi_steps: Some(24),
                 reflection_blur_resolution: Some(crate::assets::ReflectionBlurResolution::Full),
+                shadow_map_size: Some(4096),
+                shadow_update: Some(crate::assets::ShadowUpdate::EveryFrame),
                 temporal_upscaling: Some(true),
                 hdr_display: Some(true),
                 hdr_pq: Some(false),

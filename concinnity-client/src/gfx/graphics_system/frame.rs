@@ -682,6 +682,19 @@ impl GraphicsSystem {
                             self.authored_post_config.upscale_quality,
                             ceiling.min_upscale,
                         );
+                        // Re-derive the shadow knobs from the authored baselines
+                        // under the new ceiling. The cadence is live (the scheduler
+                        // reads it each frame); the resolution is restart-required,
+                        // so it only updates the row label below.
+                        self.shadow_map_size = quality_preset::clamp_shadow_map_size(
+                            self.authored_shadow_map_size,
+                            &ceiling,
+                        );
+                        self.shadow_update = quality_preset::clamp_shadow_update(
+                            self.authored_shadow_update,
+                            &ceiling,
+                        );
+                        backend.set_shadow_update(self.shadow_update);
 
                         // Persist the preset and drop the per-row quality overrides,
                         // so the next launch re-resolves them from the world +
@@ -698,6 +711,8 @@ impl GraphicsSystem {
                         cfg.graphics.ssgi_rays = None;
                         cfg.graphics.ssgi_steps = None;
                         cfg.graphics.reflection_blur_resolution = None;
+                        cfg.graphics.shadow_map_size = None;
+                        cfg.graphics.shadow_update = None;
                         cfg.graphics.render_scale = None;
                         if let Err(e) = cfg.save() {
                             tracing::warn!("GraphicsSystem: persist preset: {e}");
@@ -732,6 +747,21 @@ impl GraphicsSystem {
                                 .and_then(|idx| {
                                     settings::options(key).and_then(|o| o.get(idx).copied())
                                 })
+                            {
+                                set_cached_row_label(&self.cycle_value_labels, ctx, key, text);
+                            }
+                        }
+                        // And the shadow rows (their state lives on self, not the
+                        // post_config, so they relabel from the live fields).
+                        for key in ["shadow_map_size", "shadow_update"] {
+                            let idx = match key {
+                                "shadow_map_size" => {
+                                    settings::shadow_resolution_index(self.shadow_map_size)
+                                }
+                                _ => settings::shadow_update_index(self.shadow_update),
+                            };
+                            if let Some(text) =
+                                settings::options(key).and_then(|o| o.get(idx).copied())
                             {
                                 set_cached_row_label(&self.cycle_value_labels, ctx, key, text);
                             }
@@ -954,6 +984,45 @@ impl GraphicsSystem {
                                     cfg.graphics.hdr_pq = Some(on);
                                 }
                             }
+                            Some(opts[next])
+                        }
+                        // Shadow resolution: restart-required (the shadow map array
+                        // is sized once at init), so persist + display only; the
+                        // new size takes effect at the next launch. Preset-governed,
+                        // so an explicit choice opts the master preset out to Custom.
+                        "shadow_map_size" => {
+                            let cur = settings::shadow_resolution_index(self.shadow_map_size);
+                            let next = settings::cycle(cur, opts.len(), cmd.op);
+                            self.shadow_map_size = settings::shadow_resolution_at(next);
+                            cfg.graphics.shadow_map_size = Some(self.shadow_map_size);
+                            self.quality_preset = crate::gfx::quality_preset::QualityPreset::Custom;
+                            cfg.graphics.quality_preset = Some(self.quality_preset);
+                            set_cached_row_label(
+                                &self.cycle_value_labels,
+                                ctx,
+                                "graphics_quality",
+                                self.quality_preset.name(),
+                            );
+                            Some(opts[next])
+                        }
+                        // Shadow re-render cadence: live -- the cascade scheduler
+                        // reads the policy each frame, so it applies on the next
+                        // draw. Preset-governed, so an explicit choice flips the
+                        // master preset to Custom.
+                        "shadow_update" => {
+                            let cur = settings::shadow_update_index(self.shadow_update);
+                            let next = settings::cycle(cur, opts.len(), cmd.op);
+                            self.shadow_update = settings::shadow_update_at(next);
+                            backend.set_shadow_update(self.shadow_update);
+                            cfg.graphics.shadow_update = Some(self.shadow_update);
+                            self.quality_preset = crate::gfx::quality_preset::QualityPreset::Custom;
+                            cfg.graphics.quality_preset = Some(self.quality_preset);
+                            set_cached_row_label(
+                                &self.cycle_value_labels,
+                                ctx,
+                                "graphics_quality",
+                                self.quality_preset.name(),
+                            );
                             Some(opts[next])
                         }
                         _ => None,

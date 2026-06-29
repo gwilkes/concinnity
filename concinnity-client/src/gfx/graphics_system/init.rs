@@ -91,6 +91,34 @@ impl GraphicsSystem {
             self.vsync = v;
         }
 
+        // Shadow quality knobs (GraphicsConfig-sourced). Snapshot the world's
+        // authored values as the baseline a live preset change re-clamps from,
+        // then apply any persisted override and otherwise clamp under the preset
+        // ceiling (an explicit override wins, like the quality toggles below). The
+        // resolution is restart-required -- the shadow map array is sized from
+        // `self.shadow_map_size` at backend init below -- while the cadence is read
+        // by the cascade scheduler each frame.
+        self.authored_shadow_map_size = self.shadow_map_size;
+        self.authored_shadow_update = self.shadow_update;
+        match user_graphics.shadow_map_size {
+            Some(v) => self.shadow_map_size = v,
+            None => {
+                self.shadow_map_size = crate::gfx::quality_preset::clamp_shadow_map_size(
+                    self.shadow_map_size,
+                    &quality_ceiling,
+                )
+            }
+        }
+        match user_graphics.shadow_update {
+            Some(v) => self.shadow_update = v,
+            None => {
+                self.shadow_update = crate::gfx::quality_preset::clamp_shadow_update(
+                    self.shadow_update,
+                    &quality_ceiling,
+                )
+            }
+        }
+
         // Resolve post-process tunables. The first declared PostProcessConfig
         // wins; with none declared the renderer uses the stack defaults. The
         // `taa` toggle is a plain bool threaded alongside the resolved params.
@@ -342,6 +370,8 @@ impl GraphicsSystem {
         // closure below does not borrow self while ctx is borrowed mutably).
         let (display_upscaling, display_hdr, display_pq) =
             (self.temporal_upscaling, self.hdr_display, self.hdr_pq);
+        // Shadow knob states for the value-label sync (copies, same reason).
+        let (shadow_size, shadow_update_val) = (self.shadow_map_size, self.shadow_update);
         // Audio / controls value labels read from the persisted settings store
         // (with the baseline default when unset); their owning systems apply the
         // value at their own init.
@@ -368,6 +398,9 @@ impl GraphicsSystem {
             "temporal_upscaling" => Some(display_upscaling as usize),
             "hdr_display" => Some(display_hdr as usize),
             "hdr_pq" => Some(display_pq as usize),
+            // Shadow quality knobs (resolution restart-required, cadence live).
+            "shadow_map_size" => Some(crate::gfx::settings::shadow_resolution_index(shadow_size)),
+            "shadow_update" => Some(crate::gfx::settings::shadow_update_index(shadow_update_val)),
             // mouse_sensitivity is a slider now, synced by `init_sliders`.
             // Quality toggles: index 0 = Off, 1 = On, matching OFF_ON_OPTIONS.
             key if crate::gfx::settings::is_quality_toggle(key) => {

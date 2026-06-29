@@ -65,7 +65,7 @@ const VIDEO_ADVANCED_SLIDERS: [(&str, &str); 6] = [
 // client (`concinnity_client::gfx::settings` + `graphics_system`) knows each key's options and
 // applies it live by rebuilding the affected render resources; on backends
 // without a live path the choice persists and applies at the next launch.
-const VIDEO_QUALITY_ROWS: [(&str, &str); 10] = [
+const VIDEO_QUALITY_ROWS: [(&str, &str); 12] = [
     ("taa", "Anti-Aliasing"),
     ("ssao", "Ambient Occlusion"),
     ("ssr", "Screen-Space Reflections"),
@@ -79,6 +79,10 @@ const VIDEO_QUALITY_ROWS: [(&str, &str); 10] = [
     ("ssgi_resolution", "GI Resolution"),
     ("ssgi_rays", "GI Rays"),
     ("ssgi_steps", "GI Steps"),
+    // Shadow quality: cascade map resolution (restart-required) + re-render
+    // cadence (live). Preset-governed like the toggles above.
+    ("shadow_map_size", "Shadow Resolution"),
+    ("shadow_update", "Shadow Update"),
     ("auto_exposure", "Auto Exposure"),
 ];
 const AUDIO_ROWS: [(&str, &str); 1] = [("master_volume", "Master Volume")];
@@ -1631,6 +1635,8 @@ mod tests {
             "opt_ssgi_resolution",
             "opt_ssgi_rays",
             "opt_ssgi_steps",
+            "opt_shadow_map_size",
+            "opt_shadow_update",
             "opt_auto_exposure",
         ] {
             assert_eq!(

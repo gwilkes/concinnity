@@ -305,6 +305,14 @@ impl MtlContext {
         self.light_uniforms.ambient_intensity = value;
     }
 
+    // Set the live shadow cascade re-render cadence. The scheduler reads
+    // `shadow_update` at the start of each shadow pass, so a change takes effect
+    // on the next draw. Every cascade is already primed, so switching policy never
+    // leaves a slice unsampled (priming is one-shot per cascade, not per policy).
+    pub fn set_shadow_update(&mut self, update: crate::assets::ShadowUpdate) {
+        self.shadow_update = update;
+    }
+
     // Snapshot the current input state for this frame.
     // Key booleans reflect what is held right now; mouse deltas are cleared
     // after being read so they don't accumulate across frames.

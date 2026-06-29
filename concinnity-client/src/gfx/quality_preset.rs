@@ -12,7 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::assets::{ReflectionBlurResolution, SsgiResolution, UpscaleQuality};
+use crate::assets::{ReflectionBlurResolution, ShadowUpdate, SsgiResolution, UpscaleQuality};
 use crate::gfx::backend::{GpuProfile, GpuTier};
 
 // Persisted master graphics-quality choice. `Auto` resolves from the detected
@@ -61,6 +61,14 @@ pub(crate) struct QualityCeiling {
     // allows, clamping the world's choice coarser. The no-ceiling value is `Full`
     // (finest), so a world's authored value always stands under it.
     pub reflection_blur_resolution: ReflectionBlurResolution,
+    // Cap on the shadow-map cascade resolution in texels (restart-required): the
+    // effective size is the smaller of the world's choice and this cap. The
+    // no-ceiling value is `u32::MAX`, so a world's authored size always stands.
+    pub shadow_map_size: u32,
+    // Whether the tier permits the `EveryFrame` shadow re-render cadence (live).
+    // When false the cadence is clamped to the cheaper `Hybrid`; the no-ceiling
+    // value is `true`, so a world's authored cadence always stands.
+    pub allow_every_frame_shadows: bool,
 }
 
 // The coarser (higher render-resolution divisor) of two SSGI resolutions, the
@@ -101,6 +109,31 @@ const SSGI_STEPS_MAX: u32 = 64;
 // `Full` (finest) is the no-cap reflection-blur resolution: a world's choice
 // always stands coarser-or-equal under it.
 const REFLECTION_BLUR_MAX: ReflectionBlurResolution = ReflectionBlurResolution::Full;
+// `u32::MAX` is the no-cap shadow-map resolution: a world's authored size always
+// stands smaller-or-equal under it.
+const SHADOW_SIZE_MAX: u32 = u32::MAX;
+
+// The coarser (smaller) of two shadow-map resolutions, the shadow analogue of
+// the SSGI / reflection-blur clamp helpers. Used to clamp a world's authored
+// size DOWN under a ceiling without ever raising it. `0` (shadows disabled) is
+// the smallest, so a ceiling never re-enables a world that authored it off.
+pub(crate) fn clamp_shadow_map_size(authored: u32, ceiling: &QualityCeiling) -> u32 {
+    authored.min(ceiling.shadow_map_size)
+}
+
+// The world's shadow re-render cadence clamped under the ceiling: a tier that
+// disallows `EveryFrame` forces the cheaper `Hybrid`; otherwise the authored
+// cadence stands. Never raises (`Hybrid` -> `EveryFrame`).
+pub(crate) fn clamp_shadow_update(
+    authored: ShadowUpdate,
+    ceiling: &QualityCeiling,
+) -> ShadowUpdate {
+    if ceiling.allow_every_frame_shadows {
+        authored
+    } else {
+        ShadowUpdate::Hybrid
+    }
+}
 
 const NONE: QualityCeiling = QualityCeiling {
     taa: true,
@@ -114,6 +147,8 @@ const NONE: QualityCeiling = QualityCeiling {
     ssgi_rays: SSGI_RAYS_MAX,
     ssgi_steps: SSGI_STEPS_MAX,
     reflection_blur_resolution: REFLECTION_BLUR_MAX,
+    shadow_map_size: SHADOW_SIZE_MAX,
+    allow_every_frame_shadows: true,
 };
 const LOW: QualityCeiling = QualityCeiling {
     taa: true,
@@ -127,6 +162,8 @@ const LOW: QualityCeiling = QualityCeiling {
     ssgi_rays: 4,
     ssgi_steps: 8,
     reflection_blur_resolution: ReflectionBlurResolution::Quarter,
+    shadow_map_size: 1024,
+    allow_every_frame_shadows: false,
 };
 const MEDIUM: QualityCeiling = QualityCeiling {
     taa: true,
@@ -140,6 +177,8 @@ const MEDIUM: QualityCeiling = QualityCeiling {
     ssgi_rays: 8,
     ssgi_steps: 12,
     reflection_blur_resolution: ReflectionBlurResolution::Half,
+    shadow_map_size: 2048,
+    allow_every_frame_shadows: false,
 };
 const HIGH: QualityCeiling = QualityCeiling {
     taa: true,
@@ -153,6 +192,8 @@ const HIGH: QualityCeiling = QualityCeiling {
     ssgi_rays: 8,
     ssgi_steps: 12,
     reflection_blur_resolution: ReflectionBlurResolution::Half,
+    shadow_map_size: 4096,
+    allow_every_frame_shadows: false,
 };
 const ULTRA: QualityCeiling = QualityCeiling {
     taa: true,
@@ -166,6 +207,8 @@ const ULTRA: QualityCeiling = QualityCeiling {
     ssgi_rays: SSGI_RAYS_MAX,
     ssgi_steps: SSGI_STEPS_MAX,
     reflection_blur_resolution: REFLECTION_BLUR_MAX,
+    shadow_map_size: SHADOW_SIZE_MAX,
+    allow_every_frame_shadows: true,
 };
 
 // The active ceiling for the persisted preset and detected GPU. `Auto` maps the
@@ -389,7 +432,47 @@ mod tests {
                 lo.reflection_blur_resolution,
                 "a higher tier permitted a coarser reflection blur"
             );
+            // The shadow caps rise (or hold) with the tier: a higher tier never
+            // permits a smaller shadow map or forbids a cadence a lower tier
+            // allowed.
+            assert!(
+                lo.shadow_map_size <= hi.shadow_map_size,
+                "shadow_map_size cap dropped"
+            );
+            assert!(
+                !lo.allow_every_frame_shadows || hi.allow_every_frame_shadows,
+                "a higher tier forbade the EveryFrame shadow cadence"
+            );
         }
+    }
+
+    #[test]
+    fn shadow_caps_clamp_down_only() {
+        use crate::assets::ShadowUpdate;
+        // No ceiling (Custom / Ultra) leaves a world's authored shadows alone.
+        let none = resolve_ceiling(QualityPreset::Custom, &GpuProfile::UNKNOWN);
+        assert_eq!(clamp_shadow_map_size(8192, &none), 8192);
+        assert_eq!(
+            clamp_shadow_update(ShadowUpdate::EveryFrame, &none),
+            ShadowUpdate::EveryFrame
+        );
+        // Low caps the map size hard and forces the cheaper Hybrid cadence.
+        let low = resolve_ceiling(QualityPreset::Low, &GpuProfile::UNKNOWN);
+        assert_eq!(clamp_shadow_map_size(4096, &low), 1024);
+        assert_eq!(
+            clamp_shadow_update(ShadowUpdate::EveryFrame, &low),
+            ShadowUpdate::Hybrid
+        );
+        // The clamp never raises: a world authoring a smaller map keeps it, and a
+        // tier permitting EveryFrame leaves Hybrid as Hybrid.
+        assert_eq!(clamp_shadow_map_size(512, &low), 512);
+        assert_eq!(
+            clamp_shadow_update(ShadowUpdate::Hybrid, &none),
+            ShadowUpdate::Hybrid
+        );
+        // Shadows authored off (size 0) stay off under any ceiling.
+        assert_eq!(clamp_shadow_map_size(0, &none), 0);
+        assert_eq!(clamp_shadow_map_size(0, &low), 0);
     }
 
     #[test]

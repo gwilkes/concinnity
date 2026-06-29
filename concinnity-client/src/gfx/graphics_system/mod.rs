@@ -214,6 +214,12 @@ pub struct GraphicsSystem {
     temporal_upscaling: bool,
     hdr_display: bool,
     hdr_pq: bool,
+    // The world's authored shadow knobs before the user overrides + preset ceiling
+    // (defaulted when the world declares no GraphicsConfig). The pristine baseline
+    // a live preset change re-clamps from, like `authored_post_config`. The live
+    // values are `shadow_map_size` / `shadow_update` above.
+    authored_shadow_map_size: u32,
+    authored_shadow_update: crate::assets::ShadowUpdate,
 }
 
 // One key-rebind row's runtime bookkeeping: the action it rebinds and the value
@@ -377,6 +383,8 @@ impl GraphicsSystem {
             temporal_upscaling: false,
             hdr_display: false,
             hdr_pq: false,
+            authored_shadow_map_size: 2048,
+            authored_shadow_update: crate::assets::ShadowUpdate::default(),
         }
     }
 }

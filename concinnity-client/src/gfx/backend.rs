@@ -530,6 +530,16 @@ pub trait RenderBackend: SceneControl + Send {
         let _ = settings;
     }
 
+    // Set the shadow cascade re-render cadence live. The cascade scheduler reads
+    // the policy at the start of each shadow pass, so a change takes effect on the
+    // next draw with no pipeline rebuild or allocation (unlike the shadow map
+    // resolution, which is sized once at init). Default no-op: a backend that only
+    // reads the cadence at init keeps the init-time value (DirectX / Vulkan
+    // today), so the choice persists and takes effect at the next launch there.
+    fn set_shadow_update(&mut self, update: crate::assets::ShadowUpdate) {
+        let _ = update;
+    }
+
     // Shared atomic flag the backend polls at frame start to trigger a
     // shader rebuild. `Some` only under `cn debug` on backends that ship
     // hot-reload (Metal today); `None` on production runs and on backends

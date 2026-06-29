@@ -601,6 +601,87 @@ impl GraphicsSystem {
                         }
                         continue;
                     }
+                    // Master "Graphics Quality" preset row. A preset is a
+                    // performance ceiling over the world's authored look (it never
+                    // enables a feature the world did not author), so picking a
+                    // tier / Auto clears the per-row quality overrides and
+                    // re-derives the toggles + render scale from the world's
+                    // authored config under the new ceiling: raising a preset
+                    // restores the world's features, lowering it clamps them off.
+                    // Custom resolves to the no-op ceiling (the world's look).
+                    // Render scale is restart-required, so it only persists +
+                    // relabels here. See gfx/quality_preset.rs.
+                    if cmd.setting == "graphics_quality" {
+                        use crate::gfx::quality_preset;
+                        let opts = settings::options("graphics_quality").unwrap_or(&[]);
+                        let cur = quality_preset::preset_index(self.quality_preset);
+                        let next = settings::cycle(cur, opts.len(), cmd.op);
+                        let preset = quality_preset::preset_at(next);
+                        self.quality_preset = preset;
+                        let ceiling = quality_preset::resolve_ceiling(preset, &self.gpu_profile);
+
+                        // Re-derive the live quality toggles from the world
+                        // baseline under the new ceiling (force off where
+                        // disallowed; never turn on).
+                        self.post_config = self.authored_post_config.clone();
+                        for (key, allowed) in [
+                            ("taa", ceiling.taa),
+                            ("ssao", ceiling.ssao),
+                            ("ssr", ceiling.ssr),
+                            ("ray_traced_reflections", ceiling.ray_traced_reflections),
+                            ("ssgi", ceiling.ssgi),
+                            ("auto_exposure", ceiling.auto_exposure),
+                        ] {
+                            if !allowed {
+                                super::set_quality_toggle(&mut self.post_config, key, false);
+                            }
+                        }
+                        backend.apply_quality_settings(super::derive_quality_settings(
+                            &self.post_config,
+                        ));
+                        // Auto-exposure may have flipped off; re-push the static
+                        // post-process params so exposure reverts (mirrors the
+                        // quality-toggle arm below).
+                        backend.update_post_process(self.post_process);
+                        // Restart-required: update the live render scale for the
+                        // row label only (the upscaler + targets are sized at init,
+                        // so it takes effect at the next launch).
+                        self.render_scale = quality_preset::more_aggressive_upscale(
+                            self.authored_post_config.upscale_quality,
+                            ceiling.min_upscale,
+                        );
+
+                        // Persist the preset and drop the per-row quality overrides,
+                        // so the next launch re-resolves them from the world +
+                        // ceiling exactly as this live re-derive did.
+                        let mut cfg = crate::config::Settings::load();
+                        cfg.graphics.quality_preset = Some(preset);
+                        cfg.graphics.taa = None;
+                        cfg.graphics.ssao = None;
+                        cfg.graphics.ssr = None;
+                        cfg.graphics.ray_traced_reflections = None;
+                        cfg.graphics.ssgi = None;
+                        cfg.graphics.auto_exposure = None;
+                        cfg.graphics.render_scale = None;
+                        if let Err(e) = cfg.save() {
+                            tracing::warn!("GraphicsSystem: persist preset: {e}");
+                        }
+
+                        // Refresh the dependent rows (quality toggles + render
+                        // scale) and the master row's own Auto(tier) label.
+                        let post_snapshot = self.post_config.clone();
+                        let render_scale = self.render_scale;
+                        super::init::sync_setting_value_labels(ctx, |key| match key {
+                            "render_scale" => Some(settings::render_scale_index(render_scale)),
+                            k if settings::is_quality_toggle(k) => {
+                                super::quality_toggle_on(&post_snapshot, k).map(|on| on as usize)
+                            }
+                            _ => None,
+                        });
+                        let label = quality_preset::preset_label(preset, &self.gpu_profile);
+                        super::init::set_setting_row_label(ctx, "graphics_quality", &label);
+                        continue;
+                    }
                     let Some(opts) = settings::options(&cmd.setting) else {
                         tracing::warn!("GraphicsSystem: unknown setting '{}'", cmd.setting);
                         continue;
@@ -660,6 +741,15 @@ impl GraphicsSystem {
                             let next = settings::cycle(cur, opts.len(), cmd.op);
                             self.render_scale = settings::render_scale_at(next);
                             cfg.graphics.render_scale = Some(self.render_scale);
+                            // Render scale is ceiling-governed, so an explicit
+                            // choice opts the master preset out to Custom.
+                            self.quality_preset = crate::gfx::quality_preset::QualityPreset::Custom;
+                            cfg.graphics.quality_preset = Some(self.quality_preset);
+                            super::init::set_setting_row_label(
+                                ctx,
+                                "graphics_quality",
+                                self.quality_preset.name(),
+                            );
                             Some(opts[next])
                         }
                         "master_volume" => {
@@ -705,6 +795,16 @@ impl GraphicsSystem {
                                 "auto_exposure" => cfg.graphics.auto_exposure = Some(on),
                                 _ => {}
                             }
+                            // An explicit per-row quality change opts the master
+                            // preset out to Custom (no ceiling clamps the user's
+                            // choice), and updates the master row's label to match.
+                            self.quality_preset = crate::gfx::quality_preset::QualityPreset::Custom;
+                            cfg.graphics.quality_preset = Some(self.quality_preset);
+                            super::init::set_setting_row_label(
+                                ctx,
+                                "graphics_quality",
+                                self.quality_preset.name(),
+                            );
                             backend.apply_quality_settings(super::derive_quality_settings(
                                 &self.post_config,
                             ));

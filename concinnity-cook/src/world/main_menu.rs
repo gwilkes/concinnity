@@ -714,10 +714,12 @@ fn settings_body_rows(active: &str) -> (Vec<BodyRow>, Vec<GroupSpec>) {
         // vec below (and a row's group tag references that same gid). Quality is
         // declared first, so it is gid 0; Advanced second, so gid 1.
         _ => {
-            let mut rows: Vec<BodyRow> = VIDEO_ROWS
-                .iter()
-                .map(|&(s, l)| BodyRow::Option(s, l, -1))
-                .collect();
+            // The master "Graphics Quality" preset leads the tab (ungrouped, so it
+            // is always visible); the runtime cycles Auto/Low/Medium/High/Ultra/
+            // Custom and re-derives the toggles + render scale under its ceiling.
+            let mut rows: Vec<BodyRow> =
+                vec![BodyRow::Option("graphics_quality", "Graphics Quality", -1)];
+            rows.extend(VIDEO_ROWS.iter().map(|&(s, l)| BodyRow::Option(s, l, -1)));
             rows.push(BodyRow::GroupHeader(0, "Quality"));
             for &(s, l) in &VIDEO_QUALITY_ROWS {
                 rows.push(BodyRow::Option(s, l, 0));
@@ -1140,6 +1142,31 @@ mod tests {
             assert_eq!(opt["args"]["setting"], setting);
             assert_eq!(opt["args"]["label"], label);
         }
+    }
+
+    #[test]
+    fn video_tab_leads_with_the_master_quality_row() {
+        let mut assets = vec![serde_json::json!({"name":"m","type":"MainMenu"})];
+        expand_main_menus(&mut assets).unwrap();
+        // The master preset row is an ungrouped OptionSelect bound to the
+        // graphics_quality setting (the runtime knows its options + how to apply).
+        let opt = by_name(&assets, "m_settings_video_opt_graphics_quality");
+        assert_eq!(opt["type"], "OptionSelect");
+        assert_eq!(opt["args"]["setting"], "graphics_quality");
+        assert_eq!(opt["args"]["label"], "Graphics Quality");
+        // It leads the tab: it is emitted before the first core row (vsync).
+        let master_pos = assets
+            .iter()
+            .position(|v| asset_name(v) == "m_settings_video_opt_graphics_quality")
+            .expect("master row");
+        let vsync_pos = assets
+            .iter()
+            .position(|v| asset_name(v) == "m_settings_video_opt_vsync")
+            .expect("vsync row");
+        assert!(
+            master_pos < vsync_pos,
+            "master quality row should lead the tab"
+        );
     }
 
     #[test]

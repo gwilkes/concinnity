@@ -189,6 +189,16 @@ pub struct GraphicsSystem {
     // auto-config quality ceiling can influence the render targets / effect
     // pipelines sized at backend init. Held in memory only, never persisted.
     gpu_profile: crate::gfx::backend::GpuProfile,
+    // The live master "Graphics Quality" preset the settings-menu row cycles.
+    // Seeded at init from the persisted choice (or `Auto` on first launch);
+    // changing a preset re-derives the quality toggles + render scale under its
+    // ceiling, and changing any individual quality row flips this to `Custom`.
+    quality_preset: crate::gfx::quality_preset::QualityPreset,
+    // The world's authored PostProcessConfig before the user overrides + preset
+    // ceiling are applied (defaulted when the world declares none). The pristine
+    // baseline a live preset change re-clamps from, so up-shifting a preset
+    // restores the world's features and down-shifting clamps them off.
+    authored_post_config: crate::assets::PostProcessConfig,
 }
 
 // One key-rebind row's runtime bookkeeping: the action it rebinds and the value
@@ -343,6 +353,10 @@ impl GraphicsSystem {
             caps: crate::gfx::backend::DeviceCapabilities::ALL,
             // Conservative until probed at init.
             gpu_profile: crate::gfx::backend::GpuProfile::UNKNOWN,
+            // Seeded at init from the persisted preset (Auto on first launch).
+            quality_preset: crate::gfx::quality_preset::QualityPreset::Auto,
+            // Defaulted until init captures the world's authored config.
+            authored_post_config: crate::assets::PostProcessConfig::default(),
         }
     }
 }

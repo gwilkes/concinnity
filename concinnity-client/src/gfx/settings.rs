@@ -59,6 +59,13 @@ const WINDOW_MODE_OPTIONS: [&str; 3] = ["Windowed", "Borderless", "Fullscreen"];
 // `render_scale_at` / `render_scale_index`.
 const RENDER_SCALE_OPTIONS: [&str; 4] = ["Quality", "Balanced", "Performance", "Ultra"];
 
+// Master "Graphics Quality" preset options, in cycle order. The labels mirror
+// `QualityPreset::ALL`'s order (locked by `graphics_quality_options_match_preset_order`);
+// `quality_preset::preset_index` / `preset_at` map an index to the live preset.
+// The `Auto` row is relabeled with its resolved tier (e.g. "Auto (High)") by the
+// graphics system, which the static table cannot express.
+const GRAPHICS_QUALITY_OPTIONS: [&str; 6] = ["Auto", "Low", "Medium", "High", "Ultra", "Custom"];
+
 // Master-volume options, in cycle order. Indices map to a linear gain via
 // `master_volume_at` / `master_volume_index`.
 const MASTER_VOLUME_OPTIONS: [&str; 5] = ["Off", "25%", "50%", "75%", "100%"];
@@ -83,6 +90,7 @@ const WINDOW_SIZE_PRESETS: [(&str, u32, u32); 4] = [
 // The option labels for a known setting key, or `None` if the key is unknown.
 pub(crate) fn options(key: &str) -> Option<&'static [&'static str]> {
     match key {
+        "graphics_quality" => Some(&GRAPHICS_QUALITY_OPTIONS),
         "vsync" => Some(&VSYNC_OPTIONS),
         "window_mode" => Some(&WINDOW_MODE_OPTIONS),
         "render_scale" => Some(&RENDER_SCALE_OPTIONS),
@@ -300,6 +308,21 @@ mod tests {
     #[test]
     fn unknown_key_has_no_options() {
         assert!(options("does_not_exist").is_none());
+    }
+
+    #[test]
+    fn graphics_quality_options_match_preset_order() {
+        use crate::gfx::quality_preset::QualityPreset;
+        // The master row's labels must line up 1:1 with the preset cycle order,
+        // so an index from `preset_index` selects the right label and vice versa.
+        assert_eq!(GRAPHICS_QUALITY_OPTIONS.len(), QualityPreset::ALL.len());
+        for (i, p) in QualityPreset::ALL.iter().enumerate() {
+            assert_eq!(GRAPHICS_QUALITY_OPTIONS[i], p.name(), "label {i}");
+        }
+        assert_eq!(
+            options("graphics_quality"),
+            Some(&GRAPHICS_QUALITY_OPTIONS[..])
+        );
     }
 
     #[test]

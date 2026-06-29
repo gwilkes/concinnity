@@ -133,6 +133,31 @@ pub(crate) fn more_aggressive_upscale(a: UpscaleQuality, b: UpscaleQuality) -> U
 }
 
 impl QualityPreset {
+    // The presets in menu-cycle order. The settings-menu master row cycles
+    // through these; `GRAPHICS_QUALITY_OPTIONS` in `gfx::settings` holds the
+    // matching display labels in the same order (locked by a test there).
+    pub(crate) const ALL: [QualityPreset; 6] = [
+        Self::Auto,
+        Self::Low,
+        Self::Medium,
+        Self::High,
+        Self::Ultra,
+        Self::Custom,
+    ];
+
+    // The display name for this preset (the bare label, without an `Auto`
+    // tier suffix; see `preset_label`).
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Low => "Low",
+            Self::Medium => "Medium",
+            Self::High => "High",
+            Self::Ultra => "Ultra",
+            Self::Custom => "Custom",
+        }
+    }
+
     // Parse a preset from a string (case-insensitive), for the `CN_QUALITY_PRESET`
     // env override that lets a test / CI run force a preset (e.g. `custom` for no
     // clamp) without writing to settings.bin. `None` for an unrecognized value.
@@ -146,6 +171,48 @@ impl QualityPreset {
             "custom" => Some(Self::Custom),
             _ => None,
         }
+    }
+}
+
+// The cycle index of a preset, and the preset at an index, over `ALL`. The
+// master settings row cycles indices; these convert to and from the live
+// `QualityPreset`. An out-of-range index falls back to `Auto`.
+pub(crate) fn preset_index(preset: QualityPreset) -> usize {
+    QualityPreset::ALL
+        .iter()
+        .position(|&p| p == preset)
+        .unwrap_or(0)
+}
+pub(crate) fn preset_at(index: usize) -> QualityPreset {
+    QualityPreset::ALL
+        .get(index)
+        .copied()
+        .unwrap_or(QualityPreset::Auto)
+}
+
+// The named tier `Auto` resolves to on this GPU, for the menu label (e.g.
+// "Auto (High)"). `None` when the GPU is unclassified, where `Auto` imposes no
+// ceiling and the bare "Auto" reads correctly.
+pub(crate) fn auto_resolved_name(profile: &GpuProfile) -> Option<&'static str> {
+    match profile.tier {
+        GpuTier::Unknown => None,
+        GpuTier::Integrated => Some("Low"),
+        GpuTier::EntryDiscrete => Some("Medium"),
+        GpuTier::MidDiscrete => Some("High"),
+        GpuTier::HighDiscrete => Some("Ultra"),
+    }
+}
+
+// The master row's display text for a preset: a named tier shows its own name,
+// while `Auto` annotates the tier it resolved to on the detected GPU (e.g.
+// "Auto (High)") so the user can see what the auto-config chose.
+pub(crate) fn preset_label(preset: QualityPreset, profile: &GpuProfile) -> String {
+    match preset {
+        QualityPreset::Auto => match auto_resolved_name(profile) {
+            Some(tier) => format!("Auto ({tier})"),
+            None => "Auto".to_string(),
+        },
+        other => other.name().to_string(),
     }
 }
 
@@ -260,6 +327,59 @@ mod tests {
         assert_eq!(QualityPreset::parse("AUTO"), Some(QualityPreset::Auto));
         assert_eq!(QualityPreset::parse("nonsense"), None);
         assert_eq!(QualityPreset::parse(""), None);
+    }
+
+    #[test]
+    fn preset_index_and_at_round_trip() {
+        for p in QualityPreset::ALL {
+            assert_eq!(preset_at(preset_index(p)), p);
+        }
+        // Auto leads the cycle order; an out-of-range index falls back to Auto.
+        assert_eq!(preset_at(0), QualityPreset::Auto);
+        assert_eq!(preset_at(99), QualityPreset::Auto);
+    }
+
+    #[test]
+    fn auto_label_annotates_the_resolved_tier() {
+        // Auto shows the tier it resolved to, so the user sees the auto choice.
+        assert_eq!(
+            preset_label(
+                QualityPreset::Auto,
+                &profile_with_tier(GpuTier::MidDiscrete)
+            ),
+            "Auto (High)"
+        );
+        assert_eq!(
+            preset_label(QualityPreset::Auto, &profile_with_tier(GpuTier::Integrated)),
+            "Auto (Low)"
+        );
+        // An unclassified GPU imposes no ceiling, so bare "Auto" is honest.
+        assert_eq!(
+            preset_label(QualityPreset::Auto, &profile_with_tier(GpuTier::Unknown)),
+            "Auto"
+        );
+        // A named preset is just its own name, hardware-independent.
+        assert_eq!(
+            preset_label(
+                QualityPreset::Ultra,
+                &profile_with_tier(GpuTier::Integrated)
+            ),
+            "Ultra"
+        );
+        // The Auto suffix tracks the resolved ceiling.
+        for tier in [
+            GpuTier::Integrated,
+            GpuTier::EntryDiscrete,
+            GpuTier::MidDiscrete,
+            GpuTier::HighDiscrete,
+        ] {
+            let profile = profile_with_tier(tier);
+            let suffix = auto_resolved_name(&profile).unwrap();
+            assert_eq!(
+                preset_label(QualityPreset::Auto, &profile),
+                format!("Auto ({suffix})")
+            );
+        }
     }
 
     #[test]

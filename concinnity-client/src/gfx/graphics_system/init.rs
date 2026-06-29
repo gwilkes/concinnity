@@ -53,6 +53,9 @@ impl GraphicsSystem {
                 QualityPreset::Auto
             })
         });
+        // Hold the resolved preset as the live value the settings-menu master
+        // row cycles (and that an individual quality-row change flips to Custom).
+        self.quality_preset = active_preset;
         let quality_ceiling =
             crate::gfx::quality_preset::resolve_ceiling(active_preset, &self.gpu_profile);
         tracing::info!(
@@ -149,6 +152,11 @@ impl GraphicsSystem {
         // config would wrongly engage the upscaler). The stored copy is still
         // defaulted when absent so a runtime toggle has a config to flip.
         self.post_config = post_config.clone().unwrap_or_default();
+        // The pristine world baseline, before the user overrides + preset ceiling
+        // below. A live preset change re-clamps the quality toggles from this, so
+        // raising a preset restores the world's features (a ceiling never enables
+        // anything the world did not author, so re-clamping the baseline is exact).
+        self.authored_post_config = self.post_config.clone();
         if post_config.is_some() {
             if let Some(v) = user_graphics.taa {
                 super::set_quality_toggle(&mut self.post_config, "taa", v);
@@ -315,6 +323,12 @@ impl GraphicsSystem {
             }
             _ => None,
         });
+        // The master "Graphics Quality" row carries the resolved tier under Auto
+        // (e.g. "Auto (High)"), which the static option table cannot express, so
+        // it is set directly after the generic sync above writes the bare name.
+        let preset_label =
+            crate::gfx::quality_preset::preset_label(active_preset, &self.gpu_profile);
+        set_setting_row_label(ctx, "graphics_quality", &preset_label);
         // Capture the slider rows and sync each handle + value label to its live
         // value (e.g. the persisted/authored exposure). Like the cycle-row sync
         // above, this runs before UiInputSystem drains the HitRegions.
@@ -2012,7 +2026,7 @@ impl GraphicsSystem {
 // of that setting. `current_index` maps a setting key to the index of its
 // active option (None for an unknown key). Runs once at init, before any
 // system drains the HitRegions.
-fn sync_setting_value_labels(
+pub(super) fn sync_setting_value_labels(
     ctx: &mut PipelineContext,
     current_index: impl Fn(&str) -> Option<usize>,
 ) {
@@ -2037,6 +2051,24 @@ fn sync_setting_value_labels(
                     l.content = text.to_string();
                     break;
                 }
+            }
+        }
+    }
+}
+
+// Set the value label of the settings row bound to `key` to `text` directly,
+// for a label that is not one of the row's static `options` (the master preset
+// row's "Auto (High)", or the live "Custom" flip when a quality row changes).
+pub(super) fn set_setting_row_label(ctx: &mut PipelineContext, key: &str, text: &str) {
+    let label_id = ctx.query::<HitRegion>().find_map(|r| {
+        let row_key = r.action.strip_prefix("setting:")?.split(':').next()?;
+        (row_key == key).then_some(r.label).flatten()
+    });
+    if let Some(id) = label_id {
+        for l in ctx.query_mut::<TextLabel>() {
+            if l.asset_id == id {
+                l.content = text.to_string();
+                break;
             }
         }
     }

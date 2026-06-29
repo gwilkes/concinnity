@@ -496,7 +496,6 @@ impl GraphicsSystem {
 // key that is not a quality toggle.
 pub(super) fn quality_toggle_on(cfg: &crate::assets::PostProcessConfig, key: &str) -> Option<bool> {
     match key {
-        "taa" => Some(cfg.taa),
         "ssao" => Some(cfg.ssao),
         "ssr" => Some(cfg.ssr),
         "ray_traced_reflections" => Some(cfg.ray_traced_reflections),
@@ -509,7 +508,6 @@ pub(super) fn quality_toggle_on(cfg: &crate::assets::PostProcessConfig, key: &st
 // Flip quality toggle `key` to `on` in `cfg`. Unknown keys are ignored.
 pub(super) fn set_quality_toggle(cfg: &mut crate::assets::PostProcessConfig, key: &str, on: bool) {
     match key {
-        "taa" => cfg.taa = on,
         "ssao" => cfg.ssao = on,
         "ssr" => cfg.ssr = on,
         "ray_traced_reflections" => cfg.ray_traced_reflections = on,
@@ -540,6 +538,7 @@ pub(super) fn quality_cycle_index(
 ) -> Option<usize> {
     use crate::gfx::settings;
     match key {
+        "aa_mode" => Some(settings::aa_mode_index(cfg.aa_mode)),
         "ssgi_resolution" => Some(settings::ssgi_resolution_index(cfg.ssgi_resolution)),
         "ssgi_rays" => Some(settings::ssgi_rays_index(cfg.ssgi_rays)),
         "ssgi_steps" => Some(settings::ssgi_steps_index(cfg.ssgi_steps)),
@@ -559,6 +558,7 @@ pub(super) fn set_quality_cycle(
 ) {
     use crate::gfx::settings;
     match key {
+        "aa_mode" => cfg.aa_mode = settings::aa_mode_at(index),
         "ssgi_resolution" => cfg.ssgi_resolution = settings::ssgi_resolution_at(index),
         "ssgi_rays" => cfg.ssgi_rays = settings::ssgi_rays_at(index),
         "ssgi_steps" => cfg.ssgi_steps = settings::ssgi_steps_at(index),
@@ -582,8 +582,11 @@ pub(super) fn clamp_quality_cycle(
     if overridden {
         return;
     }
-    use crate::gfx::quality_preset::{coarser_reflection_blur, coarser_ssgi_resolution};
+    use crate::gfx::quality_preset::{
+        clamp_aa_mode, coarser_reflection_blur, coarser_ssgi_resolution,
+    };
     match key {
+        "aa_mode" => cfg.aa_mode = clamp_aa_mode(cfg.aa_mode, ceiling.aa_mode),
         "ssgi_resolution" => {
             cfg.ssgi_resolution =
                 coarser_ssgi_resolution(cfg.ssgi_resolution, ceiling.ssgi_resolution)
@@ -607,7 +610,7 @@ pub(super) fn derive_quality_settings(
     cfg: &crate::assets::PostProcessConfig,
 ) -> crate::gfx::backend::QualitySettings {
     crate::gfx::backend::QualitySettings {
-        taa: cfg.taa,
+        taa: cfg.aa_mode.taa_enabled(),
         ssao: cfg.ssao_settings(),
         ssr: cfg.ssr_settings(),
         rt_reflections: cfg.rt_reflection_settings(),

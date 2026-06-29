@@ -705,7 +705,6 @@ impl GraphicsSystem {
                         // disallowed; never turn on).
                         self.post_config = self.authored_post_config.clone();
                         for (key, allowed) in [
-                            ("taa", ceiling.taa),
                             ("ssao", ceiling.ssao),
                             ("ssr", ceiling.ssr),
                             ("ray_traced_reflections", ceiling.ray_traced_reflections),
@@ -716,12 +715,20 @@ impl GraphicsSystem {
                                 super::set_quality_toggle(&mut self.post_config, key, false);
                             }
                         }
-                        // And clamp the cycle quality knobs (SSGI gather +
-                        // reflection blur) under the ceiling (overrides cleared,
+                        // And clamp the cycle quality knobs (AA mode + SSGI gather
+                        // + reflection blur) under the ceiling (overrides cleared,
                         // so clamp every one).
                         for key in settings::QUALITY_CYCLE_KEYS {
                             super::clamp_quality_cycle(&mut self.post_config, key, &ceiling, false);
                         }
+                        // The composite FXAA flag rides PostProcessParams (pushed
+                        // by update_post_process below), so refresh it from the
+                        // re-derived AA mode before that push.
+                        self.post_process.fxaa = if self.post_config.aa_mode.fxaa_enabled() {
+                            1.0
+                        } else {
+                            0.0
+                        };
                         backend.apply_quality_settings(super::derive_quality_settings(
                             &self.post_config,
                         ));
@@ -768,7 +775,7 @@ impl GraphicsSystem {
                         // ceiling exactly as this live re-derive did.
                         let mut cfg = crate::config::Settings::load();
                         cfg.graphics.quality_preset = Some(preset);
-                        cfg.graphics.taa = None;
+                        cfg.graphics.aa_mode = None;
                         cfg.graphics.ssao = None;
                         cfg.graphics.ssr = None;
                         cfg.graphics.ray_traced_reflections = None;
@@ -957,7 +964,6 @@ impl GraphicsSystem {
                             let on = next == 1;
                             super::set_quality_toggle(&mut self.post_config, key, on);
                             match key {
-                                "taa" => cfg.graphics.taa = Some(on),
                                 "ssao" => cfg.graphics.ssao = Some(on),
                                 "ssr" => cfg.graphics.ssr = Some(on),
                                 "ray_traced_reflections" => {
@@ -1007,6 +1013,7 @@ impl GraphicsSystem {
                             let next = settings::cycle(cur, opts.len(), cmd.op);
                             super::set_quality_cycle(&mut self.post_config, key, next);
                             match key {
+                                "aa_mode" => cfg.graphics.aa_mode = Some(self.post_config.aa_mode),
                                 "ssgi_resolution" => {
                                     cfg.graphics.ssgi_resolution =
                                         Some(self.post_config.ssgi_resolution)
@@ -1034,6 +1041,19 @@ impl GraphicsSystem {
                             backend.apply_quality_settings(super::derive_quality_settings(
                                 &self.post_config,
                             ));
+                            // The AA mode also drives the composite FXAA flag,
+                            // which rides PostProcessParams rather than the
+                            // QualitySettings rebuild above. Refresh it and push it
+                            // live (the TAA pass itself rebuilt via the call above).
+                            if key == "aa_mode" {
+                                self.post_process.fxaa = if self.post_config.aa_mode.fxaa_enabled()
+                                {
+                                    1.0
+                                } else {
+                                    0.0
+                                };
+                                backend.update_post_process(self.post_process);
+                            }
                             Some(opts[next])
                         }
                         // Display-output / upscaling preference toggles. Restart-

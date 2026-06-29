@@ -81,7 +81,7 @@ impl VkContext {
         // composite pass. `None` binds a 2x2x2 identity LUT, so the grade is a
         // no-op at any `lut_strength`.
         color_lut_bytes: Option<&[u8]>,
-        // Temporal anti-aliasing toggle, resolved from `PostProcessConfig.taa`.
+        // Temporal anti-aliasing toggle, resolved from `PostProcessConfig.aa_mode`.
         // When set, a velocity pre-pass + history-resolve pass run and the
         // projection is sub-pixel jittered; when false all of that is skipped.
         taa_enabled: bool,

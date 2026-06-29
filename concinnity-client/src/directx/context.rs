@@ -804,7 +804,7 @@ pub struct DxContext {
     // / velocity geometry pre-passes. See [`GbufferResources`].
     pub(super) gbuffer: Option<GbufferResources>,
 
-    // Temporal anti-aliasing. `Some` only when `PostProcessConfig.taa` is set;
+    // Temporal anti-aliasing. `Some` only when `PostProcessConfig.aa_mode` is set;
     // when `None` the history resolve and the projection jitter are skipped and
     // the composite samples the HDR scene target directly.
     pub(super) taa: Option<TaaResources>,

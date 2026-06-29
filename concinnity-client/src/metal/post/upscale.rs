@@ -7,7 +7,7 @@
 // per-frame encoder all live together so the effect is a single unit.
 //
 // The scaler does temporal accumulation itself, so the existing TAA pass is
-// bypassed while upscaling is on (`PostProcessConfig.taa` is ignored). The
+// bypassed while upscaling is on (`PostProcessConfig.aa_mode` is ignored). The
 // existing velocity pre-pass still runs: the scaler consumes its motion
 // vectors. The existing projection jitter still runs: the scaler consumes
 // its sub-pixel offset.

@@ -242,7 +242,7 @@ pub(super) fn init_backend(
     // serialised ColorLut payload (3D grading LUT). None disables grading;
     // the runtime then binds an identity LUT.
     color_lut_bytes: Option<&[u8]>,
-    // temporal anti-aliasing toggle from PostProcessConfig.taa.
+    // temporal anti-aliasing toggle from PostProcessConfig.aa_mode.
     taa_enabled: bool,
     // SSAO (GTAO) settings from PostProcessConfig; None disables SSAO.
     ssao_settings: Option<crate::gfx::ssao::SsaoSettings>,

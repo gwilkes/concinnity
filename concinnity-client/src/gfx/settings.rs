@@ -8,7 +8,8 @@
 // row can only target a setting the engine actually knows how to apply.
 
 use crate::assets::{
-    ReflectionBlurResolution, SettingOp, ShadowUpdate, SsgiResolution, UpscaleQuality, WindowMode,
+    AaMode, ReflectionBlurResolution, SettingOp, ShadowUpdate, SsgiResolution, UpscaleQuality,
+    WindowMode,
 };
 
 // Ordered option labels for `vsync`: index 0 is off, index 1 is on.
@@ -20,8 +21,7 @@ const OFF_ON_OPTIONS: [&str; 2] = ["Off", "On"];
 // pass whose GPU resources are built at init, so a change rebuilds those
 // resources (live on Metal; persisted + applied at the next launch elsewhere).
 // `GraphicsSystem` maps each key to the `PostProcessConfig` field it flips.
-pub(crate) const QUALITY_TOGGLE_KEYS: [&str; 6] = [
-    "taa",
+pub(crate) const QUALITY_TOGGLE_KEYS: [&str; 5] = [
     "ssao",
     "ssr",
     "ray_traced_reflections",
@@ -73,6 +73,13 @@ const SSGI_STEPS_COUNTS: [u32; 4] = [8, 12, 24, 48];
 // Reflection blur resolution options, finest-first (matches the enum).
 const REFLECTION_BLUR_OPTIONS: [&str; 3] = ["Full", "Half", "Quarter"];
 
+// Anti-aliasing mode options (Video "Quality" group), in cycle order matching
+// the AaMode enum: Off (no edge smoothing), FXAA (cheap composite edge filter),
+// TAA (temporal accumulation, the cleanest and most expensive). Rides the
+// feature's live-reinit like the other quality cycles. Indices map via the
+// `aa_mode_*` helpers below.
+const AA_MODE_OPTIONS: [&str; 3] = ["Off", "FXAA", "TAA"];
+
 // Shadow-map cascade resolution options (texels), in cycle order. "Off" disables
 // shadows (size 0); the rest are the per-cascade texel dimensions. Indices map
 // via the `shadow_resolution_*` helpers below (an authored size off the discrete
@@ -120,7 +127,8 @@ const TEXTURE_QUALITY_BUDGETS: [u32; 4] = [2, 4, 8, 12];
 // (`apply_quality_settings`) -- the sub-tunable travels in its settings payload,
 // so no new backend method is needed. `GraphicsSystem` maps each key to the
 // `PostProcessConfig` field it cycles.
-pub(crate) const QUALITY_CYCLE_KEYS: [&str; 4] = [
+pub(crate) const QUALITY_CYCLE_KEYS: [&str; 5] = [
+    "aa_mode",
     "ssgi_resolution",
     "ssgi_rays",
     "ssgi_steps",
@@ -164,6 +172,7 @@ pub(crate) fn options(key: &str) -> Option<&'static [&'static str]> {
         "render_scale" => Some(&RENDER_SCALE_OPTIONS),
         "window_size" => Some(&WINDOW_SIZE_LABELS),
         "master_volume" => Some(&MASTER_VOLUME_OPTIONS),
+        "aa_mode" => Some(&AA_MODE_OPTIONS),
         "ssgi_resolution" => Some(&SSGI_RESOLUTION_OPTIONS),
         "ssgi_rays" => Some(&SSGI_RAYS_OPTIONS),
         "ssgi_steps" => Some(&SSGI_STEPS_OPTIONS),
@@ -224,6 +233,24 @@ pub(crate) fn render_scale_index(quality: UpscaleQuality) -> usize {
         UpscaleQuality::Balanced => 1,
         UpscaleQuality::Performance => 2,
         UpscaleQuality::UltraPerformance => 3,
+    }
+}
+
+// Anti-aliasing mode for an option index, and the index for a mode. Order
+// matches AA_MODE_OPTIONS (Off, FXAA, TAA), which is also ascending cost so the
+// index doubles as the aggressiveness rank the preset ceiling clamps against.
+pub(crate) fn aa_mode_at(index: usize) -> AaMode {
+    match index {
+        0 => AaMode::Off,
+        2 => AaMode::Taa,
+        _ => AaMode::Fxaa,
+    }
+}
+pub(crate) fn aa_mode_index(mode: AaMode) -> usize {
+    match mode {
+        AaMode::Off => 0,
+        AaMode::Fxaa => 1,
+        AaMode::Taa => 2,
     }
 }
 
@@ -661,7 +688,7 @@ mod tests {
         assert!(setting_available("ray_traced_reflections", &capable));
         assert!(!setting_available("ray_traced_reflections", &incapable));
         // Every other setting is always available, regardless of capability.
-        for key in ["vsync", "taa", "ssao", "ssr", "ssgi", "auto_exposure"] {
+        for key in ["vsync", "aa_mode", "ssao", "ssr", "ssgi", "auto_exposure"] {
             assert!(
                 setting_available(key, &incapable),
                 "{key} should be available"
@@ -673,6 +700,22 @@ mod tests {
             "ray_traced_reflections",
             &DeviceCapabilities::default()
         ));
+    }
+
+    #[test]
+    fn aa_mode_round_trips_and_orders_by_cost() {
+        // Index order is ascending cost (Off < FXAA < TAA), so it doubles as the
+        // aggressiveness rank the preset ceiling clamps against.
+        for (i, mode) in [AaMode::Off, AaMode::Fxaa, AaMode::Taa]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(aa_mode_index(mode), i);
+            assert_eq!(aa_mode_at(i), mode);
+        }
+        assert_eq!(AA_MODE_OPTIONS.len(), 3);
+        // An out-of-range index falls back to the FXAA default.
+        assert_eq!(aa_mode_at(9), AaMode::Fxaa);
     }
 
     #[test]

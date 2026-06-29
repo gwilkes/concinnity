@@ -463,7 +463,7 @@ impl DxContext {
             )
         );
 
-        // TAA (only when PostProcessConfig.taa).
+        // TAA (only when PostProcessConfig.aa_mode).
         let taa_rebuilt = rebuild_if_live!(
             self.taa.is_some(),
             super::post::taa::rebuild_taa_pipelines(

@@ -12,7 +12,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::assets::{ReflectionBlurResolution, ShadowUpdate, SsgiResolution, UpscaleQuality};
+use crate::assets::{
+    AaMode, ReflectionBlurResolution, ShadowUpdate, SsgiResolution, UpscaleQuality,
+};
 use crate::gfx::backend::{GpuProfile, GpuTier};
 
 // Persisted master graphics-quality choice. `Auto` resolves from the detected
@@ -36,7 +38,12 @@ pub enum QualityPreset {
 // world did not author.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct QualityCeiling {
-    pub taa: bool,
+    // The most aggressive anti-aliasing mode the tier permits. Clamps a world's
+    // authored mode DOWN by cost rank (Off < FXAA < TAA): a lower tier can force
+    // TAA to FXAA (skipping the velocity pre-pass) but never enables a mode the
+    // world did not author. The no-ceiling value is `Taa` (the maximum), so an
+    // authored mode always stands under it.
+    pub aa_mode: AaMode,
     pub ssao: bool,
     pub ssr: bool,
     pub ray_traced_reflections: bool,
@@ -89,6 +96,18 @@ pub(crate) fn coarser_ssgi_resolution(a: SsgiResolution, b: SsgiResolution) -> S
         a
     } else {
         b
+    }
+}
+
+// The authored anti-aliasing mode clamped under a ceiling: the cheaper of the
+// world's mode and the cap, by the ascending-cost rank `aa_mode_index` defines
+// (Off < FXAA < TAA). Never makes AA more aggressive than the world authored.
+pub(crate) fn clamp_aa_mode(authored: AaMode, cap: AaMode) -> AaMode {
+    use crate::gfx::settings::aa_mode_index;
+    if aa_mode_index(authored) <= aa_mode_index(cap) {
+        authored
+    } else {
+        cap
     }
 }
 
@@ -166,7 +185,7 @@ pub(crate) fn clamp_shadow_distance(authored: u32, ceiling: &QualityCeiling) -> 
 }
 
 const NONE: QualityCeiling = QualityCeiling {
-    taa: true,
+    aa_mode: AaMode::Taa,
     ssao: true,
     ssr: true,
     ray_traced_reflections: true,
@@ -183,7 +202,7 @@ const NONE: QualityCeiling = QualityCeiling {
     shadow_distance: SHADOW_DIST_MAX,
 };
 const LOW: QualityCeiling = QualityCeiling {
-    taa: true,
+    aa_mode: AaMode::Fxaa,
     ssao: false,
     ssr: false,
     ray_traced_reflections: false,
@@ -200,7 +219,7 @@ const LOW: QualityCeiling = QualityCeiling {
     shadow_distance: 40,
 };
 const MEDIUM: QualityCeiling = QualityCeiling {
-    taa: true,
+    aa_mode: AaMode::Taa,
     ssao: true,
     ssr: false,
     ray_traced_reflections: false,
@@ -217,7 +236,7 @@ const MEDIUM: QualityCeiling = QualityCeiling {
     shadow_distance: 80,
 };
 const HIGH: QualityCeiling = QualityCeiling {
-    taa: true,
+    aa_mode: AaMode::Taa,
     ssao: true,
     ssr: true,
     ray_traced_reflections: false,
@@ -234,7 +253,7 @@ const HIGH: QualityCeiling = QualityCeiling {
     shadow_distance: 160,
 };
 const ULTRA: QualityCeiling = QualityCeiling {
-    taa: true,
+    aa_mode: AaMode::Taa,
     ssao: true,
     ssr: true,
     ray_traced_reflections: true,
@@ -441,7 +460,6 @@ mod tests {
         for pair in order.windows(2) {
             let (lo, hi) = (pair[0], pair[1]);
             for (lo_on, hi_on) in [
-                (lo.taa, hi.taa),
                 (lo.ssao, hi.ssao),
                 (lo.ssr, hi.ssr),
                 (lo.ray_traced_reflections, hi.ray_traced_reflections),
@@ -450,6 +468,13 @@ mod tests {
             ] {
                 assert!(!lo_on || hi_on, "a higher tier dropped a feature");
             }
+            // The AA-mode cap rises (or holds) with the tier: a higher tier
+            // never permits a less aggressive (cheaper) anti-aliasing mode.
+            assert!(
+                crate::gfx::settings::aa_mode_index(lo.aa_mode)
+                    <= crate::gfx::settings::aa_mode_index(hi.aa_mode),
+                "a higher tier capped AA at a cheaper mode"
+            );
             // And never forces more aggressive upscaling than a lower tier.
             assert_eq!(
                 more_aggressive_upscale(lo.min_upscale, hi.min_upscale),
@@ -582,9 +607,29 @@ mod tests {
         assert!(!low.ssgi);
         assert!(!low.ray_traced_reflections);
         assert!(!low.ssao);
-        // AA and auto-exposure are cheap enough to keep on even at Low.
-        assert!(low.taa);
+        // Low caps anti-aliasing at FXAA: it keeps edges smooth nearly for free
+        // but skips TAA's velocity pre-pass and history buffer. Auto-exposure is
+        // cheap enough to keep on.
+        assert_eq!(low.aa_mode, AaMode::Fxaa);
         assert!(low.auto_exposure);
+    }
+
+    #[test]
+    fn aa_mode_clamps_down_only() {
+        // The no-ceiling cap is TAA (the maximum), so any authored mode stands.
+        assert_eq!(NONE.aa_mode, AaMode::Taa);
+        assert_eq!(clamp_aa_mode(AaMode::Taa, NONE.aa_mode), AaMode::Taa);
+        // A lower cap forces a more expensive authored mode down to it, but
+        // never raises a cheaper authored mode up.
+        assert_eq!(clamp_aa_mode(AaMode::Taa, AaMode::Fxaa), AaMode::Fxaa);
+        assert_eq!(clamp_aa_mode(AaMode::Fxaa, AaMode::Taa), AaMode::Fxaa);
+        assert_eq!(clamp_aa_mode(AaMode::Fxaa, AaMode::Off), AaMode::Off);
+        assert_eq!(clamp_aa_mode(AaMode::Off, AaMode::Taa), AaMode::Off);
+        // Ultra imposes the maximum (no clamp); Low caps at FXAA.
+        let ultra = resolve_ceiling(QualityPreset::Ultra, &GpuProfile::UNKNOWN);
+        assert_eq!(ultra.aa_mode, AaMode::Taa);
+        let low = resolve_ceiling(QualityPreset::Low, &GpuProfile::UNKNOWN);
+        assert_eq!(low.aa_mode, AaMode::Fxaa);
     }
 
     #[test]

@@ -106,7 +106,7 @@ impl DxContext {
         // pass. `None` binds a 2×2×2 identity LUT, so the grade is a no-op at
         // any `lut_strength`.
         color_lut_bytes: Option<&[u8]>,
-        // Temporal anti-aliasing toggle (resolved from `PostProcessConfig.taa`).
+        // Temporal anti-aliasing toggle (resolved from `PostProcessConfig.aa_mode`).
         // When set, the renderer jitters the projection, runs a velocity
         // pre-pass + a history-resolve pass, and feeds the resolved image to
         // the bloom + composite passes.
@@ -233,7 +233,7 @@ impl DxContext {
         // FSR3 needs the velocity buffer + the TAA-velocity pre-pass
         // PSOs, both of which live inside `TaaResources`. When upscale
         // is on we force the TAA resources to be built even if the
-        // world's `PostProcessConfig.taa` is off; the TAA *resolve*
+        // world's `PostProcessConfig.aa_mode` is off; the TAA *resolve*
         // pass is still skipped (see `record_frame::seed_inputs`),
         // because FSR owns the temporal accumulation.
         let taa_enabled = taa_enabled || temporal_upscaling;

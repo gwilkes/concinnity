@@ -74,7 +74,7 @@ const VIDEO_ADVANCED_SLIDERS: [(&str, &str); 8] = [
 // applies it live by rebuilding the affected render resources; on backends
 // without a live path the choice persists and applies at the next launch.
 const VIDEO_QUALITY_ROWS: [(&str, &str); 14] = [
-    ("taa", "Anti-Aliasing"),
+    ("aa_mode", "Anti-Aliasing"),
     ("ssao", "Ambient Occlusion"),
     ("ssr", "Screen-Space Reflections"),
     ("ray_traced_reflections", "Ray-Traced Reflections"),
@@ -1668,7 +1668,7 @@ mod tests {
                 .map(|r| r["group"].as_i64().unwrap())
         };
         for key in [
-            "opt_taa",
+            "opt_aa_mode",
             "opt_ssao",
             "opt_ssr",
             "opt_ray_traced_reflections",

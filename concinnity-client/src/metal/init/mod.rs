@@ -118,7 +118,7 @@ impl MtlContext {
         mut post_process: crate::gfx::render_types::PostProcessParams,
         // serialised ColorLut payload (3D grading LUT). None → identity LUT.
         color_lut_bytes: Option<&[u8]>,
-        // temporal anti-aliasing toggle resolved from PostProcessConfig.taa.
+        // temporal anti-aliasing toggle resolved from PostProcessConfig.aa_mode.
         taa_enabled: bool,
         // SSAO tunables resolved from PostProcessConfig; None → SSAO disabled.
         ssao_settings: Option<SsaoSettings>,

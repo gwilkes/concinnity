@@ -116,14 +116,18 @@ pub struct GraphicsSettings {
     // re-applied at init. A user preference, independent of the quality preset.
     #[serde(default)]
     pub fov: Option<f32>,
+    // Anti-aliasing mode (`PostProcessConfig.aa_mode`: off / FXAA / TAA). `None`
+    // uses the world's value. Applied live on Metal (the TAA pass rebuilds and
+    // the composite FXAA flag updates in place) and governed by the quality
+    // preset ceiling like the toggles below.
+    #[serde(default)]
+    pub aa_mode: Option<crate::assets::AaMode>,
     // Quality-feature toggles. Each `None` uses the world's
     // `PostProcessConfig` value. They gate render passes whose GPU resources
     // (pipelines, targets, acceleration structures) are built at init, so a
     // change rebuilds those resources: applied live on Metal (the backend
     // rebuilds the affected effects in place); on backends without a live path
     // the choice persists and applies at the next launch.
-    #[serde(default)]
-    pub taa: Option<bool>,
     #[serde(default)]
     pub ssao: Option<bool>,
     #[serde(default)]
@@ -436,7 +440,7 @@ mod tests {
                 lut_strength: Some(0.75),
                 ambient_intensity: Some(1.5),
                 fov: Some(90.0),
-                taa: Some(true),
+                aa_mode: Some(crate::assets::AaMode::Taa),
                 ssao: Some(false),
                 ssr: Some(true),
                 ray_traced_reflections: Some(false),

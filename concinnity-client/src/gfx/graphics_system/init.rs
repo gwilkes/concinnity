@@ -154,7 +154,9 @@ impl GraphicsSystem {
 
         // Resolve post-process tunables. The first declared PostProcessConfig
         // wins; with none declared the renderer uses the stack defaults. The
-        // `taa` toggle is a plain bool threaded alongside the resolved params.
+        // AA mode resolves into a TAA gate (threaded alongside the params) and
+        // the composite `fxaa` flag inside `post_process` (refreshed below once
+        // the override + ceiling clamp have settled the final mode).
         let post_config = ctx.drain::<PostProcessConfig>().into_iter().next();
         let mut post_process = post_config
             .as_ref()
@@ -222,9 +224,6 @@ impl GraphicsSystem {
         // anything the world did not author, so re-clamping the baseline is exact).
         self.authored_post_config = self.post_config.clone();
         if post_config.is_some() {
-            if let Some(v) = user_graphics.taa {
-                super::set_quality_toggle(&mut self.post_config, "taa", v);
-            }
             if let Some(v) = user_graphics.ssao {
                 super::set_quality_toggle(&mut self.post_config, "ssao", v);
             }
@@ -240,8 +239,11 @@ impl GraphicsSystem {
             if let Some(v) = user_graphics.auto_exposure {
                 super::set_quality_toggle(&mut self.post_config, "auto_exposure", v);
             }
-            // SSGI gather + reflection blur sub-quality overrides (cycle
-            // dropdowns), alongside the boolean toggles above.
+            // AA mode + SSGI gather + reflection blur sub-quality overrides
+            // (cycle dropdowns), alongside the boolean toggles above.
+            if let Some(v) = user_graphics.aa_mode {
+                self.post_config.aa_mode = v;
+            }
             if let Some(v) = user_graphics.ssgi_resolution {
                 self.post_config.ssgi_resolution = v;
             }
@@ -305,12 +307,6 @@ impl GraphicsSystem {
             };
             clamp(
                 &mut self.post_config,
-                "taa",
-                user_graphics.taa.is_some(),
-                quality_ceiling.taa,
-            );
-            clamp(
-                &mut self.post_config,
                 "ssao",
                 user_graphics.ssao.is_some(),
                 quality_ceiling.ssao,
@@ -343,6 +339,7 @@ impl GraphicsSystem {
             // the ceiling too (coarser resolution / fewer rays / steps), skipping
             // any the user explicitly overrode.
             let cycle_overridden = |key: &str| match key {
+                "aa_mode" => user_graphics.aa_mode.is_some(),
                 "ssgi_resolution" => user_graphics.ssgi_resolution.is_some(),
                 "ssgi_rays" => user_graphics.ssgi_rays.is_some(),
                 "ssgi_steps" => user_graphics.ssgi_steps.is_some(),
@@ -365,7 +362,17 @@ impl GraphicsSystem {
         // RT takes precedence over SSR where both are on (the graph builder picks
         // `RtReflections`), reusing the same SSR pre-pass G-buffer + resolve
         // target.
-        let taa_enabled = self.post_config.taa;
+        let taa_enabled = self.post_config.aa_mode.taa_enabled();
+        // The composite FXAA flag follows the final (overridden + ceiling-clamped)
+        // AA mode. resolve() seeded `post_process.fxaa` from the authored mode
+        // before the override/clamp above, so refresh both the local copy passed
+        // to the backend ctor and the live `self.post_process` here.
+        post_process.fxaa = if self.post_config.aa_mode.fxaa_enabled() {
+            1.0
+        } else {
+            0.0
+        };
+        self.post_process.fxaa = post_process.fxaa;
         let ssao_settings = self.post_config.ssao_settings();
         let ssr_settings = self.post_config.ssr_settings();
         let rt_reflection_settings = self.post_config.rt_reflection_settings();

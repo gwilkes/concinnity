@@ -49,6 +49,9 @@ struct PostUniforms {
     // Inside the HDR branch: 0.0 = scRGB-linear passthrough, 1.0 = PQ
     // encode (SMPTE ST 2084) for HDR10 panels.
     float pq_output;
+    // 1.0 = run the FXAA edge filter on the SDR path; 0.0 = skip it (the Off
+    // anti-aliasing mode). Ignored on the HDR path, which never runs FXAA.
+    float fxaa;
 };
 
 // SDR reference white in cd/m² (nits). BT.2408 recommends 203 nits as the
@@ -146,6 +149,14 @@ fragment float4 post_fragment_main(
     }
 
     float3 ldr_c = pow(aces_narkowicz(hdr_c), float3(1.0 / 2.2));
+
+    // FXAA is gated by post.fxaa (off for the Off anti-aliasing mode). When
+    // disabled, grade + vignette the tonemapped centre directly and skip the
+    // neighbour samples the edge filter would otherwise take.
+    if (post.fxaa < 0.5) {
+        float3 graded = mix(ldr_c, apply_lut(lut, smp, ldr_c), post.lut_strength);
+        return float4(graded * vig, 1.0);
+    }
 
     // 2) FXAA 3.11-style edge detection on the encoded image. Each neighbour
     //    is composited with bloom and remapped through the same tonemap +

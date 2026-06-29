@@ -258,7 +258,7 @@ pub struct TextUniforms {
 // Post-process tunables resolved from the `PostProcessConfig` asset (or its
 // defaults) and threaded into each backend at init. Pushed verbatim to the
 // bloom prefilter and composite fragment shaders, so the layout must stay in
-// sync with the `PostUniforms` struct in those shaders. 32 bytes.
+// sync with the `PostUniforms` struct in those shaders. 36 bytes.
 #[derive(Copy, Clone, Debug)]
 #[repr(C)]
 pub struct PostProcessParams {
@@ -292,6 +292,12 @@ pub struct PostProcessParams {
     // PQ-encoded values directly to an HDR10 panel. Only read when
     // `hdr_output > 0.5`; always 0.0 on the SDR path.
     pub pq_output: f32,
+    // FXAA edge-filter flag on the SDR path. `1.0` runs the composite's
+    // FXAA pass; `0.0` skips it (the `Off` anti-aliasing mode). Resolved
+    // from `PostProcessConfig.aa_mode`: on for `Fxaa` and `Taa`, off for
+    // `Off`. Always ignored on the HDR path, which never runs FXAA. Stored
+    // as a float so the shader branches on `> 0.5` without a cast.
+    pub fxaa: f32,
 }
 
 impl PostProcessParams {
@@ -305,6 +311,7 @@ impl PostProcessParams {
         lut_strength: 1.0,
         hdr_output: 0.0,
         pq_output: 0.0,
+        fxaa: 1.0,
     };
 }
 
@@ -1446,8 +1453,8 @@ mod tests {
 
     #[test]
     fn post_process_params_layout_matches_msl() {
-        // MSL `PostUniforms` in post.metal / bloom.metal: eight floats.
-        assert_eq!(size_of::<PostProcessParams>(), 32);
+        // MSL `PostUniforms` in post.metal / bloom.metal: nine floats.
+        assert_eq!(size_of::<PostProcessParams>(), 36);
         assert_eq!(offset_of!(PostProcessParams, bloom_intensity), 0);
         assert_eq!(offset_of!(PostProcessParams, bloom_threshold), 4);
         assert_eq!(offset_of!(PostProcessParams, bloom_knee), 8);
@@ -1456,6 +1463,7 @@ mod tests {
         assert_eq!(offset_of!(PostProcessParams, lut_strength), 20);
         assert_eq!(offset_of!(PostProcessParams, hdr_output), 24);
         assert_eq!(offset_of!(PostProcessParams, pq_output), 28);
+        assert_eq!(offset_of!(PostProcessParams, fxaa), 32);
     }
 
     #[test]

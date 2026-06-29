@@ -1368,7 +1368,7 @@ value.
 ```jsonl
 {"name":"post","type":"PostProcessConfig","args":{"bloom_intensity":0.8}}
 {"name":"post_dim","type":"PostProcessConfig","args":{"exposure_ev":-1.0,"vignette_strength":0.4}}
-{"name":"post_taa","type":"PostProcessConfig","args":{"taa":true}}
+{"name":"post_taa","type":"PostProcessConfig","args":{"aa_mode":"taa"}}
 {"name":"post_ssao","type":"PostProcessConfig","args":{"ssao":true,"ssao_radius":0.6}}
 {"name":"post_ssr","type":"PostProcessConfig","args":{"ssr":true,"ssr_intensity":0.8}}
 {"name":"post_rt","type":"PostProcessConfig","args":{"ray_traced_reflections":true,"ssr_intensity":0.8}}
@@ -1390,7 +1390,7 @@ value.
 - `exposure_ev`: A float. Exposure offset in photographic stops. Each +1 doubles scene brightness before bloom and tonemapping; 0 is neutral. Defaults to `0.0`.
 - `vignette_strength`: A float. Vignette strength in `[0, 1]`. 0 disables the corner darkening. Defaults to `0.0`.
 - `lut_strength`: A float. Colour-LUT blend in `[0, 1]`. Mixes the graded colour over the ungraded one by this amount. Only matters when the world declares a [ColorLut](#colorlut); with none, grading is a no-op at any strength. Defaults to `1.0`.
-- `taa`: A boolean. Temporal anti-aliasing toggle. Smooths edges by jittering and accumulating detail across frames. Defaults to `false`.
+- `aa_mode`: A string (one of `off`, `fxaa`, or `taa`). Anti-aliasing mode. `fxaa` (default) applies a cheap composite-pass edge filter; `taa` adds a temporal pass that jitters the projection and accumulates detail across frames for the cleanest edges, at the cost of a velocity pre-pass and a history buffer; `off` disables edge smoothing.
 - `ssao`: A boolean. Screen-space ambient occlusion toggle. Darkens creases and contact areas where ambient light is occluded. Defaults to `false`.
 - `ssao_radius`: A float. How far the ambient-occlusion search reaches for occluders, in world units. Larger values pick up broader, softer occlusion. Defaults to `0.5`.
 - `ssao_intensity`: A float. Ambient-occlusion strength, clamped to `[0, 4]`. 1.0 is the natural amount; higher values exaggerate the contact darkening. Defaults to `1.0`.

@@ -94,8 +94,11 @@ pub struct SkinnedSlotLayout {
 // ignores this (the choice still persists and applies at the next launch).
 #[allow(dead_code)] // fields read only by Metal's apply_quality_settings.
 pub struct QualitySettings {
-    // Temporal anti-aliasing on/off. The backend additionally suppresses TAA
-    // while temporal upscaling is active (the scaler does its own accumulation).
+    // Temporal anti-aliasing on/off (the `Taa` anti-aliasing mode). The backend
+    // additionally suppresses TAA while temporal upscaling is active (the scaler
+    // does its own accumulation). The other anti-aliasing modes are the composite
+    // FXAA edge filter, which rides `PostProcessParams.fxaa` (pushed via
+    // `update_post_process`), not this pass-rebuild payload.
     pub taa: bool,
     pub ssao: Option<SsaoSettings>,
     pub ssr: Option<SsrSettings>,

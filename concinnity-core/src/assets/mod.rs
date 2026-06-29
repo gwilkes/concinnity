@@ -136,6 +136,8 @@ pub use particle_emitter::ParticleEmitter;
 pub use physics_config::PhysicsConfig;
 pub use point_light::PointLight;
 #[allow(unused_imports)]
+pub use post_process_config::AaMode;
+#[allow(unused_imports)]
 pub use post_process_config::IndirectLighting;
 pub use post_process_config::PostProcessConfig;
 #[allow(unused_imports)]

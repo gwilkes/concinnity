@@ -58,12 +58,17 @@ const VIDEO_ADVANCED_SLIDERS: [(&str, &str); 6] = [
 // client (`concinnity_client::gfx::settings` + `graphics_system`) knows each key's options and
 // applies it live by rebuilding the affected render resources; on backends
 // without a live path the choice persists and applies at the next launch.
-const VIDEO_QUALITY_ROWS: [(&str, &str); 6] = [
+const VIDEO_QUALITY_ROWS: [(&str, &str); 9] = [
     ("taa", "Anti-Aliasing"),
     ("ssao", "Ambient Occlusion"),
     ("ssr", "Screen-Space Reflections"),
     ("ray_traced_reflections", "Ray-Traced Reflections"),
     ("ssgi", "Global Illumination"),
+    // SSGI gather sub-quality (multi-option dropdowns), grouped under the GI
+    // toggle. The runtime knows each key's options and applies them live.
+    ("ssgi_resolution", "GI Resolution"),
+    ("ssgi_rays", "GI Rays"),
+    ("ssgi_steps", "GI Steps"),
     ("auto_exposure", "Auto Exposure"),
 ];
 const AUDIO_ROWS: [(&str, &str); 1] = [("master_volume", "Master Volume")];
@@ -1563,8 +1568,8 @@ mod tests {
     }
 
     // The Video "Quality" group (gid 0): a header row that toggles group 0 and
-    // the six render-feature toggles tagged into group 0, the panel declaring it
-    // collapsed.
+    // the render-feature toggles + SSGI sub-quality dropdowns tagged into group
+    // 0, the panel declaring it collapsed.
     #[test]
     fn video_quality_group_holds_render_feature_toggles() {
         let mut assets = vec![serde_json::json!({"name":"m","type":"MainMenu"})];
@@ -1604,6 +1609,9 @@ mod tests {
             "opt_ssr",
             "opt_ray_traced_reflections",
             "opt_ssgi",
+            "opt_ssgi_resolution",
+            "opt_ssgi_rays",
+            "opt_ssgi_steps",
             "opt_auto_exposure",
         ] {
             assert_eq!(

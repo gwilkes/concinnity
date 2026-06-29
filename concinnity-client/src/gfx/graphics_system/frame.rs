@@ -662,6 +662,15 @@ impl GraphicsSystem {
                                 super::set_quality_toggle(&mut self.post_config, key, false);
                             }
                         }
+                        // And clamp the SSGI gather sub-quality under the ceiling
+                        // (overrides cleared, so clamp all three).
+                        super::clamp_ssgi_sub_quality(
+                            &mut self.post_config,
+                            &ceiling,
+                            false,
+                            false,
+                            false,
+                        );
                         backend.apply_quality_settings(super::derive_quality_settings(
                             &self.post_config,
                         ));
@@ -688,6 +697,9 @@ impl GraphicsSystem {
                         cfg.graphics.ray_traced_reflections = None;
                         cfg.graphics.ssgi = None;
                         cfg.graphics.auto_exposure = None;
+                        cfg.graphics.ssgi_resolution = None;
+                        cfg.graphics.ssgi_rays = None;
+                        cfg.graphics.ssgi_steps = None;
                         cfg.graphics.render_scale = None;
                         if let Err(e) = cfg.save() {
                             tracing::warn!("GraphicsSystem: persist preset: {e}");
@@ -716,6 +728,15 @@ impl GraphicsSystem {
                                 "render_scale",
                                 text,
                             );
+                        }
+                        for key in ["ssgi_resolution", "ssgi_rays", "ssgi_steps"] {
+                            if let Some(text) = super::quality_cycle_index(&self.post_config, key)
+                                .and_then(|idx| {
+                                    settings::options(key).and_then(|o| o.get(idx).copied())
+                                })
+                            {
+                                set_cached_row_label(&self.cycle_value_labels, ctx, key, text);
+                            }
                         }
                         // The master row's own label carries the Auto(tier) suffix
                         // and is updated through the event-carried value-label id.
@@ -864,6 +885,44 @@ impl GraphicsSystem {
                             if key == "auto_exposure" {
                                 backend.update_post_process(self.post_process);
                             }
+                            Some(opts[next])
+                        }
+                        // Cycle quality knobs (SSGI gather sub-quality dropdowns):
+                        // cycle the value on the stored config, persist it, flip
+                        // the preset to Custom, then rebuild the affected effect
+                        // live (Metal; a no-op backend keeps the choice for the
+                        // next launch). Rides the same apply_quality_settings path
+                        // as the toggles -- the sub-tunable travels in the feature's
+                        // settings payload, so no new backend method is needed.
+                        key if super::is_quality_cycle(key) => {
+                            let cur =
+                                super::quality_cycle_index(&self.post_config, key).unwrap_or(0);
+                            let next = settings::cycle(cur, opts.len(), cmd.op);
+                            super::set_quality_cycle(&mut self.post_config, key, next);
+                            match key {
+                                "ssgi_resolution" => {
+                                    cfg.graphics.ssgi_resolution =
+                                        Some(self.post_config.ssgi_resolution)
+                                }
+                                "ssgi_rays" => {
+                                    cfg.graphics.ssgi_rays = Some(self.post_config.ssgi_rays)
+                                }
+                                "ssgi_steps" => {
+                                    cfg.graphics.ssgi_steps = Some(self.post_config.ssgi_steps)
+                                }
+                                _ => {}
+                            }
+                            self.quality_preset = crate::gfx::quality_preset::QualityPreset::Custom;
+                            cfg.graphics.quality_preset = Some(self.quality_preset);
+                            set_cached_row_label(
+                                &self.cycle_value_labels,
+                                ctx,
+                                "graphics_quality",
+                                self.quality_preset.name(),
+                            );
+                            backend.apply_quality_settings(super::derive_quality_settings(
+                                &self.post_config,
+                            ));
                             Some(opts[next])
                         }
                         _ => None,

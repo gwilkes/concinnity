@@ -473,6 +473,68 @@ pub(super) fn set_quality_toggle(cfg: &mut crate::assets::PostProcessConfig, key
     }
 }
 
+// The cycle quality knobs (non-boolean, dropdown-valued): the SSGI gather
+// sub-quality. Governed by the preset ceiling like the boolean toggles, and a
+// manual change flips the preset to Custom. Paired with `settings::options(key)`
+// for their value labels.
+pub(super) fn is_quality_cycle(key: &str) -> bool {
+    matches!(key, "ssgi_resolution" | "ssgi_rays" | "ssgi_steps")
+}
+
+// The current menu option index of cycle quality knob `key` in `cfg`, or `None`
+// for a key that is not a cycle quality knob.
+pub(super) fn quality_cycle_index(
+    cfg: &crate::assets::PostProcessConfig,
+    key: &str,
+) -> Option<usize> {
+    use crate::gfx::settings;
+    match key {
+        "ssgi_resolution" => Some(settings::ssgi_resolution_index(cfg.ssgi_resolution)),
+        "ssgi_rays" => Some(settings::ssgi_rays_index(cfg.ssgi_rays)),
+        "ssgi_steps" => Some(settings::ssgi_steps_index(cfg.ssgi_steps)),
+        _ => None,
+    }
+}
+
+// Set cycle quality knob `key` in `cfg` from a menu option index. Unknown keys
+// are ignored.
+pub(super) fn set_quality_cycle(
+    cfg: &mut crate::assets::PostProcessConfig,
+    key: &str,
+    index: usize,
+) {
+    use crate::gfx::settings;
+    match key {
+        "ssgi_resolution" => cfg.ssgi_resolution = settings::ssgi_resolution_at(index),
+        "ssgi_rays" => cfg.ssgi_rays = settings::ssgi_rays_at(index),
+        "ssgi_steps" => cfg.ssgi_steps = settings::ssgi_steps_at(index),
+        _ => {}
+    }
+}
+
+// Clamp the SSGI gather sub-quality in `cfg` DOWN under the ceiling (coarser
+// resolution / smaller counts; never raises), skipping any field the user has
+// explicitly overridden. Shared by the init clamp and the live preset re-derive
+// so both produce the same result.
+pub(super) fn clamp_ssgi_sub_quality(
+    cfg: &mut crate::assets::PostProcessConfig,
+    ceiling: &crate::gfx::quality_preset::QualityCeiling,
+    res_overridden: bool,
+    rays_overridden: bool,
+    steps_overridden: bool,
+) {
+    use crate::gfx::quality_preset::coarser_ssgi_resolution;
+    if !res_overridden {
+        cfg.ssgi_resolution = coarser_ssgi_resolution(cfg.ssgi_resolution, ceiling.ssgi_resolution);
+    }
+    if !rays_overridden {
+        cfg.ssgi_rays = cfg.ssgi_rays.min(ceiling.ssgi_rays);
+    }
+    if !steps_overridden {
+        cfg.ssgi_steps = cfg.ssgi_steps.min(ceiling.ssgi_steps);
+    }
+}
+
 // Derive the backend's per-feature `QualitySettings` from a resolved config.
 // Mirrors the init-time derivation (the same `*_settings()` methods), so a
 // live rebuild reproduces exactly what a launch with this config would build.

@@ -176,6 +176,17 @@ impl GraphicsSystem {
             if let Some(v) = user_graphics.auto_exposure {
                 super::set_quality_toggle(&mut self.post_config, "auto_exposure", v);
             }
+            // SSGI gather sub-quality overrides (cycle dropdowns), alongside the
+            // boolean toggles above.
+            if let Some(v) = user_graphics.ssgi_resolution {
+                self.post_config.ssgi_resolution = v;
+            }
+            if let Some(v) = user_graphics.ssgi_rays {
+                self.post_config.ssgi_rays = v;
+            }
+            if let Some(v) = user_graphics.ssgi_steps {
+                self.post_config.ssgi_steps = v;
+            }
         }
         // Apply the active quality preset as a performance ceiling over the
         // world's authored toggles: where the ceiling disallows a feature, force
@@ -228,6 +239,16 @@ impl GraphicsSystem {
                 "auto_exposure",
                 user_graphics.auto_exposure.is_some(),
                 quality_ceiling.auto_exposure,
+            );
+            // Clamp the SSGI gather sub-quality under the ceiling too (coarser
+            // resolution / fewer rays / fewer steps), skipping any the user
+            // explicitly overrode.
+            super::clamp_ssgi_sub_quality(
+                &mut self.post_config,
+                &quality_ceiling,
+                user_graphics.ssgi_resolution.is_some(),
+                user_graphics.ssgi_rays.is_some(),
+                user_graphics.ssgi_steps.is_some(),
             );
         }
         // Per-feature settings, derived from the overlaid config. Each is the
@@ -321,6 +342,8 @@ impl GraphicsSystem {
             key if crate::gfx::settings::is_quality_toggle(key) => {
                 super::quality_toggle_on(&quality_cfg, key).map(|on| on as usize)
             }
+            // SSGI gather sub-quality dropdowns.
+            key if super::is_quality_cycle(key) => super::quality_cycle_index(&quality_cfg, key),
             _ => None,
         });
         // The master "Graphics Quality" row carries the resolved tier under Auto

@@ -7,7 +7,7 @@
 // by the same string. Keeping the option list here (not in world data) means a
 // row can only target a setting the engine actually knows how to apply.
 
-use crate::assets::{SettingOp, UpscaleQuality, WindowMode};
+use crate::assets::{SettingOp, SsgiResolution, UpscaleQuality, WindowMode};
 
 // Ordered option labels for `vsync`: index 0 is off, index 1 is on.
 const VSYNC_OPTIONS: [&str; 2] = ["Off", "On"];
@@ -59,6 +59,16 @@ const WINDOW_MODE_OPTIONS: [&str; 3] = ["Windowed", "Borderless", "Fullscreen"];
 // `render_scale_at` / `render_scale_index`.
 const RENDER_SCALE_OPTIONS: [&str; 4] = ["Quality", "Balanced", "Performance", "Ultra"];
 
+// SSGI gather sub-quality dropdowns. The gather clamps rays to [1,32] and steps
+// to [1,64]; these are the menu's discrete levels, in cycle order. Resolution is
+// finest-first (Full/Half/Quarter), matching the enum. Indices map via the
+// `ssgi_*_at` / `ssgi_*_index` helpers below.
+const SSGI_RESOLUTION_OPTIONS: [&str; 3] = ["Full", "Half", "Quarter"];
+const SSGI_RAYS_OPTIONS: [&str; 4] = ["4", "8", "16", "32"];
+const SSGI_RAYS_COUNTS: [u32; 4] = [4, 8, 16, 32];
+const SSGI_STEPS_OPTIONS: [&str; 4] = ["8", "12", "24", "48"];
+const SSGI_STEPS_COUNTS: [u32; 4] = [8, 12, 24, 48];
+
 // Master "Graphics Quality" preset options, in cycle order. The labels mirror
 // `QualityPreset::ALL`'s order (locked by `graphics_quality_options_match_preset_order`);
 // `quality_preset::preset_index` / `preset_at` map an index to the live preset.
@@ -96,6 +106,9 @@ pub(crate) fn options(key: &str) -> Option<&'static [&'static str]> {
         "render_scale" => Some(&RENDER_SCALE_OPTIONS),
         "window_size" => Some(&WINDOW_SIZE_LABELS),
         "master_volume" => Some(&MASTER_VOLUME_OPTIONS),
+        "ssgi_resolution" => Some(&SSGI_RESOLUTION_OPTIONS),
+        "ssgi_rays" => Some(&SSGI_RAYS_OPTIONS),
+        "ssgi_steps" => Some(&SSGI_STEPS_OPTIONS),
         key if is_quality_toggle(key) => Some(&OFF_ON_OPTIONS),
         _ => None,
     }
@@ -143,6 +156,50 @@ pub(crate) fn render_scale_index(quality: UpscaleQuality) -> usize {
         UpscaleQuality::Performance => 2,
         UpscaleQuality::UltraPerformance => 3,
     }
+}
+
+// SSGI gather resolution for an option index, and the index for a resolution.
+// Order matches SSGI_RESOLUTION_OPTIONS (finest first).
+pub(crate) fn ssgi_resolution_at(index: usize) -> SsgiResolution {
+    match index {
+        0 => SsgiResolution::Full,
+        2 => SsgiResolution::Quarter,
+        _ => SsgiResolution::Half,
+    }
+}
+pub(crate) fn ssgi_resolution_index(res: SsgiResolution) -> usize {
+    match res {
+        SsgiResolution::Full => 0,
+        SsgiResolution::Half => 1,
+        SsgiResolution::Quarter => 2,
+    }
+}
+
+// SSGI ray / step counts for an option index, and the menu index nearest an
+// authored count (the world may author a value off the discrete levels; the row
+// then shows the closest one).
+pub(crate) fn ssgi_rays_at(index: usize) -> u32 {
+    *SSGI_RAYS_COUNTS.get(index).unwrap_or(&SSGI_RAYS_COUNTS[1])
+}
+pub(crate) fn ssgi_rays_index(count: u32) -> usize {
+    nearest_count_index(&SSGI_RAYS_COUNTS, count)
+}
+pub(crate) fn ssgi_steps_at(index: usize) -> u32 {
+    *SSGI_STEPS_COUNTS
+        .get(index)
+        .unwrap_or(&SSGI_STEPS_COUNTS[1])
+}
+pub(crate) fn ssgi_steps_index(count: u32) -> usize {
+    nearest_count_index(&SSGI_STEPS_COUNTS, count)
+}
+// The index of the level closest to `count` (ties pick the lower level).
+fn nearest_count_index(levels: &[u32], count: u32) -> usize {
+    levels
+        .iter()
+        .enumerate()
+        .min_by_key(|&(_, &v)| v.abs_diff(count))
+        .map(|(i, _)| i)
+        .unwrap_or(0)
 }
 
 // Window (width, height) for a preset index.
@@ -453,6 +510,34 @@ mod tests {
             WindowMode::Fullscreen,
         ] {
             assert_eq!(window_mode_at(window_mode_index(m)), m);
+        }
+    }
+
+    #[test]
+    fn ssgi_sub_quality_round_trips_and_snaps() {
+        // Resolution round-trips across every option.
+        for r in [
+            SsgiResolution::Full,
+            SsgiResolution::Half,
+            SsgiResolution::Quarter,
+        ] {
+            assert_eq!(ssgi_resolution_at(ssgi_resolution_index(r)), r);
+        }
+        // Ray / step levels round-trip on their preset values.
+        for i in 0..SSGI_RAYS_COUNTS.len() {
+            assert_eq!(ssgi_rays_index(ssgi_rays_at(i)), i);
+        }
+        for i in 0..SSGI_STEPS_COUNTS.len() {
+            assert_eq!(ssgi_steps_index(ssgi_steps_at(i)), i);
+        }
+        // An authored value off the discrete levels snaps to the nearest.
+        assert_eq!(ssgi_rays_index(7), 1); // 7 -> 8
+        assert_eq!(ssgi_rays_index(20), 2); // 20 -> 16
+        assert_eq!(ssgi_steps_index(40), 3); // 40 -> 48
+        // The three SSGI sub-quality keys are cycle rows, not sliders.
+        for key in ["ssgi_resolution", "ssgi_rays", "ssgi_steps"] {
+            assert!(options(key).is_some(), "{key} should be a cycle row");
+            assert!(slider_range(key).is_none(), "{key} should not be a slider");
         }
     }
 

@@ -12,7 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::assets::UpscaleQuality;
+use crate::assets::{SsgiResolution, UpscaleQuality};
 use crate::gfx::backend::{GpuProfile, GpuTier};
 
 // Persisted master graphics-quality choice. `Auto` resolves from the detected
@@ -47,12 +47,40 @@ pub(crate) struct QualityCeiling {
     // `Quality` (the least aggressive) means "no forced upscaling" -- the world's
     // choice stands.
     pub min_upscale: UpscaleQuality,
+    // Caps on the SSGI gather sub-quality (they only bite where `ssgi` is
+    // permitted): the finest gather resolution, and the most rays / ray-march
+    // steps per pixel. Each clamps DOWN: the effective value is the coarser
+    // resolution / smaller count of the world's choice and the cap. The
+    // no-ceiling values are the engine maxima (`Full`, 32, 64), so a world's
+    // authored value always stands under them.
+    pub ssgi_resolution: SsgiResolution,
+    pub ssgi_rays: u32,
+    pub ssgi_steps: u32,
+}
+
+// The coarser (higher render-resolution divisor) of two SSGI resolutions, the
+// resolution analogue of `more_aggressive_upscale`. Used to clamp a world's
+// gather resolution under a ceiling without ever making it finer.
+pub(crate) fn coarser_ssgi_resolution(a: SsgiResolution, b: SsgiResolution) -> SsgiResolution {
+    if a.scale_divisor() >= b.scale_divisor() {
+        a
+    } else {
+        b
+    }
 }
 
 // No ceiling: everything permitted, no forced upscaling. The resolved ceiling
 // for `Custom`, and for `Auto` on hardware we could not classify (clamping an
 // unknown GPU on a guess would risk needlessly degrading a capable one; the
 // world's authored look is the best signal we have there).
+// The engine maxima for the SSGI sub-quality caps, used wherever a tier imposes
+// no SSGI ceiling: `Full` gather resolution, and the upper clamp bounds the
+// gather honours (rays <= 32, steps <= 64). A world's authored value always
+// stands under these.
+const SSGI_RES_MAX: SsgiResolution = SsgiResolution::Full;
+const SSGI_RAYS_MAX: u32 = 32;
+const SSGI_STEPS_MAX: u32 = 64;
+
 const NONE: QualityCeiling = QualityCeiling {
     taa: true,
     ssao: true,
@@ -61,6 +89,9 @@ const NONE: QualityCeiling = QualityCeiling {
     ssgi: true,
     auto_exposure: true,
     min_upscale: UpscaleQuality::Quality,
+    ssgi_resolution: SSGI_RES_MAX,
+    ssgi_rays: SSGI_RAYS_MAX,
+    ssgi_steps: SSGI_STEPS_MAX,
 };
 const LOW: QualityCeiling = QualityCeiling {
     taa: true,
@@ -70,6 +101,9 @@ const LOW: QualityCeiling = QualityCeiling {
     ssgi: false,
     auto_exposure: true,
     min_upscale: UpscaleQuality::Performance,
+    ssgi_resolution: SsgiResolution::Quarter,
+    ssgi_rays: 4,
+    ssgi_steps: 8,
 };
 const MEDIUM: QualityCeiling = QualityCeiling {
     taa: true,
@@ -79,6 +113,9 @@ const MEDIUM: QualityCeiling = QualityCeiling {
     ssgi: false,
     auto_exposure: true,
     min_upscale: UpscaleQuality::Balanced,
+    ssgi_resolution: SsgiResolution::Half,
+    ssgi_rays: 8,
+    ssgi_steps: 12,
 };
 const HIGH: QualityCeiling = QualityCeiling {
     taa: true,
@@ -88,6 +125,9 @@ const HIGH: QualityCeiling = QualityCeiling {
     ssgi: true,
     auto_exposure: true,
     min_upscale: UpscaleQuality::Quality,
+    ssgi_resolution: SsgiResolution::Half,
+    ssgi_rays: 8,
+    ssgi_steps: 12,
 };
 const ULTRA: QualityCeiling = QualityCeiling {
     taa: true,
@@ -97,6 +137,9 @@ const ULTRA: QualityCeiling = QualityCeiling {
     ssgi: true,
     auto_exposure: true,
     min_upscale: UpscaleQuality::Quality,
+    ssgi_resolution: SSGI_RES_MAX,
+    ssgi_rays: SSGI_RAYS_MAX,
+    ssgi_steps: SSGI_STEPS_MAX,
 };
 
 // The active ceiling for the persisted preset and detected GPU. `Auto` maps the
@@ -303,7 +346,41 @@ mod tests {
                 more_aggressive_upscale(lo.min_upscale, hi.min_upscale),
                 lo.min_upscale
             );
+            // The SSGI sub-quality caps rise (or hold) with the tier too: a
+            // higher tier never permits fewer rays / steps or a coarser gather.
+            assert!(lo.ssgi_rays <= hi.ssgi_rays, "ssgi_rays cap dropped");
+            assert!(lo.ssgi_steps <= hi.ssgi_steps, "ssgi_steps cap dropped");
+            assert_eq!(
+                coarser_ssgi_resolution(lo.ssgi_resolution, hi.ssgi_resolution),
+                lo.ssgi_resolution,
+                "a higher tier permitted a coarser SSGI gather"
+            );
         }
+    }
+
+    #[test]
+    fn ssgi_caps_clamp_down_only() {
+        // The no-ceiling values are the engine maxima, so any authored value
+        // stands under them.
+        assert_eq!(NONE.ssgi_rays, 32);
+        assert_eq!(NONE.ssgi_steps, 64);
+        assert_eq!(NONE.ssgi_resolution, SsgiResolution::Full);
+        // The coarser-resolution helper picks the higher divisor (lower quality),
+        // and an equal input is returned as-is.
+        assert_eq!(
+            coarser_ssgi_resolution(SsgiResolution::Full, SsgiResolution::Quarter),
+            SsgiResolution::Quarter
+        );
+        assert_eq!(
+            coarser_ssgi_resolution(SsgiResolution::Half, SsgiResolution::Half),
+            SsgiResolution::Half
+        );
+        // Ultra imposes the maxima (no clamp); Low caps hard.
+        let ultra = resolve_ceiling(QualityPreset::Ultra, &GpuProfile::UNKNOWN);
+        assert_eq!(ultra.ssgi_rays, 32);
+        let low = resolve_ceiling(QualityPreset::Low, &GpuProfile::UNKNOWN);
+        assert_eq!(low.ssgi_rays, 4);
+        assert_eq!(low.ssgi_resolution, SsgiResolution::Quarter);
     }
 
     #[test]

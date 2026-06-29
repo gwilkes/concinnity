@@ -127,6 +127,18 @@ pub struct GraphicsSettings {
     pub ssgi: Option<bool>,
     #[serde(default)]
     pub auto_exposure: Option<bool>,
+    // SSGI gather sub-quality: internal resolution, hemisphere rays per pixel,
+    // and ray-march steps per ray (`PostProcessConfig.ssgi_resolution`/`_rays`/
+    // `_steps`). Each `None` uses the world's value. Applied live on Metal (the
+    // backend rebuilds the SSGI pass in place); persisted + applied at the next
+    // launch on backends without a live path. Governed by the quality preset
+    // ceiling like the toggles above.
+    #[serde(default)]
+    pub ssgi_resolution: Option<crate::assets::SsgiResolution>,
+    #[serde(default)]
+    pub ssgi_rays: Option<u32>,
+    #[serde(default)]
+    pub ssgi_steps: Option<u32>,
 }
 
 // Persisted overrides for audio settings.
@@ -344,6 +356,9 @@ mod tests {
                 ray_traced_reflections: Some(false),
                 ssgi: Some(true),
                 auto_exposure: Some(false),
+                ssgi_resolution: Some(crate::assets::SsgiResolution::Quarter),
+                ssgi_rays: Some(16),
+                ssgi_steps: Some(24),
                 ..Default::default()
             },
             audio: AudioSettings {

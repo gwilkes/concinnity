@@ -50,6 +50,9 @@ cbuffer ShadowBlock : register(b3)
 {
     float4x4 light_vps[NUM_SHADOW_CASCADES];
     float4   cascade_splits;
+    // Live cascade count (1..4); slots at or beyond it are unrendered, so the
+    // selection + blend below must not reach them.
+    uint     active_cascades;
 }
 
 struct DirLight   { float4 dir_i;  float4 col;   };
@@ -228,11 +231,11 @@ float shadow_factor_cascaded(float3 world_pos, float view_depth, float2 screen_x
     else if (view_depth < cascade_splits[1]) cascade = 1;
     else if (view_depth < cascade_splits[2]) cascade = 2;
     else if (view_depth < cascade_splits[3]) cascade = 3;
-    if (cascade >= NUM_SHADOW_CASCADES) return 1.0;
+    if (cascade >= active_cascades) return 1.0;
 
     float shade = sample_cascade_pcf(cascade, world_pos, screen_xy);
 
-    if (cascade + 1 < NUM_SHADOW_CASCADES)
+    if (cascade + 1 < active_cascades)
     {
         uint  prev       = (cascade == 0) ? 0 : cascade - 1;
         float split_far  = cascade_splits[cascade];

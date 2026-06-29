@@ -104,6 +104,9 @@ impl MtlContext {
         // Shadow distance (GraphicsConfig.shadow_distance, world units). The
         // per-frame cascade split reads it; live via set_shadow_distance.
         shadow_distance: u32,
+        // Shadow cascade count (GraphicsConfig.shadow_cascades, 1..=4). The
+        // per-frame split + schedule read it; live via set_shadow_cascades.
+        shadow_cascades: u32,
         // Scene-sampler max anisotropy (GraphicsConfig.anisotropy), clamped to
         // Metal's guaranteed 1..16 range where it is used below.
         anisotropy: u32,
@@ -1079,6 +1082,7 @@ impl MtlContext {
             shadow_map_size: effective_shadow_size,
             shadow_update,
             shadow_distance,
+            shadow_cascades,
             shadow_scheduler: Default::default(),
             shadow_render_mask: 0,
             shadow_sampler,

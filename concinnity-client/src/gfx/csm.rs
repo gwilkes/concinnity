@@ -42,6 +42,8 @@ pub fn empty_shadow_uniforms() -> ShadowUniforms {
     ShadowUniforms {
         light_vps: [IDENTITY4; NUM_SHADOW_CASCADES],
         cascade_splits: [f32::INFINITY; NUM_SHADOW_CASCADES],
+        active_cascades: NUM_SHADOW_CASCADES as u32,
+        _pad: [0; 3],
     }
 }
 
@@ -57,6 +59,9 @@ pub fn empty_shadow_uniforms() -> ShadowUniforms {
 // - `light_dir_to_source`: unit vector pointing TOWARD the light. Same convention
 //   as `DirectionalLight.direction`; renormalised internally.
 // - `shadow_map_size`: per-cascade texture resolution; used for texel snapping.
+// - `active_cascades`: how many of the `NUM_SHADOW_CASCADES` slots are live (1..=4);
+//   only the first `active` are split + projected, the rest hold a negative split
+//   sentinel and an identity VP so the shader never selects them.
 #[allow(clippy::too_many_arguments)]
 pub fn compute_shadow_uniforms(
     view: [[f32; 4]; 4],
@@ -67,13 +72,17 @@ pub fn compute_shadow_uniforms(
     shadow_distance: f32,
     light_dir_to_source: [f32; 3],
     shadow_map_size: u32,
+    active_cascades: u32,
 ) -> ShadowUniforms {
     let shadow_far = shadow_distance.max(near + 1.0);
+    let active = active_cascades.clamp(1, NUM_SHADOW_CASCADES as u32) as usize;
 
-    // Practical PSSM splits.
-    let cascade_count = NUM_SHADOW_CASCADES as f32;
-    let mut splits = [0.0_f32; NUM_SHADOW_CASCADES];
-    for (i, split) in splits.iter_mut().enumerate() {
+    // Practical PSSM splits over the `active` cascades. The unused tail keeps a
+    // negative sentinel so the fragment shader's `view_depth < split` test never
+    // selects a cascade the CPU did not render.
+    let cascade_count = active as f32;
+    let mut splits = [-1.0_f32; NUM_SHADOW_CASCADES];
+    for (i, split) in splits.iter_mut().take(active).enumerate() {
         let p = (i + 1) as f32 / cascade_count;
         let log = near * (shadow_far / near).powf(p);
         let lin = near + (shadow_far - near) * p;
@@ -93,7 +102,7 @@ pub fn compute_shadow_uniforms(
 
     let mut light_vps = [IDENTITY4; NUM_SHADOW_CASCADES];
     let mut prev_split = near;
-    for i in 0..NUM_SHADOW_CASCADES {
+    for i in 0..active {
         let near_d = prev_split;
         let far_d = splits[i];
         prev_split = far_d;
@@ -191,6 +200,8 @@ pub fn compute_shadow_uniforms(
     ShadowUniforms {
         light_vps,
         cascade_splits: splits,
+        active_cascades: active as u32,
+        _pad: [0; 3],
     }
 }
 
@@ -296,6 +307,7 @@ mod tests {
             80.0,
             [0.0, 1.0, 0.0],
             2048,
+            4,
         );
         for i in 1..NUM_SHADOW_CASCADES {
             assert!(
@@ -306,6 +318,47 @@ mod tests {
         }
         assert!(u.cascade_splits[0] > 0.1);
         assert!((u.cascade_splits[NUM_SHADOW_CASCADES - 1] - 80.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn fewer_active_cascades_fill_only_the_live_slots() {
+        // With active_cascades = 2 the first two slots cover [near, shadow_far]
+        // (last split == shadow distance) and the unused tail holds the negative
+        // sentinel + identity VPs, so the shader never selects an unrendered slot.
+        let u = compute_shadow_uniforms(
+            ident_view(),
+            [0.0, 0.0, 0.0],
+            std::f32::consts::FRAC_PI_2,
+            1.0,
+            0.1,
+            80.0,
+            [0.0, 1.0, 0.0],
+            2048,
+            2,
+        );
+        assert_eq!(u.active_cascades, 2);
+        assert!(u.cascade_splits[0] > 0.1);
+        assert!(u.cascade_splits[1] > u.cascade_splits[0]);
+        assert!((u.cascade_splits[1] - 80.0).abs() < 1e-3);
+        // Unused tail: negative split sentinel + untouched identity VP.
+        assert!(u.cascade_splits[2] < 0.0);
+        assert!(u.cascade_splits[3] < 0.0);
+        assert_eq!(u.light_vps[2], IDENTITY4);
+        assert_eq!(u.light_vps[3], IDENTITY4);
+        // Out-of-range counts clamp into 1..=4.
+        let one = compute_shadow_uniforms(
+            ident_view(),
+            [0.0, 0.0, 0.0],
+            std::f32::consts::FRAC_PI_2,
+            1.0,
+            0.1,
+            80.0,
+            [0.0, 1.0, 0.0],
+            2048,
+            0,
+        );
+        assert_eq!(one.active_cascades, 1);
+        assert!((one.cascade_splits[0] - 80.0).abs() < 1e-3);
     }
 
     #[test]
@@ -321,6 +374,7 @@ mod tests {
             1.0,
             [0.0, 1.0, 0.0],
             2048,
+            4,
         );
         for s in &u.cascade_splits {
             assert!(s.is_finite() && *s > 0.0);
@@ -338,6 +392,7 @@ mod tests {
             80.0,
             [-0.4, 0.7, 0.3],
             2048,
+            4,
         );
         for vp in &u.light_vps {
             for col in vp {
@@ -361,6 +416,7 @@ mod tests {
             80.0,
             [0.0, 1.0, 0.0],
             2048,
+            4,
         );
         // World point 2m in front of camera (looking down -Z).
         let p = [0.0_f32, 0.0, -2.0, 1.0];
@@ -393,6 +449,7 @@ mod tests {
             80.0,
             light,
             size,
+            4,
         );
         let vp = u.light_vps[0];
         let p = [world_p[0], world_p[1], world_p[2], 1.0];
@@ -451,6 +508,7 @@ mod tests {
             80.0,
             light,
             2048,
+            4,
         );
         let vp = u.light_vps[0];
         let p = [world_p[0], world_p[1], world_p[2], 1.0];

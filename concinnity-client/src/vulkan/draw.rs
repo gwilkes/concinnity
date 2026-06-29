@@ -375,6 +375,7 @@ impl VkContext {
                 (self.shadow.distance as f32).min(far),
                 self.shadow.light_dir,
                 self.shadow.map_size,
+                self.shadow.cascades,
             );
             // Advance the cascade schedule and refresh only this frame's
             // cascades' light VPs; skipped cascades keep the VP + depth their
@@ -383,9 +384,13 @@ impl VkContext {
             // cascades render), so always refresh. encode_shadow_pass
             // re-rasterizes only the masked slices.
             let update = self.shadow.update;
-            let mask = self.shadow.scheduler.next_mask(update);
+            let mask = self
+                .shadow
+                .scheduler
+                .next_mask(update, self.shadow.cascades);
             self.shadow.render_mask = mask;
             self.shadow.uniforms.cascade_splits = fresh.cascade_splits;
+            self.shadow.uniforms.active_cascades = fresh.active_cascades;
             for i in 0..crate::gfx::render_types::NUM_SHADOW_CASCADES {
                 if mask & (1u32 << i) != 0 {
                     self.shadow.uniforms.light_vps[i] = fresh.light_vps[i];

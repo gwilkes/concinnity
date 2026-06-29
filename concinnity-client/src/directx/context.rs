@@ -471,6 +471,10 @@ pub(super) struct ShadowState {
     // Shadow distance in world units (GraphicsConfig.shadow_distance), read by the
     // per-frame cascade-split computation and capped at the camera far plane.
     pub distance: u32,
+    // Active shadow cascade count, 1..=4 (GraphicsConfig.shadow_cascades). The
+    // per-frame split + schedule read it; only the first `cascades` of the four
+    // slots are rendered + sampled. Stored at init (applies at the next launch).
+    pub cascades: u32,
     // Round-robin clock + primed-set for the cascade schedule; advanced once per
     // frame in record_frame.
     pub scheduler: crate::gfx::shadow_schedule::ShadowCascadeScheduler,
@@ -1410,11 +1414,16 @@ impl DxContext {
                 (self.shadow.distance as f32).min(far),
                 self.shadow.light_dir,
                 self.shadow.map_size,
+                self.shadow.cascades,
             );
             let update = self.shadow.update;
-            let mask = self.shadow.scheduler.next_mask(update);
+            let mask = self
+                .shadow
+                .scheduler
+                .next_mask(update, self.shadow.cascades);
             self.shadow.render_mask = mask;
             self.shadow.uniforms.cascade_splits = fresh.cascade_splits;
+            self.shadow.uniforms.active_cascades = fresh.active_cascades;
             for i in 0..crate::gfx::render_types::NUM_SHADOW_CASCADES {
                 if mask & (1u32 << i) != 0 {
                     self.shadow.uniforms.light_vps[i] = fresh.light_vps[i];

@@ -29,6 +29,7 @@ is not user-configurable.
 - `shadow_map_size`: An integer. Shadow map resolution in texels (e.g. 2048). Set to 0 to disable shadows. Defaults to `2048`.
 - `shadow_update`: A string (one of `every_frame` or `hybrid`). How often shadow cascades are re-rendered. `hybrid` (default) amortizes the far cascades across frames; `every_frame` refreshes them all every frame. See [ShadowUpdate].
 - `shadow_distance`: An integer. How far from the camera shadows are cast, in world units (e.g. 80). The cascades cover from the near plane out to this distance; a larger value shadows more of the scene but spreads the same shadow-map resolution over more area (softer, blockier shadows). Capped at the camera far plane. Defaults to `80`.
+- `shadow_cascades`: An integer. Number of shadow cascades, 1 to 4 (`4` is the default and the maximum). More cascades keep distant shadows sharper by splitting the view range into finer slices, at the cost of an extra shadow-map render per cascade; fewer is cheaper but blockier far from the camera. The slice count covers the same `shadow_distance` regardless.
 - `anisotropy`: An integer. Maximum anisotropic-filtering degree for the scene texture sampler (albedo + normal maps), e.g. 8. Higher keeps textures viewed at a grazing angle (floors, walls receding into the distance) sharp instead of blurring along the minor axis, at a small sampling cost. `1` disables anisotropy (plain trilinear). Clamped to the GPU's supported range (1..16) at init. Defaults to `8`.
 
 ### ShaderStage

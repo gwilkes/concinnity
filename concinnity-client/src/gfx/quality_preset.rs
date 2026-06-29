@@ -86,6 +86,11 @@ pub(crate) struct QualityCeiling {
     // `u32::MAX`, so a world's authored distance always stands. A lower tier
     // shadows a shorter distance (cheaper, and sharper per texel).
     pub shadow_distance: u32,
+    // Cap on the shadow cascade count (live): the effective count is the smaller
+    // of the world's choice and this cap. The no-ceiling value is `4` (the
+    // maximum), so a world's authored count always stands. A lower tier renders
+    // fewer cascades (one shadow-map render saved per dropped cascade).
+    pub shadow_cascades: u32,
 }
 
 // The coarser (higher render-resolution divisor) of two SSGI resolutions, the
@@ -148,6 +153,9 @@ const ANISO_MAX: u32 = 16;
 // `u32::MAX` is the no-cap shadow distance: a world's authored distance always
 // stands smaller-or-equal under it.
 const SHADOW_DIST_MAX: u32 = u32::MAX;
+// `4` is the no-cap shadow cascade count (the engine maximum = NUM_SHADOW_CASCADES):
+// a world's authored count always stands smaller-or-equal under it.
+const SHADOW_CASCADES_MAX: u32 = 4;
 
 // The coarser (smaller) of two shadow-map resolutions, the shadow analogue of
 // the SSGI / reflection-blur clamp helpers. Used to clamp a world's authored
@@ -184,6 +192,12 @@ pub(crate) fn clamp_shadow_distance(authored: u32, ceiling: &QualityCeiling) -> 
     authored.min(ceiling.shadow_distance)
 }
 
+// The world's shadow cascade count clamped under the ceiling: the smaller of the
+// authored count and the cap. Never raises.
+pub(crate) fn clamp_shadow_cascades(authored: u32, ceiling: &QualityCeiling) -> u32 {
+    authored.min(ceiling.shadow_cascades)
+}
+
 const NONE: QualityCeiling = QualityCeiling {
     aa_mode: AaMode::Taa,
     ssao: true,
@@ -200,6 +214,7 @@ const NONE: QualityCeiling = QualityCeiling {
     allow_every_frame_shadows: true,
     anisotropy: ANISO_MAX,
     shadow_distance: SHADOW_DIST_MAX,
+    shadow_cascades: SHADOW_CASCADES_MAX,
 };
 const LOW: QualityCeiling = QualityCeiling {
     aa_mode: AaMode::Fxaa,
@@ -217,6 +232,7 @@ const LOW: QualityCeiling = QualityCeiling {
     allow_every_frame_shadows: false,
     anisotropy: 4,
     shadow_distance: 40,
+    shadow_cascades: 2,
 };
 const MEDIUM: QualityCeiling = QualityCeiling {
     aa_mode: AaMode::Taa,
@@ -234,6 +250,7 @@ const MEDIUM: QualityCeiling = QualityCeiling {
     allow_every_frame_shadows: false,
     anisotropy: 8,
     shadow_distance: 80,
+    shadow_cascades: 3,
 };
 const HIGH: QualityCeiling = QualityCeiling {
     aa_mode: AaMode::Taa,
@@ -251,6 +268,7 @@ const HIGH: QualityCeiling = QualityCeiling {
     allow_every_frame_shadows: false,
     anisotropy: 16,
     shadow_distance: 160,
+    shadow_cascades: 4,
 };
 const ULTRA: QualityCeiling = QualityCeiling {
     aa_mode: AaMode::Taa,
@@ -268,6 +286,7 @@ const ULTRA: QualityCeiling = QualityCeiling {
     allow_every_frame_shadows: true,
     anisotropy: ANISO_MAX,
     shadow_distance: SHADOW_DIST_MAX,
+    shadow_cascades: SHADOW_CASCADES_MAX,
 };
 
 // The active ceiling for the persisted preset and detected GPU. `Auto` maps the
@@ -515,6 +534,11 @@ mod tests {
                 lo.shadow_distance <= hi.shadow_distance,
                 "shadow_distance cap dropped"
             );
+            // The shadow cascade-count cap rises (or holds) with the tier too.
+            assert!(
+                lo.shadow_cascades <= hi.shadow_cascades,
+                "shadow_cascades cap dropped"
+            );
         }
     }
 
@@ -571,6 +595,20 @@ mod tests {
         let low = resolve_ceiling(QualityPreset::Low, &GpuProfile::UNKNOWN);
         assert_eq!(clamp_shadow_distance(320, &low), 40);
         assert_eq!(clamp_shadow_distance(30, &low), 30);
+    }
+
+    #[test]
+    fn shadow_cascades_clamp_down_only() {
+        // No ceiling (Custom / Ultra) leaves the world's authored count alone.
+        let none = resolve_ceiling(QualityPreset::Custom, &GpuProfile::UNKNOWN);
+        assert_eq!(none.shadow_cascades, SHADOW_CASCADES_MAX);
+        assert_eq!(clamp_shadow_cascades(4, &none), 4);
+        // Low caps at 2, Medium at 3; the clamp never raises a smaller authored one.
+        let low = resolve_ceiling(QualityPreset::Low, &GpuProfile::UNKNOWN);
+        assert_eq!(clamp_shadow_cascades(4, &low), 2);
+        assert_eq!(clamp_shadow_cascades(1, &low), 1);
+        let medium = resolve_ceiling(QualityPreset::Medium, &GpuProfile::UNKNOWN);
+        assert_eq!(clamp_shadow_cascades(4, &medium), 3);
     }
 
     #[test]

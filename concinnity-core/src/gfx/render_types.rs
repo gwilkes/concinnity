@@ -211,8 +211,21 @@ pub struct ShadowUniforms {
     // One light-space VP matrix per cascade, column-major.
     pub light_vps: [[[f32; 4]; 4]; NUM_SHADOW_CASCADES],
     // View-space depth at the FAR end of each cascade. Stored as a vec4 to
-    // keep MSL std140-like alignment trivial across backends.
+    // keep MSL std140-like alignment trivial across backends. Slots
+    // `[active_cascades..]` hold a negative sentinel so the fragment shader's
+    // split comparison never selects an unrendered cascade.
     pub cascade_splits: [f32; NUM_SHADOW_CASCADES],
+    // How many of the `NUM_SHADOW_CASCADES` slots are live this frame (1..=4,
+    // from `GraphicsConfig.shadow_cascades`). The array capacity stays 4; only
+    // the first `active_cascades` are split, rendered, and sampled. The fragment
+    // shader bounds both its cascade fallback and its cross-cascade blend by this
+    // so it never reads a slot the CPU did not render.
+    pub active_cascades: u32,
+    // Pads the struct to 288 bytes (a multiple of 16). The Rust `[[f32; 4]; 4]`
+    // matrices are only 4-byte aligned, so Rust would otherwise leave this at 276;
+    // the MSL `float4x4`-aligned struct and the GLSL std140 block both round up to
+    // 288, so the upload size must match for the bound buffer range to cover them.
+    pub _pad: [u32; 3],
 }
 
 // Per-shadow-pass push constant identifying which cascade is being rendered.
@@ -1411,12 +1424,15 @@ mod tests {
     fn shadow_uniforms_layout_matches_msl() {
         // MSL `ShadowUniforms` in default.metal / shadow_map.metal (and
         // `RaymarchShadowUniforms` in raymarch_helpers.metal, bound from this
-        // same struct): NUM_SHADOW_CASCADES float4x4s then the splits. The MSL
-        // declares the splits as `float4` (default/shadow) or `float[4]`
-        // (raymarch); both occupy the same 16 bytes as the Rust `[f32; 4]`.
-        assert_eq!(size_of::<ShadowUniforms>(), 272);
+        // same struct): NUM_SHADOW_CASCADES float4x4s, then the splits, then the
+        // active-cascade count. The MSL declares the splits as `float4`
+        // (default/shadow) or `float[4]` (raymarch); both occupy the same 16
+        // bytes as the Rust `[f32; 4]`. `active_cascades` is a `uint` at offset
+        // 272; the struct rounds up to 288 for the 16-byte (float4x4) alignment.
+        assert_eq!(size_of::<ShadowUniforms>(), 288);
         assert_eq!(offset_of!(ShadowUniforms, light_vps), 0);
         assert_eq!(offset_of!(ShadowUniforms, cascade_splits), 256);
+        assert_eq!(offset_of!(ShadowUniforms, active_cascades), 272);
         // 16-aligned size keeps the float4x4 array head aligned in MSL.
         assert_eq!(size_of::<ShadowUniforms>() % 16, 0);
     }

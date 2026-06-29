@@ -69,6 +69,12 @@ pub struct GraphicsConfig {
     /// shadows more of the scene but spreads the same shadow-map resolution over
     /// more area (softer, blockier shadows). Capped at the camera far plane.
     pub shadow_distance: u32,
+    /// Number of shadow cascades, 1 to 4 (`4` is the default and the maximum).
+    /// More cascades keep distant shadows sharper by splitting the view range
+    /// into finer slices, at the cost of an extra shadow-map render per cascade;
+    /// fewer is cheaper but blockier far from the camera. The slice count covers
+    /// the same `shadow_distance` regardless.
+    pub shadow_cascades: u32,
     /// Maximum anisotropic-filtering degree for the scene texture sampler
     /// (albedo + normal maps), e.g. 8. Higher keeps textures viewed at a grazing
     /// angle (floors, walls receding into the distance) sharp instead of blurring
@@ -89,6 +95,7 @@ impl Default for GraphicsConfig {
             shadow_map_size: 2048,
             shadow_update: ShadowUpdate::default(),
             shadow_distance: 80,
+            shadow_cascades: 4,
             anisotropy: 8,
         }
     }
@@ -225,6 +232,16 @@ mod tests {
         let cfg: GraphicsConfig =
             serde_json::from_str(r#"{"shadow_map_size":1024}"#).expect("parse");
         assert_eq!(cfg.shadow_distance, 80);
+    }
+
+    #[test]
+    fn shadow_cascades_defaults_to_4_and_round_trips() {
+        assert_eq!(GraphicsConfig::default().shadow_cascades, 4);
+        let cfg: GraphicsConfig = serde_json::from_str(r#"{"shadow_cascades":2}"#).expect("parse");
+        assert_eq!(cfg.shadow_cascades, 2);
+        let cfg: GraphicsConfig =
+            serde_json::from_str(r#"{"shadow_map_size":1024}"#).expect("parse");
+        assert_eq!(cfg.shadow_cascades, 4);
     }
 
     #[test]

@@ -108,6 +108,14 @@ const SHADOW_UPDATE_OPTIONS: [&str; 2] = ["Every Frame", "Hybrid"];
 const SHADOW_DISTANCE_OPTIONS: [&str; 4] = ["40 m", "80 m", "160 m", "320 m"];
 const SHADOW_DISTANCE_VALUES: [u32; 4] = [40, 80, 160, 320];
 
+// Shadow cascade-count options, in cycle order. More cascades keep distant
+// shadows sharper (finer view-range slices) at the cost of an extra shadow-map
+// render each; fewer is cheaper but blockier far away. Indices map via the
+// `shadow_cascades_*` helpers below. Applied live (the per-frame split + schedule
+// read the count each draw); preset-governed.
+const SHADOW_CASCADES_OPTIONS: [&str; 3] = ["2", "3", "4"];
+const SHADOW_CASCADES_VALUES: [u32; 3] = [2, 3, 4];
+
 // Anisotropic-filtering degree options for the scene sampler, in cycle order.
 // "Off" is 1x (plain trilinear); the rest are the max anisotropy degree. Indices
 // map via the `anisotropy_*` helpers below (an authored degree off the discrete
@@ -189,6 +197,7 @@ pub(crate) fn options(key: &str) -> Option<&'static [&'static str]> {
         "shadow_map_size" => Some(&SHADOW_RESOLUTION_OPTIONS),
         "shadow_update" => Some(&SHADOW_UPDATE_OPTIONS),
         "shadow_distance" => Some(&SHADOW_DISTANCE_OPTIONS),
+        "shadow_cascades" => Some(&SHADOW_CASCADES_OPTIONS),
         "anisotropy" => Some(&ANISOTROPY_OPTIONS),
         "frames_in_flight" => Some(&FRAME_BUFFERING_OPTIONS),
         "texture_quality" => Some(&TEXTURE_QUALITY_OPTIONS),
@@ -362,6 +371,17 @@ pub(crate) fn shadow_distance_at(index: usize) -> u32 {
 }
 pub(crate) fn shadow_distance_index(distance: u32) -> usize {
     nearest_count_index(&SHADOW_DISTANCE_VALUES, distance)
+}
+
+// Shadow cascade count for an option index, and the menu index nearest an
+// authored count. The default fallback is the world default (4, the last index).
+pub(crate) fn shadow_cascades_at(index: usize) -> u32 {
+    *SHADOW_CASCADES_VALUES
+        .get(index)
+        .unwrap_or(&SHADOW_CASCADES_VALUES[2])
+}
+pub(crate) fn shadow_cascades_index(count: u32) -> usize {
+    nearest_count_index(&SHADOW_CASCADES_VALUES, count)
 }
 
 // Anisotropic-filtering degree for an option index, and the menu index nearest an
@@ -965,6 +985,21 @@ mod tests {
         // It is a cycle row, not a slider.
         assert!(options("shadow_distance").is_some());
         assert!(slider_range("shadow_distance").is_none());
+    }
+
+    #[test]
+    fn shadow_cascades_round_trips_and_snaps() {
+        for i in 0..SHADOW_CASCADES_VALUES.len() {
+            assert_eq!(shadow_cascades_index(shadow_cascades_at(i)), i);
+        }
+        // The world default 4 is the last index; out-of-range falls back to it.
+        assert_eq!(shadow_cascades_at(2), 4);
+        assert_eq!(shadow_cascades_index(4), 2);
+        assert_eq!(shadow_cascades_at(9), 4);
+        // An authored count off the levels snaps to the nearest.
+        assert_eq!(shadow_cascades_index(1), 0); // 1 -> 2
+        assert!(options("shadow_cascades").is_some());
+        assert!(slider_range("shadow_cascades").is_none());
     }
 
     #[test]

@@ -202,6 +202,12 @@ pub struct GraphicsSettings {
     // knobs above.
     #[serde(default)]
     pub shadow_distance: Option<u32>,
+    // Shadow cascade count, 1..4 (`GraphicsConfig.shadow_cascades`). `None` uses
+    // the world's value. Applied live on Metal (the per-frame split + schedule
+    // read it) and governed by the quality preset ceiling like the shadow knobs
+    // above.
+    #[serde(default)]
+    pub shadow_cascades: Option<u32>,
     // Anisotropic-filtering degree for the scene sampler
     // (`GraphicsConfig.anisotropy`). `None` uses the world's value. Restart-
     // required (the sampler is built once at backend init) and governed by the
@@ -469,6 +475,7 @@ mod tests {
                 shadow_map_size: Some(4096),
                 shadow_update: Some(crate::assets::ShadowUpdate::EveryFrame),
                 shadow_distance: Some(160),
+                shadow_cascades: Some(3),
                 anisotropy: Some(16),
                 temporal_upscaling: Some(true),
                 hdr_display: Some(true),

@@ -240,6 +240,9 @@ struct ShadowUniforms {
     float4x4 light_vps[NUM_SHADOW_CASCADES];
     // x..w = view-space far depth for cascades 0..3
     float4   cascade_splits;
+    // Live cascade count (1..4); slots at or beyond it are unrendered, so the
+    // selection + blend below must not reach them.
+    uint     active_cascades;
 };
 
 // Sky gradient colours matching the procedural sky texture generator.
@@ -425,7 +428,7 @@ static float shadow_factor_cascaded(
     else if (view_depth < shadow.cascade_splits[1]) cascade = 1;
     else if (view_depth < shadow.cascade_splits[2]) cascade = 2;
     else if (view_depth < shadow.cascade_splits[3]) cascade = 3;
-    if (cascade >= NUM_SHADOW_CASCADES) return 1.0;
+    if (cascade >= shadow.active_cascades) return 1.0;
 
     float shade = sample_cascade_pcf(cascade, world_pos, shadow, shadow_map, shadow_samp, screen_xy);
 
@@ -436,7 +439,7 @@ static float shadow_factor_cascaded(
     // boundary sweeps across the world as the camera moves and the shadow edge
     // appears to glide. Blending the shadow factor over the band turns the
     // jump into a smooth transition that stays anchored to the world.
-    if (cascade + 1 < NUM_SHADOW_CASCADES) {
+    if (cascade + 1 < shadow.active_cascades) {
         float split_far  = shadow.cascade_splits[cascade];
         float split_near = (cascade == 0) ? 0.0 : shadow.cascade_splits[cascade - 1];
         float band = (split_far - split_near) * 0.15;

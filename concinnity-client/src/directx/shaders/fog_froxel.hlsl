@@ -52,6 +52,7 @@ cbuffer ShadowUniforms : register(b2)
 {
     float4x4 light_vps[NUM_SHADOW_CASCADES];
     float4   cascade_splits;
+    uint     active_cascades;
 }
 
 Texture2DArray<float> shadow_map : register(t0);
@@ -78,7 +79,7 @@ float fog_shadow_factor(float3 world_pos, float view_depth)
     else if (view_depth < cascade_splits.y) cascade = 1;
     else if (view_depth < cascade_splits.z) cascade = 2;
     else if (view_depth < cascade_splits.w) cascade = 3;
-    if (cascade >= NUM_SHADOW_CASCADES) return 1.0;
+    if (cascade >= active_cascades) return 1.0;
 
     float4 light_clip = mul(light_vps[cascade], float4(world_pos, 1.0));
     float3 ndc = light_clip.xyz / light_clip.w;

@@ -78,6 +78,7 @@ static const int RAYMARCH_NUM_SHADOW_CASCADES = 4;
 cbuffer RaymarchShadowUniforms : register(b3) {
   float4x4 shadow_light_vps[4];
   float4 shadow_cascade_splits;
+  uint shadow_active_cascades;
 };
 
 // Per-point material the user's `shade` returns. Same layout as the
@@ -294,7 +295,7 @@ float sampleSunShadow(float3 world_pos, float view_depth, float2 screen_xy,
   else if (view_depth < shadow_cascade_splits.w)
     cascade = 3;
 
-  if (cascade < RAYMARCH_NUM_SHADOW_CASCADES) {
+  if (cascade < (int)shadow_active_cascades) {
     float4 light_clip = mul(shadow_light_vps[cascade], float4(world_pos, 1.0));
     float3 ndc = light_clip.xyz / max(light_clip.w, 1e-6);
     float2 uv = float2(ndc.x * 0.5 + 0.5, -ndc.y * 0.5 + 0.5);

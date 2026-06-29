@@ -74,7 +74,7 @@ const VIDEO_ADVANCED_SLIDERS: [(&str, &str); 8] = [
 // client (`concinnity_client::gfx::settings` + `graphics_system`) knows each key's options and
 // applies it live by rebuilding the affected render resources; on backends
 // without a live path the choice persists and applies at the next launch.
-const VIDEO_QUALITY_ROWS: [(&str, &str); 14] = [
+const VIDEO_QUALITY_ROWS: [(&str, &str); 15] = [
     ("aa_mode", "Anti-Aliasing"),
     ("ssao", "Ambient Occlusion"),
     ("ssr", "Screen-Space Reflections"),
@@ -89,10 +89,12 @@ const VIDEO_QUALITY_ROWS: [(&str, &str); 14] = [
     ("ssgi_rays", "GI Rays"),
     ("ssgi_steps", "GI Steps"),
     // Shadow quality: cascade map resolution (restart-required) + re-render
-    // cadence (live) + distance (live). Preset-governed like the toggles above.
+    // cadence (live) + distance (live) + cascade count (live). Preset-governed
+    // like the toggles above.
     ("shadow_map_size", "Shadow Resolution"),
     ("shadow_update", "Shadow Update"),
     ("shadow_distance", "Shadow Distance"),
+    ("shadow_cascades", "Shadow Cascades"),
     ("auto_exposure", "Auto Exposure"),
     // Anisotropic texture filtering (restart-required). Preset-governed like the
     // toggles above.
@@ -1682,6 +1684,7 @@ mod tests {
             "opt_shadow_map_size",
             "opt_shadow_update",
             "opt_shadow_distance",
+            "opt_shadow_cascades",
             "opt_auto_exposure",
             "opt_anisotropy",
             // The per-feature sub-quality sliders share the Quality group.

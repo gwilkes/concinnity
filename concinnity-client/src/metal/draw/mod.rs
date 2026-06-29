@@ -247,6 +247,7 @@ impl MtlContext {
                 (self.shadow_distance as f32).min(far),
                 self.shadow_light_dir,
                 self.shadow_map_size,
+                self.shadow_cascades,
             );
             // Pick this frame's cascades and refresh only their VPs; cascades
             // skipped this frame keep the VP their slice was rendered with so
@@ -255,6 +256,7 @@ impl MtlContext {
             let mask = self.next_shadow_cascade_mask();
             self.shadow_render_mask = mask;
             self.shadow_uniforms.cascade_splits = fresh.cascade_splits;
+            self.shadow_uniforms.active_cascades = fresh.active_cascades;
             for i in 0..crate::gfx::render_types::NUM_SHADOW_CASCADES {
                 if mask & (1u32 << i) != 0 {
                     self.shadow_uniforms.light_vps[i] = fresh.light_vps[i];

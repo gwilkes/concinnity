@@ -554,6 +554,17 @@ pub trait RenderBackend: SceneControl + Send {
         let _ = distance;
     }
 
+    // Set the live shadow cascade count (1..=4). The cascade-split math + the
+    // re-render schedule read it each frame and only the first `count` cascades
+    // are projected, rendered, and sampled (the array capacity stays 4), so a
+    // change takes effect on the next frame with no resize or rebuild. Default
+    // no-op: a backend that only reads the count at init keeps the init-time
+    // value (DirectX / Vulkan today), so the choice persists and takes effect at
+    // the next launch there.
+    fn set_shadow_cascades(&mut self, count: u32) {
+        let _ = count;
+    }
+
     // Update the live scalar sub-tunables of the SSAO / SSR / SSGI / auto-exposure
     // passes (radius, intensity, distance, EV bounds, adaptation speed). Unlike
     // `apply_quality_settings`, this rebuilds nothing: each backend re-reads these

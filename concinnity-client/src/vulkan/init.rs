@@ -66,6 +66,9 @@ impl VkContext {
         // Shadow distance (GraphicsConfig.shadow_distance, world units). The
         // per-frame cascade split reads it, capped at the camera far plane.
         shadow_distance: u32,
+        // Shadow cascade count (GraphicsConfig.shadow_cascades, 1..=4). The
+        // per-frame split + schedule read it; applies at the next launch.
+        shadow_cascades: u32,
         // Scene-sampler max anisotropy (GraphicsConfig.anisotropy), clamped to the
         // device limit where the sampler is built below.
         anisotropy: u32,
@@ -3332,6 +3335,7 @@ impl VkContext {
                 light_dir: shadow_light_dir,
                 update: shadow_update,
                 distance: shadow_distance,
+                cascades: shadow_cascades,
                 scheduler: Default::default(),
                 render_mask: 0,
             },

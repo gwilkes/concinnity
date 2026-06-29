@@ -235,6 +235,10 @@ pub struct MtlContext {
     // per-frame cascade-split computation and capped at the camera far plane.
     // Mutable so set_shadow_distance can change it live.
     pub(super) shadow_distance: u32,
+    // Active shadow cascade count, 1..=4 (GraphicsConfig.shadow_cascades). The
+    // per-frame split + schedule read it; only the first `shadow_cascades` of the
+    // four slots are rendered + sampled. Mutable so set_shadow_cascades is live.
+    pub(super) shadow_cascades: u32,
     // Round-robin clock + primed-set for the cascade schedule; advanced once per
     // frame by `next_shadow_cascade_mask`.
     pub(super) shadow_scheduler: crate::gfx::shadow_schedule::ShadowCascadeScheduler,

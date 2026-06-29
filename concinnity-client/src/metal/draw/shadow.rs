@@ -34,7 +34,8 @@ impl MtlContext {
     // draw_frame; the result is stashed in `shadow_render_mask` for
     // encode_shadow_pass and used to gate which cascade VPs refresh.
     pub(in crate::metal) fn next_shadow_cascade_mask(&mut self) -> u32 {
-        self.shadow_scheduler.next_mask(self.shadow_update)
+        self.shadow_scheduler
+            .next_mask(self.shadow_update, self.shadow_cascades)
     }
 
     // pub(in crate::metal) so the render-graph executor in

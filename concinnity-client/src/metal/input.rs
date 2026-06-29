@@ -320,6 +320,14 @@ impl MtlContext {
         self.shadow_distance = distance;
     }
 
+    // Set the live shadow cascade count (1..=4). The per-frame split + schedule
+    // read `shadow_cascades` each draw; only the first `count` of the four slots
+    // are rendered + sampled, so a change takes effect on the next frame with no
+    // resize (the shadow-map array stays sized for the 4-cascade capacity).
+    pub fn set_shadow_cascades(&mut self, count: u32) {
+        self.shadow_cascades = count;
+    }
+
     // Update the live scalar sub-tunables of the SSAO / SSR / SSGI / auto-exposure
     // passes without rebuilding anything. The draw path rebuilds each pass's
     // per-frame uniform from these stored `*Settings` structs every frame

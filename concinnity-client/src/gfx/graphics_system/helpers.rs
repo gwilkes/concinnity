@@ -228,6 +228,10 @@ pub(super) fn init_backend(
     // backend's per-frame cascade-split computation reads it (capped at the camera
     // far plane); live on Metal via set_shadow_distance.
     shadow_distance: u32,
+    // Shadow cascade count (1..=4) from GraphicsConfig.shadow_cascades. Each
+    // backend's per-frame split + schedule read it; live on Metal via
+    // set_shadow_cascades.
+    shadow_cascades: u32,
     // Scene-sampler max anisotropy from GraphicsConfig.anisotropy. Each backend
     // builds its albedo / normal-map sampler with this (clamped to the GPU's
     // 1..16 range) at init; restart-required.
@@ -372,6 +376,7 @@ pub(super) fn init_backend(
             shadow_map_size,
             shadow_update,
             shadow_distance,
+            shadow_cascades,
             anisotropy,
             text_atlases,
             env_map_bytes,
@@ -434,6 +439,7 @@ pub(super) fn init_backend(
             shadow_map_size,
             shadow_update,
             shadow_distance,
+            shadow_cascades,
             anisotropy,
             text_atlases,
             env_map_bytes,
@@ -495,6 +501,7 @@ pub(super) fn init_backend(
             shadow_map_size,
             shadow_update,
             shadow_distance,
+            shadow_cascades,
             anisotropy,
             text_atlases,
             env_map_bytes,

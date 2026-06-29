@@ -36,6 +36,9 @@ layout(std140, set = 0, binding = 1) uniform LightBlock {
 layout(std140, set = 0, binding = 2) uniform ShadowBlock {
     mat4 light_vps[4];
     vec4 cascade_splits;
+    // Live cascade count (1..4); slots at or beyond it are unrendered, so the
+    // selection + blend below must not reach them.
+    uint active_cascades;
 } shadow_uni;
 
 // 4-layer array shadow map (one slice per cascade), sampled with depth-compare
@@ -198,11 +201,11 @@ float shadow_factor_cascaded(vec3 world_pos, float view_depth, vec2 screen_xy) {
     else if (view_depth < shadow_uni.cascade_splits[1]) cascade = 1;
     else if (view_depth < shadow_uni.cascade_splits[2]) cascade = 2;
     else if (view_depth < shadow_uni.cascade_splits[3]) cascade = 3;
-    if (cascade >= 4) return 1.0;
+    if (cascade >= int(shadow_uni.active_cascades)) return 1.0;
 
     float shade = sample_cascade_pcf(cascade, world_pos, screen_xy);
 
-    if (cascade + 1 < 4) {
+    if (cascade + 1 < int(shadow_uni.active_cascades)) {
         float split_far  = shadow_uni.cascade_splits[cascade];
         float split_near = (cascade == 0) ? 0.0 : shadow_uni.cascade_splits[cascade - 1];
         float band = (split_far - split_near) * 0.15;

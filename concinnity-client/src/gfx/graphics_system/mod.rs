@@ -65,6 +65,10 @@ pub struct GraphicsSystem {
     // live via set_shadow_distance (the per-frame cascade-split math reads it);
     // preset-governed (a manual change flips the master preset to Custom).
     shadow_distance: u32,
+    // Active shadow cascade count, 1..=4 (GraphicsConfig.shadow_cascades). Applied
+    // live via set_shadow_cascades (the per-frame split + schedule read it);
+    // preset-governed (a manual change flips the master preset to Custom).
+    shadow_cascades: u32,
     // Scene-sampler max anisotropy. Restart-required (the sampler is built once at
     // backend init from this), so this is display/persist state; the value reaches
     // the backend through the ctor. Preset-governed (a manual change flips the
@@ -239,6 +243,9 @@ pub struct GraphicsSystem {
     // The world's authored shadow distance, the baseline a live preset change
     // re-clamps from. The live value is `shadow_distance` above.
     authored_shadow_distance: u32,
+    // The world's authored shadow cascade count, the baseline a live preset
+    // change re-clamps from. The live value is `shadow_cascades` above.
+    authored_shadow_cascades: u32,
     // The world's authored anisotropy degree before the user override + preset
     // ceiling, the baseline a live preset change re-clamps from (like
     // `authored_shadow_map_size`). The live value is `anisotropy` above.
@@ -371,6 +378,7 @@ impl GraphicsSystem {
             shadow_map_size: 2048,
             shadow_update: crate::assets::ShadowUpdate::default(),
             shadow_distance: 80,
+            shadow_cascades: 4,
             anisotropy: 8,
             failed: false,
             start_time: None,
@@ -421,6 +429,7 @@ impl GraphicsSystem {
             authored_shadow_map_size: 2048,
             authored_shadow_update: crate::assets::ShadowUpdate::default(),
             authored_shadow_distance: 80,
+            authored_shadow_cascades: 4,
             authored_anisotropy: 8,
             occlusion_two_pass: false,
             texture_cap: 96,

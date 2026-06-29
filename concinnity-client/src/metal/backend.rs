@@ -72,6 +72,7 @@ impl RenderBackend for MtlContext {
         fn apply_quality_settings(&mut self, settings: QualitySettings);
         fn set_shadow_update(&mut self, update: crate::assets::ShadowUpdate);
         fn set_shadow_distance(&mut self, distance: u32);
+        fn set_shadow_cascades(&mut self, count: u32);
         fn update_quality_params(&mut self, settings: QualitySettings);
         fn take_input(&mut self) -> RenderInput;
         fn wait_idle(&self);

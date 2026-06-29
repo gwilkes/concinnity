@@ -801,6 +801,13 @@ impl GraphicsSystem {
                             &ceiling,
                         );
                         backend.set_shadow_distance(self.shadow_distance);
+                        // Shadow cascade count: live (the per-frame split + schedule
+                        // read it), so re-derive from the authored baseline and push.
+                        self.shadow_cascades = quality_preset::clamp_shadow_cascades(
+                            self.authored_shadow_cascades,
+                            &ceiling,
+                        );
+                        backend.set_shadow_cascades(self.shadow_cascades);
                         // Anisotropy: restart-required, so re-derive from the
                         // authored baseline for the row label only (the sampler is
                         // built at init; the new degree takes effect next launch).
@@ -825,6 +832,7 @@ impl GraphicsSystem {
                         cfg.graphics.shadow_map_size = None;
                         cfg.graphics.shadow_update = None;
                         cfg.graphics.shadow_distance = None;
+                        cfg.graphics.shadow_cascades = None;
                         cfg.graphics.anisotropy = None;
                         cfg.graphics.render_scale = None;
                         if let Err(e) = cfg.save() {
@@ -871,6 +879,7 @@ impl GraphicsSystem {
                             "shadow_map_size",
                             "shadow_update",
                             "shadow_distance",
+                            "shadow_cascades",
                             "anisotropy",
                         ] {
                             let idx = match key {
@@ -879,6 +888,9 @@ impl GraphicsSystem {
                                 }
                                 "shadow_distance" => {
                                     settings::shadow_distance_index(self.shadow_distance)
+                                }
+                                "shadow_cascades" => {
+                                    settings::shadow_cascades_index(self.shadow_cascades)
                                 }
                                 "anisotropy" => settings::anisotropy_index(self.anisotropy),
                                 _ => settings::shadow_update_index(self.shadow_update),
@@ -1203,6 +1215,25 @@ impl GraphicsSystem {
                             self.shadow_distance = settings::shadow_distance_at(next);
                             backend.set_shadow_distance(self.shadow_distance);
                             cfg.graphics.shadow_distance = Some(self.shadow_distance);
+                            self.quality_preset = crate::gfx::quality_preset::QualityPreset::Custom;
+                            cfg.graphics.quality_preset = Some(self.quality_preset);
+                            set_cached_row_label(
+                                &self.cycle_value_labels,
+                                ctx,
+                                "graphics_quality",
+                                self.quality_preset.name(),
+                            );
+                            Some(opts[next])
+                        }
+                        // Shadow cascade count: live -- the per-frame split + schedule
+                        // read it, so it applies on the next draw. Preset-governed, so
+                        // an explicit choice flips the master preset to Custom.
+                        "shadow_cascades" => {
+                            let cur = settings::shadow_cascades_index(self.shadow_cascades);
+                            let next = settings::cycle(cur, opts.len(), cmd.op);
+                            self.shadow_cascades = settings::shadow_cascades_at(next);
+                            backend.set_shadow_cascades(self.shadow_cascades);
+                            cfg.graphics.shadow_cascades = Some(self.shadow_cascades);
                             self.quality_preset = crate::gfx::quality_preset::QualityPreset::Custom;
                             cfg.graphics.quality_preset = Some(self.quality_preset);
                             set_cached_row_label(

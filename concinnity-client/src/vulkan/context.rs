@@ -66,6 +66,10 @@ pub(super) struct VkShadow {
     // Shadow distance in world units (GraphicsConfig.shadow_distance), read by the
     // per-frame cascade-split computation and capped at the camera far plane.
     pub(super) distance: u32,
+    // Active shadow cascade count, 1..=4 (GraphicsConfig.shadow_cascades). The
+    // per-frame split + schedule read it; only the first `cascades` of the four
+    // slots are rendered + sampled. Stored at init (applies at the next launch).
+    pub(super) cascades: u32,
     // Round-robin clock + primed-set for the cascade schedule; advanced once per
     // frame in draw_frame.
     pub(super) scheduler: crate::gfx::shadow_schedule::ShadowCascadeScheduler,

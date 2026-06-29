@@ -89,6 +89,9 @@ impl DxContext {
         // Shadow distance (GraphicsConfig.shadow_distance, world units). The
         // per-frame cascade split reads it, capped at the camera far plane.
         shadow_distance: u32,
+        // Shadow cascade count (GraphicsConfig.shadow_cascades, 1..=4). The
+        // per-frame split + schedule read it; applies at the next launch.
+        shadow_cascades: u32,
         // Scene-sampler max anisotropy (GraphicsConfig.anisotropy), clamped to the
         // D3D12 1..16 range where the sampler is built below.
         anisotropy: u32,
@@ -1968,6 +1971,7 @@ impl DxContext {
                 light_dir: shadow_light_dir,
                 update: shadow_update,
                 distance: shadow_distance,
+                cascades: shadow_cascades,
                 scheduler: Default::default(),
                 render_mask: 0,
                 uniforms: crate::gfx::csm::empty_shadow_uniforms(),

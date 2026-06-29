@@ -85,6 +85,7 @@ impl GraphicsSystem {
             self.shadow_map_size = args.shadow_map_size;
             self.shadow_update = args.shadow_update;
             self.shadow_distance = args.shadow_distance;
+            self.shadow_cascades = args.shadow_cascades;
             self.anisotropy = args.anisotropy;
         }
         // A persisted vsync choice overrides the world's value. Applied outside
@@ -136,6 +137,18 @@ impl GraphicsSystem {
             None => {
                 self.shadow_distance = crate::gfx::quality_preset::clamp_shadow_distance(
                     self.shadow_distance,
+                    &quality_ceiling,
+                )
+            }
+        }
+        // Shadow cascade count (GraphicsConfig-sourced, live -- the per-frame split
+        // + schedule read it). Same baseline / override / ceiling-clamp shape.
+        self.authored_shadow_cascades = self.shadow_cascades;
+        match user_graphics.shadow_cascades {
+            Some(v) => self.shadow_cascades = v,
+            None => {
+                self.shadow_cascades = crate::gfx::quality_preset::clamp_shadow_cascades(
+                    self.shadow_cascades,
                     &quality_ceiling,
                 )
             }
@@ -488,6 +501,7 @@ impl GraphicsSystem {
         // Shadow knob states for the value-label sync (copies, same reason).
         let (shadow_size, shadow_update_val) = (self.shadow_map_size, self.shadow_update);
         let shadow_distance_val = self.shadow_distance;
+        let shadow_cascades_val = self.shadow_cascades;
         let anisotropy_val = self.anisotropy;
         // System / streaming restart-row states for the value-label sync (copies).
         // `occlusion_two_pass` is already a local above.
@@ -524,6 +538,9 @@ impl GraphicsSystem {
             "shadow_update" => Some(crate::gfx::settings::shadow_update_index(shadow_update_val)),
             "shadow_distance" => Some(crate::gfx::settings::shadow_distance_index(
                 shadow_distance_val,
+            )),
+            "shadow_cascades" => Some(crate::gfx::settings::shadow_cascades_index(
+                shadow_cascades_val,
             )),
             "anisotropy" => Some(crate::gfx::settings::anisotropy_index(anisotropy_val)),
             // System / streaming restart rows.
@@ -1985,6 +2002,7 @@ impl GraphicsSystem {
             self.shadow_map_size,
             self.shadow_update,
             self.shadow_distance,
+            self.shadow_cascades,
             self.anisotropy,
             text_atlas_data,
             env_map_bytes.as_deref(),

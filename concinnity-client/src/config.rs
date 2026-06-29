@@ -57,6 +57,13 @@ pub struct Settings {
 // fall back to the world's GraphicsConfig / Window / PostProcessConfig defaults.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct GraphicsSettings {
+    // Master graphics-quality preset. `None` means never configured: the first
+    // launch seeds `Auto` (detect the GPU tier and clamp quality under the
+    // world's authored look) and saves once. `Auto` re-resolves from the
+    // detected tier each launch; a named tier is a fixed ceiling; `Custom`
+    // imposes no ceiling (only the per-field overrides below apply).
+    #[serde(default)]
+    pub quality_preset: Option<crate::gfx::quality_preset::QualityPreset>,
     // Display sync (vsync). `None` uses the world's `GraphicsConfig.vsync`.
     #[serde(default)]
     pub vsync: Option<bool>,
@@ -322,6 +329,7 @@ mod tests {
     fn settings_cbor_roundtrip() {
         let s = Settings {
             graphics: GraphicsSettings {
+                quality_preset: Some(crate::gfx::quality_preset::QualityPreset::High),
                 vsync: Some(true),
                 window_size: Some([1920, 1080]),
                 exposure_ev: Some(-1.5),

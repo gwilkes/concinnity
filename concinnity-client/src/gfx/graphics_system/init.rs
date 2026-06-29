@@ -25,6 +25,42 @@ impl GraphicsSystem {
         // below (each field is None when the user never changed that setting).
         let user_graphics = crate::config::Settings::load().graphics;
 
+        // Detect the GPU before the backend is built so the auto-config quality
+        // ceiling can influence the render targets / effect pipelines sized at
+        // backend init. Held on self for later (e.g. the menu's preset label).
+        self.gpu_profile = probe_gpu_profile();
+        // Resolve the master quality preset. An ephemeral `CN_QUALITY_PRESET`
+        // env override wins first and is never persisted, so a test / CI / GPU
+        // smoke can force a preset (e.g. `custom` for no clamp) without touching
+        // settings.bin. Otherwise the persisted choice; `None` there = never
+        // configured (a first launch, or a settings file written before the
+        // preset existed): seed `Auto` and persist once, which records the
+        // detection without baking any per-field value (the per-field overrides
+        // keep their `None = world default` meaning). `Auto` re-resolves from the
+        // detected tier each launch; `Custom` / an unclassified GPU impose no
+        // ceiling.
+        use crate::gfx::quality_preset::QualityPreset;
+        let env_preset = std::env::var("CN_QUALITY_PRESET")
+            .ok()
+            .and_then(|s| QualityPreset::parse(&s));
+        let active_preset = env_preset.unwrap_or_else(|| {
+            user_graphics.quality_preset.unwrap_or_else(|| {
+                let mut s = crate::config::Settings::load();
+                s.graphics.quality_preset = Some(QualityPreset::Auto);
+                if let Err(e) = s.save() {
+                    tracing::warn!("first-launch quality preset save failed: {e}");
+                }
+                QualityPreset::Auto
+            })
+        });
+        let quality_ceiling =
+            crate::gfx::quality_preset::resolve_ceiling(active_preset, &self.gpu_profile);
+        tracing::info!(
+            "auto-config: GPU tier {:?}, quality preset {:?}",
+            self.gpu_profile.tier,
+            active_preset,
+        );
+
         if let Some(w) = ctx.drain::<Window>().into_iter().next() {
             self.window_args = w.to_args();
         }
@@ -133,6 +169,59 @@ impl GraphicsSystem {
                 super::set_quality_toggle(&mut self.post_config, "auto_exposure", v);
             }
         }
+        // Apply the active quality preset as a performance ceiling over the
+        // world's authored toggles: where the ceiling disallows a feature, force
+        // it off -- but only for a toggle the user did not explicitly override (an
+        // explicit choice wins), and never turning a feature on. A no-op under
+        // Custom / an unclassified GPU (the ceiling permits everything). Runs
+        // after the user-override overlay and before the per-feature derivation
+        // below, so the backend builds against the clamped config.
+        if post_config.is_some() {
+            let clamp = |cfg: &mut crate::assets::PostProcessConfig,
+                         key: &str,
+                         overridden: bool,
+                         allowed: bool| {
+                if !overridden && !allowed {
+                    super::set_quality_toggle(cfg, key, false);
+                }
+            };
+            clamp(
+                &mut self.post_config,
+                "taa",
+                user_graphics.taa.is_some(),
+                quality_ceiling.taa,
+            );
+            clamp(
+                &mut self.post_config,
+                "ssao",
+                user_graphics.ssao.is_some(),
+                quality_ceiling.ssao,
+            );
+            clamp(
+                &mut self.post_config,
+                "ssr",
+                user_graphics.ssr.is_some(),
+                quality_ceiling.ssr,
+            );
+            clamp(
+                &mut self.post_config,
+                "ray_traced_reflections",
+                user_graphics.ray_traced_reflections.is_some(),
+                quality_ceiling.ray_traced_reflections,
+            );
+            clamp(
+                &mut self.post_config,
+                "ssgi",
+                user_graphics.ssgi.is_some(),
+                quality_ceiling.ssgi,
+            );
+            clamp(
+                &mut self.post_config,
+                "auto_exposure",
+                user_graphics.auto_exposure.is_some(),
+                quality_ceiling.auto_exposure,
+            );
+        }
         // Per-feature settings, derived from the overlaid config. Each is the
         // init-time gate the backend builds against; the same derivation feeds a
         // live rebuild (`derive_quality_settings`). RT reflections need an
@@ -170,7 +259,16 @@ impl GraphicsSystem {
             .as_ref()
             .map(|c| c.upscale_quality)
             .unwrap_or_default();
-        self.render_scale = user_graphics.render_scale.unwrap_or(world_quality);
+        // A persisted render-scale choice wins; otherwise the world's choice,
+        // clamped under the preset ceiling (the more aggressive of the two, so a
+        // weak-tier ceiling forces more upscaling but never less).
+        self.render_scale = match user_graphics.render_scale {
+            Some(v) => v,
+            None => crate::gfx::quality_preset::more_aggressive_upscale(
+                world_quality,
+                quality_ceiling.min_upscale,
+            ),
+        };
         let upscale_scale = if post_config.is_some() {
             self.render_scale.scale()
         } else {

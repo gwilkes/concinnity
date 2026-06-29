@@ -8,9 +8,20 @@
 // classifies the same way.
 
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLDevice, MTLGPUFamily};
+use objc2_metal::{MTLCreateSystemDefaultDevice, MTLDevice, MTLGPUFamily};
 
 use crate::gfx::backend::{GpuClassInput, GpuProfile, GpuVendor, classify_tier};
+
+// Probe the system default GPU's profile without building the renderer, for the
+// auto-config quality ceiling that must be resolved before the backend (and its
+// render targets) are created. Creates only the cheap default-device handle,
+// which is dropped immediately. `UNKNOWN` when no Metal device is available.
+pub(crate) fn probe_gpu_profile() -> GpuProfile {
+    match MTLCreateSystemDefaultDevice() {
+        Some(device) => device_profile(&device),
+        None => GpuProfile::UNKNOWN,
+    }
+}
 
 // Highest Apple GPU family the device supports, as a generation rank (7 = M1 ..
 // 10 = M4), or 0 when the device reports no Apple family (e.g. an AMD dGPU on an
@@ -40,7 +51,10 @@ pub(crate) fn device_profile(device: &ProtocolObject<dyn MTLDevice>) -> GpuProfi
     } else {
         GpuVendor::Other
     };
-    let discrete = !device.isLowPower();
+    // A true discrete GPU: not unified-memory (Apple silicon) and not low-power
+    // (an Intel-Mac iGPU). Leaves the Intel-Mac AMD dGPU as the only discrete
+    // case; Apple silicon reports unified, not discrete.
+    let discrete = !unified && !device.isLowPower();
     let tier = classify_tier(&GpuClassInput {
         vendor,
         memory_budget_bytes: budget,

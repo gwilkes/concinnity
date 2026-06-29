@@ -164,6 +164,24 @@ pub(super) fn build_texture_payload_source(
     ))
 }
 
+// Probe the active GPU's coarse performance profile before the backend is built,
+// so the auto-config quality ceiling can influence the render targets / effect
+// pipelines the backend sizes at init. Metal creates the cheap default-device
+// handle and classifies it; DirectX / Vulkan return `UNKNOWN` for now (their
+// pre-backend adapter / instance enumeration is wired + GPU-verified on a Windows
+// host), which the resolver treats as "no ceiling" -- so auto-config is a no-op
+// there until that lands, never a wrong clamp.
+pub(super) fn probe_gpu_profile() -> crate::gfx::backend::GpuProfile {
+    #[cfg(backend_metal)]
+    {
+        crate::metal::probe_gpu_profile()
+    }
+    #[cfg(not(backend_metal))]
+    {
+        crate::gfx::backend::GpuProfile::UNKNOWN
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn init_backend(
     window_args: &WindowArgs,

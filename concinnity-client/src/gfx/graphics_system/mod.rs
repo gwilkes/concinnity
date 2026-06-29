@@ -185,6 +185,10 @@ pub struct GraphicsSystem {
     // cannot provide (e.g. ray-traced reflections without hardware ray tracing)
     // is grayed out and made inert. Held in memory only, never persisted.
     caps: crate::gfx::backend::DeviceCapabilities,
+    // Coarse GPU performance profile, probed before the backend is built so the
+    // auto-config quality ceiling can influence the render targets / effect
+    // pipelines sized at backend init. Held in memory only, never persisted.
+    gpu_profile: crate::gfx::backend::GpuProfile,
 }
 
 // One key-rebind row's runtime bookkeeping: the action it rebinds and the value
@@ -337,6 +341,8 @@ impl GraphicsSystem {
             rebind_rows: Vec::new(),
             // All-capable until the backend reports otherwise at init.
             caps: crate::gfx::backend::DeviceCapabilities::ALL,
+            // Conservative until probed at init.
+            gpu_profile: crate::gfx::backend::GpuProfile::UNKNOWN,
         }
     }
 }

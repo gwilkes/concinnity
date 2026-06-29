@@ -450,6 +450,15 @@ const MOUSE_SENSITIVITY_RANGE: (f32, f32) = (1.0, 100.0);
 const MOUSE_SENS_MIN: f32 = 0.0003;
 const MOUSE_SENS_MAX: f32 = 0.005;
 
+// Field-of-view slider: a vertical FOV in degrees applied directly (the slider
+// value IS the degrees, so `slider_apply_value` only clamps and the recover is
+// the identity) to every Camera3D's `fov_y_degrees`. The range spans a narrow to
+// a wide view; the engine's authored default (`DEFAULT_FOV`) sits mid-track.
+const FOV_RANGE: (f32, f32) = (50.0, 100.0);
+// Effective vertical FOV in degrees when the user has never chosen one. Matches
+// Camera3D's authored default.
+pub(crate) const DEFAULT_FOV: f32 = 75.0;
+
 // The (min, max) value range for a slider key, or `None` if the key is not a
 // slider setting.
 pub(crate) fn slider_range(key: &str) -> Option<(f32, f32)> {
@@ -471,6 +480,7 @@ pub(crate) fn slider_range(key: &str) -> Option<(f32, f32)> {
         "auto_exposure_max_ev" => Some(AE_MAX_EV_RANGE),
         "auto_exposure_speed" => Some(AE_SPEED_RANGE),
         "mouse_sensitivity" => Some(MOUSE_SENSITIVITY_RANGE),
+        "fov" => Some(FOV_RANGE),
         _ => None,
     }
 }
@@ -507,6 +517,8 @@ pub(crate) fn format_slider_value(key: &str, value: f32) -> String {
         "vignette" | "lut_strength" => format!("{}%", (value * 100.0).round() as i32),
         // Mouse sensitivity is a whole-number 1..100 scale.
         "mouse_sensitivity" => format!("{}", value.round() as i32),
+        // Field of view reads in whole degrees.
+        "fov" => format!("{}\u{00b0}", value.round() as i32),
         _ => format!("{value:.2}"),
     }
 }
@@ -542,6 +554,8 @@ pub(crate) fn slider_apply_value(key: &str, value: f32) -> f32 {
             let v = value.clamp(MOUSE_SENSITIVITY_RANGE.0, MOUSE_SENSITIVITY_RANGE.1);
             MOUSE_SENS_MIN + (MOUSE_SENS_MAX - MOUSE_SENS_MIN) * (v - 1.0) / 99.0
         }
+        // FOV is stored as degrees, only clamped to the slider range.
+        "fov" => value.clamp(FOV_RANGE.0, FOV_RANGE.1),
         _ => value,
     }
 }
@@ -708,6 +722,25 @@ mod tests {
             (1.0..=100.0).contains(&def),
             "default UI value {def} in range"
         );
+    }
+
+    #[test]
+    fn fov_is_a_degrees_slider() {
+        // It is a slider (range present), not a cycle row.
+        assert_eq!(slider_range("fov"), Some((50.0, 100.0)));
+        assert!(options("fov").is_none());
+        // The slider value IS the degrees: apply only clamps, recover is identity.
+        for &deg in &[50.0_f32, 75.0, 100.0] {
+            let stored = slider_apply_value("fov", deg);
+            assert!((stored - deg).abs() < 1.0e-6);
+            assert!((slider_recover_value("fov", stored) - deg).abs() < 1.0e-6);
+        }
+        // Out-of-range values clamp to the span.
+        assert_eq!(slider_apply_value("fov", 10.0), 50.0);
+        assert_eq!(slider_apply_value("fov", 200.0), 100.0);
+        // The label reads in whole degrees, and the default sits inside the track.
+        assert_eq!(format_slider_value("fov", 74.6), "75\u{00b0}");
+        assert!((50.0..=100.0).contains(&DEFAULT_FOV));
     }
 
     #[test]

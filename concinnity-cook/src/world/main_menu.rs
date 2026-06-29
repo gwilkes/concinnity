@@ -57,7 +57,7 @@ const VIDEO_ADVANCED_ROWS: [(&str, &str); 7] = [
 // `ambient_intensity` are pure `PostProcessParams` fields applied via
 // `update_post_process`; `ambient_intensity` rides a dedicated backend setter
 // (Metal live; see the client `graphics_system`).
-const VIDEO_ADVANCED_SLIDERS: [(&str, &str); 7] = [
+const VIDEO_ADVANCED_SLIDERS: [(&str, &str); 8] = [
     ("exposure", "Exposure"),
     ("bloom_intensity", "Bloom"),
     ("bloom_threshold", "Bloom Threshold"),
@@ -65,6 +65,8 @@ const VIDEO_ADVANCED_SLIDERS: [(&str, &str); 7] = [
     ("vignette", "Vignette"),
     ("lut_strength", "Color Grade"),
     ("ambient_intensity", "Ambient"),
+    // Camera vertical field of view (degrees). Live, independent of the preset.
+    ("fov", "Field of View"),
 ];
 // Quality toggles in the Video "Quality" collapsible group (collapsed by
 // default): the heavier render features. Each is an Off/On cycle row. The
@@ -1602,6 +1604,7 @@ mod tests {
             "sld_vignette",
             "sld_lut_strength",
             "sld_ambient_intensity",
+            "sld_fov",
         ] {
             assert_eq!(
                 in_advanced(key),

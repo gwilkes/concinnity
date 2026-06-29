@@ -592,7 +592,7 @@ impl GraphicsSystem {
                             backend.update_quality_params(super::derive_quality_settings(
                                 &self.post_config,
                             ));
-                        } else if cmd.setting != "mouse_sensitivity" {
+                        } else if cmd.setting != "mouse_sensitivity" && cmd.setting != "fov" {
                             backend.update_post_process(self.post_process);
                         }
                         // Ambient (IBL) scale lives in LightUniforms, not
@@ -601,14 +601,23 @@ impl GraphicsSystem {
                             self.ambient_intensity = stored;
                             backend.set_ambient_intensity(stored);
                         }
-                        // Mouse sensitivity is owned by the camera controller,
-                        // not the renderer: hand the new radians/pixel value
-                        // across as a ControlsCommand the camera reads this tick
-                        // (live, no restart).
+                        // Mouse sensitivity and FOV take effect on the camera, not
+                        // the renderer: hand the new value across as a
+                        // ControlsCommand the camera reads this tick (live, no
+                        // restart). Each carries only the field it changed.
                         if cmd.setting == "mouse_sensitivity" {
                             ctx.events_mut::<crate::assets::ControlsCommand>().send(
                                 crate::assets::ControlsCommand {
-                                    mouse_sensitivity: stored,
+                                    mouse_sensitivity: Some(stored),
+                                    fov_y_degrees: None,
+                                },
+                            );
+                        }
+                        if cmd.setting == "fov" {
+                            ctx.events_mut::<crate::assets::ControlsCommand>().send(
+                                crate::assets::ControlsCommand {
+                                    mouse_sensitivity: None,
+                                    fov_y_degrees: Some(stored),
                                 },
                             );
                         }
@@ -657,6 +666,9 @@ impl GraphicsSystem {
                                 "mouse_sensitivity" => {
                                     cfg.controls.mouse_sensitivity = Some(stored)
                                 }
+                                // FOV persists the clamped degrees (a graphics
+                                // preference, stored alongside the look sliders).
+                                "fov" => cfg.graphics.fov = Some(stored),
                                 _ => {}
                             }
                             if let Err(e) = cfg.save() {
@@ -1613,6 +1625,12 @@ impl GraphicsSystem {
                 .controls
                 .mouse_sensitivity
                 .unwrap_or(settings::DEFAULT_MOUSE_SENSITIVITY),
+            // FOV lives in the graphics store (degrees); read the persisted value
+            // or the authored default.
+            "fov" => crate::config::Settings::load()
+                .graphics
+                .fov
+                .unwrap_or(settings::DEFAULT_FOV),
             _ => return None,
         };
         // Invert `slider_apply_value` to the user-facing value (exposure: 2^ev ->

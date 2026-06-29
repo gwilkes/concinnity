@@ -110,6 +110,12 @@ pub struct GraphicsSettings {
     // `LightUniforms`, not `PostProcessParams`); re-applied at init.
     #[serde(default)]
     pub ambient_intensity: Option<f32>,
+    // Camera vertical field of view in degrees. `None` uses the world's authored
+    // `Camera3D.fov_y_degrees`. Applied live (Camera3DSystem updates the camera
+    // from a ControlsCommand; the projection rebuilds from it each frame) and
+    // re-applied at init. A user preference, independent of the quality preset.
+    #[serde(default)]
+    pub fov: Option<f32>,
     // Quality-feature toggles. Each `None` uses the world's
     // `PostProcessConfig` value. They gate render passes whose GPU resources
     // (pipelines, targets, acceleration structures) are built at init, so a
@@ -423,6 +429,7 @@ mod tests {
                 vignette: Some(0.3),
                 lut_strength: Some(0.75),
                 ambient_intensity: Some(1.5),
+                fov: Some(90.0),
                 taa: Some(true),
                 ssao: Some(false),
                 ssr: Some(true),

@@ -72,10 +72,17 @@ impl System for Camera3DSystem {
     fn init(&mut self, ctx: &mut PipelineContext) {
         self.last_step = Some(Instant::now());
 
-        // A persisted mouse-sensitivity choice (settings menu) overrides the
-        // camera's authored value. `None` keeps the authored value.
-        if let Some(s) = crate::config::Settings::load().controls.mouse_sensitivity {
+        // Persisted settings-menu choices override the camera's authored values.
+        // `None` keeps the authored value. Sensitivity lives on this controller;
+        // FOV lives on the Camera3D component, so it is written there directly.
+        let settings = crate::config::Settings::load();
+        if let Some(s) = settings.controls.mouse_sensitivity {
             self.mouse_sensitivity = s;
+        }
+        if let Some(fov) = settings.graphics.fov {
+            for camera in ctx.query_mut::<Camera3D>() {
+                camera.fov_y_degrees = fov;
+            }
         }
 
         // Collect interact targets: every entity carrying the Interactable tag.
@@ -94,12 +101,20 @@ impl System for Camera3DSystem {
     }
 
     fn step(&mut self, ctx: &mut PipelineContext) -> StepResult {
-        // Apply any live controls change (settings-menu sensitivity slider)
+        // Apply any live controls change (settings-menu sensitivity / FOV slider)
         // sent this tick by GraphicsSystem, which runs first. The last one this
-        // tick wins.
+        // tick wins. Sensitivity updates this controller immediately; FOV lives on
+        // the Camera3D component, so it is captured here and written in the camera
+        // loop below (which holds the mutable Camera3D borrow).
+        let mut pending_fov: Option<f32> = None;
         if let Some(events) = ctx.events::<ControlsCommand>() {
             for cmd in events.read(&mut self.controls_cursor) {
-                self.mouse_sensitivity = cmd.mouse_sensitivity;
+                if let Some(s) = cmd.mouse_sensitivity {
+                    self.mouse_sensitivity = s;
+                }
+                if let Some(fov) = cmd.fov_y_degrees {
+                    pending_fov = Some(fov);
+                }
             }
         }
 
@@ -122,6 +137,11 @@ impl System for Camera3DSystem {
 
         // update every Camera3D in the world (normally exactly one)
         for camera in ctx.query_mut::<Camera3D>() {
+            // A live FOV change (settings-menu slider) applies to the camera's
+            // projection on the next rendered frame.
+            if let Some(fov) = pending_fov {
+                camera.fov_y_degrees = fov;
+            }
             // mouse look
             camera.yaw -= input.mouse_dx * self.mouse_sensitivity;
             camera.pitch = (camera.pitch - input.mouse_dy * self.mouse_sensitivity).clamp(
@@ -323,7 +343,8 @@ mod tests {
         // reads it this tick. A mouse delta in the same frame must rotate by the
         // NEW sensitivity (0.005), not the controller's 0.001.
         world.events_mut::<ControlsCommand>().send(ControlsCommand {
-            mouse_sensitivity: 0.005,
+            mouse_sensitivity: Some(0.005),
+            fov_y_degrees: None,
         });
         world.add_component(FrameInput {
             mouse_dx: 10.0,
@@ -335,6 +356,64 @@ mod tests {
         assert!(
             (yaw - (-10.0 * 0.005)).abs() < 1.0e-6,
             "yaw {yaw} should reflect the live sensitivity 0.005"
+        );
+    }
+
+    // A ControlsCommand carrying a new FOV updates the Camera3D's fov_y_degrees
+    // live (the projection is rebuilt from it each frame), and an event with
+    // fov_y_degrees: None leaves the FOV untouched. This is the settings-menu FOV
+    // slider applying without a restart.
+    #[test]
+    fn controls_command_updates_fov_live() {
+        use crate::assets::{ControlsCommand, FrameInput};
+
+        let mut world = World::new_empty();
+        let ctrl = CameraController {
+            free_fly: true,
+            ..CameraController::default()
+        };
+        world.add_component(camera(Some(ctrl)));
+        world.start().unwrap();
+
+        // The camera starts at the authored 75 degrees.
+        let fov0 = world
+            .query::<Camera3D>()
+            .next()
+            .map(|c| c.fov_y_degrees)
+            .unwrap();
+        assert!((fov0 - 75.0).abs() < 1.0e-6);
+
+        // A FOV-only command applies this tick; a sensitivity-only command does
+        // not disturb the FOV.
+        world.events_mut::<ControlsCommand>().send(ControlsCommand {
+            mouse_sensitivity: None,
+            fov_y_degrees: Some(90.0),
+        });
+        world.add_component(FrameInput::default());
+        world.step();
+        let fov1 = world
+            .query::<Camera3D>()
+            .next()
+            .map(|c| c.fov_y_degrees)
+            .unwrap();
+        assert!(
+            (fov1 - 90.0).abs() < 1.0e-6,
+            "fov {fov1} should reflect the live FOV 90"
+        );
+
+        world.events_mut::<ControlsCommand>().send(ControlsCommand {
+            mouse_sensitivity: Some(0.004),
+            fov_y_degrees: None,
+        });
+        world.step();
+        let fov2 = world
+            .query::<Camera3D>()
+            .next()
+            .map(|c| c.fov_y_degrees)
+            .unwrap();
+        assert!(
+            (fov2 - 90.0).abs() < 1.0e-6,
+            "fov {fov2} should be unchanged by a sensitivity-only command"
         );
     }
 

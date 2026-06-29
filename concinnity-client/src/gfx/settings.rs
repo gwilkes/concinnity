@@ -61,6 +61,14 @@ const WINDOW_MODE_OPTIONS: [&str; 3] = ["Windowed", "Borderless", "Fullscreen"];
 // `render_scale_at` / `render_scale_index`.
 const RENDER_SCALE_OPTIONS: [&str; 4] = ["Quality", "Balanced", "Performance", "Ultra"];
 
+// Frame-rate cap options (Video Display group), in cycle order. "Unlimited" is 0
+// (no cap); the rest are target FPS. A CPU-side frame pacer in the render loop
+// enforces them, so they compose with vsync (the more restrictive wins). Indices
+// map via the `fps_cap_*` helpers below (an authored cap off the discrete levels
+// snaps to the nearest). Applied live (the pacer reads the value each frame).
+const FPS_CAP_OPTIONS: [&str; 6] = ["Unlimited", "30", "60", "120", "144", "240"];
+const FPS_CAP_VALUES: [u32; 6] = [0, 30, 60, 120, 144, 240];
+
 // SSGI gather sub-quality dropdowns. The gather clamps rays to [1,32] and steps
 // to [1,64]; these are the menu's discrete levels, in cycle order. Resolution is
 // finest-first (Full/Half/Quarter), matching the enum. Indices map via the
@@ -170,6 +178,7 @@ pub(crate) fn options(key: &str) -> Option<&'static [&'static str]> {
         "vsync" => Some(&VSYNC_OPTIONS),
         "window_mode" => Some(&WINDOW_MODE_OPTIONS),
         "render_scale" => Some(&RENDER_SCALE_OPTIONS),
+        "fps_cap" => Some(&FPS_CAP_OPTIONS),
         "window_size" => Some(&WINDOW_SIZE_LABELS),
         "master_volume" => Some(&MASTER_VOLUME_OPTIONS),
         "aa_mode" => Some(&AA_MODE_OPTIONS),
@@ -365,6 +374,16 @@ pub(crate) fn anisotropy_at(index: usize) -> u32 {
 }
 pub(crate) fn anisotropy_index(level: u32) -> usize {
     nearest_count_index(&ANISOTROPY_LEVELS, level)
+}
+
+// Frame-rate cap (FPS) for an option index, and the menu index nearest an
+// authored cap (the world may author a cap off the discrete levels; the row then
+// shows the closest one). The default fallback is "Unlimited" (index 0).
+pub(crate) fn fps_cap_at(index: usize) -> u32 {
+    *FPS_CAP_VALUES.get(index).unwrap_or(&FPS_CAP_VALUES[0])
+}
+pub(crate) fn fps_cap_index(cap: u32) -> usize {
+    nearest_count_index(&FPS_CAP_VALUES, cap)
 }
 
 // Frames-in-flight (ring-buffer depth) for an option index, and the index for a
@@ -716,6 +735,21 @@ mod tests {
         assert_eq!(AA_MODE_OPTIONS.len(), 3);
         // An out-of-range index falls back to the FXAA default.
         assert_eq!(aa_mode_at(9), AaMode::Fxaa);
+    }
+
+    #[test]
+    fn fps_cap_round_trips_and_snaps() {
+        assert_eq!(FPS_CAP_OPTIONS.len(), FPS_CAP_VALUES.len());
+        for (i, &cap) in FPS_CAP_VALUES.iter().enumerate() {
+            assert_eq!(fps_cap_index(cap), i);
+            assert_eq!(fps_cap_at(i), cap);
+        }
+        // "Unlimited" is 0 and the index-0 fallback.
+        assert_eq!(fps_cap_at(0), 0);
+        assert_eq!(fps_cap_at(99), 0);
+        // An authored cap off the discrete levels snaps to the nearest.
+        assert_eq!(fps_cap_index(58), fps_cap_index(60));
+        assert_eq!(fps_cap_index(1000), FPS_CAP_VALUES.len() - 1);
     }
 
     #[test]

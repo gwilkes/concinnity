@@ -23,6 +23,7 @@ is not user-configurable.
 - `max_frames`: An integer. Cap the render loop at this many frames, then exit. Unset runs until the window is closed.
 - `frames_in_flight`: An integer. Preferred number of frames in flight (1-3). Higher can smooth pacing at the cost of input latency. Defaults to `2`.
 - `vsync`: A boolean. Cap the frame rate to the display refresh (vsync). Defaults to `false`: the render loop runs uncapped (DirectX presents with tearing allowed, Vulkan uses a mailbox present mode), which is what a benchmark wants. Set to `true` to lock presentation to the monitor refresh, eliminating tearing and the wasted frames that never reach the screen.
+- `fps_cap`: An integer. Cap the frame rate to this many frames per second. `0` (default) leaves the loop uncapped. The cap is a CPU-side frame pacer, so it composes with `vsync`: the more restrictive of the two wins. Useful for limiting heat, fan noise, and power draw, or matching a fixed refresh.
 - `clear_color`: An array of 4 floats. Background clear colour [r, g, b, a] in linear 0..1 space. Defaults to `[0.01, 0.01, 0.02, 1.0]`.
 - `rotation_speed`: A float. Rotation speed of the demo object in radians per second. Only used when no camera is present. Defaults to `1.0`.
 - `shadow_map_size`: An integer. Shadow map resolution in texels (e.g. 2048). Set to 0 to disable shadows. Defaults to `2048`.

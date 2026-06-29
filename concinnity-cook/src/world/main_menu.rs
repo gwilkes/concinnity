@@ -30,8 +30,9 @@ const SETTINGS_TABS: [(&str, &str); 3] = [
 // Setting rows per tab, top to bottom: (setting key, display label). The runtime
 // (`concinnity_client::gfx::settings`) knows each key's options and how to apply
 // it; this only chooses which rows appear.
-const VIDEO_ROWS: [(&str, &str); 3] = [
+const VIDEO_ROWS: [(&str, &str); 4] = [
     ("vsync", "Vsync"),
+    ("fps_cap", "Frame Rate"),
     ("window_mode", "Window Mode"),
     ("window_size", "Window Size"),
 ];
@@ -1184,6 +1185,7 @@ mod tests {
         expand_main_menus(&mut assets).unwrap();
         for (setting, label) in [
             ("vsync", "Vsync"),
+            ("fps_cap", "Frame Rate"),
             ("window_mode", "Window Mode"),
             ("window_size", "Window Size"),
             ("render_scale", "Render Scale"),

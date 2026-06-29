@@ -67,6 +67,11 @@ pub struct GraphicsSettings {
     // Display sync (vsync). `None` uses the world's `GraphicsConfig.vsync`.
     #[serde(default)]
     pub vsync: Option<bool>,
+    // Frame-rate cap in FPS (0 = unlimited). `None` uses the world's
+    // `GraphicsConfig.fps_cap`. Applied live (the render loop's frame pacer reads
+    // it each frame); independent of the quality preset.
+    #[serde(default)]
+    pub fps_cap: Option<u32>,
     // Window mode (windowed / borderless / fullscreen). `None` uses the world's
     // `Window.mode`. Applied live.
     #[serde(default)]
@@ -432,6 +437,7 @@ mod tests {
             graphics: GraphicsSettings {
                 quality_preset: Some(crate::gfx::quality_preset::QualityPreset::High),
                 vsync: Some(true),
+                fps_cap: Some(144),
                 window_size: Some([1920, 1080]),
                 exposure_ev: Some(-1.5),
                 bloom_intensity: Some(0.8),

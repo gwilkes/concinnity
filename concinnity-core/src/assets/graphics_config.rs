@@ -48,6 +48,11 @@ pub struct GraphicsConfig {
     /// to `true` to lock presentation to the monitor refresh, eliminating tearing
     /// and the wasted frames that never reach the screen.
     pub vsync: bool,
+    /// Cap the frame rate to this many frames per second. `0` (default) leaves
+    /// the loop uncapped. The cap is a CPU-side frame pacer, so it composes with
+    /// `vsync`: the more restrictive of the two wins. Useful for limiting heat,
+    /// fan noise, and power draw, or matching a fixed refresh.
+    pub fps_cap: u32,
     /// Background clear colour [r, g, b, a] in linear 0..1 space.
     pub clear_color: [f32; 4],
     /// Rotation speed of the demo object in radians per second. Only used when
@@ -78,6 +83,7 @@ impl Default for GraphicsConfig {
             max_frames: None,
             frames_in_flight: 2,
             vsync: false,
+            fps_cap: 0,
             clear_color: [0.01, 0.01, 0.02, 1.0],
             rotation_speed: 1.0,
             shadow_map_size: 2048,
@@ -196,6 +202,18 @@ mod tests {
         // Explicit true is honoured.
         let cfg: GraphicsConfig = serde_json::from_str(r#"{"vsync":true}"#).expect("parse");
         assert!(cfg.vsync);
+    }
+
+    #[test]
+    fn fps_cap_defaults_to_unlimited_and_round_trips() {
+        // Omitted -> 0 (uncapped).
+        assert_eq!(GraphicsConfig::default().fps_cap, 0);
+        let cfg: GraphicsConfig =
+            serde_json::from_str(r#"{"shadow_map_size":1024}"#).expect("parse");
+        assert_eq!(cfg.fps_cap, 0);
+        // Explicit cap is honoured.
+        let cfg: GraphicsConfig = serde_json::from_str(r#"{"fps_cap":60}"#).expect("parse");
+        assert_eq!(cfg.fps_cap, 60);
     }
 
     #[test]

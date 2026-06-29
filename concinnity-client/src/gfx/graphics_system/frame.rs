@@ -11,6 +11,7 @@ use crate::gfx::{
     draw_list::{self},
     scene_reel, settings, sprite as gfx_sprite, text,
 };
+use std::time::{Duration, Instant};
 
 use super::helpers::*;
 use super::*;
@@ -129,6 +130,19 @@ fn rebind_key_of(action: &str) -> Option<&str> {
         .filter(|k| !k.is_empty())
 }
 
+// Frame-pacing math for the FPS cap, split from the sleep so the drift / no-burst
+// logic is unit-testable. Given the current time, the previously scheduled
+// deadline (if any), and the target frame interval, returns `(wait_until, next)`:
+// the deadline to hold this frame's start to, and the deadline to store for the
+// next frame. When the previous deadline is still in the future the cap is met by
+// waiting to it and accumulating exactly (no drift); when it has already passed
+// (a frame that overran the budget) it resets to `now` so a slow frame never
+// triggers a catch-up burst of un-paced frames.
+fn pace_deadline(now: Instant, prev: Option<Instant>, target: Duration) -> (Instant, Instant) {
+    let wait_until = prev.filter(|d| *d > now).unwrap_or(now);
+    (wait_until, wait_until + target)
+}
+
 // The setting key of a cycle row's forward stepper (`setting:<key>:next`), or
 // `None`. A cycle row emits a matching `:prev` region with the same value label,
 // so capturing the `:next` region alone maps each cycle key once.
@@ -143,6 +157,29 @@ impl GraphicsSystem {
     pub(super) fn run_step(&mut self, ctx: &mut PipelineContext) -> StepResult {
         if self.failed {
             return StepResult::Done;
+        }
+
+        // Frame-rate cap: hold each frame's start to the target interval so the
+        // loop presents at most `fps_cap` times a second. A CPU pacer here is
+        // backend-agnostic -- every backend's present runs later in this same
+        // step -- and runs before `elapsed` below so `dt` reflects the capped
+        // interval. Coarse-sleep to ~1ms before the deadline, then spin for
+        // sub-millisecond precision. `0` = unlimited (skip, and clear the running
+        // deadline so re-enabling starts fresh).
+        if self.fps_cap > 0 {
+            let target = Duration::from_secs_f64(1.0 / self.fps_cap as f64);
+            let (wait_until, next) =
+                pace_deadline(Instant::now(), self.next_frame_deadline, target);
+            while let Some(remaining) = wait_until.checked_duration_since(Instant::now()) {
+                if remaining > Duration::from_millis(1) {
+                    std::thread::sleep(remaining - Duration::from_millis(1));
+                } else {
+                    std::hint::spin_loop();
+                }
+            }
+            self.next_frame_deadline = Some(next);
+        } else {
+            self.next_frame_deadline = None;
         }
 
         let elapsed = self
@@ -874,6 +911,19 @@ impl GraphicsSystem {
                             self.vsync = next == 1;
                             backend.set_vsync(self.vsync);
                             cfg.graphics.vsync = Some(self.vsync);
+                            Some(opts[next])
+                        }
+                        "fps_cap" => {
+                            let cur = settings::fps_cap_index(self.fps_cap);
+                            let next = settings::cycle(cur, opts.len(), cmd.op);
+                            self.fps_cap = settings::fps_cap_at(next);
+                            // Live with no backend call: the pacer at the top of
+                            // run_step reads self.fps_cap each frame. Clearing the
+                            // running deadline re-bases the pacer from the next
+                            // frame, so changing the cap never leaves one stale
+                            // long wait. Independent of the preset (no Custom flip).
+                            self.next_frame_deadline = None;
+                            cfg.graphics.fps_cap = Some(self.fps_cap);
                             Some(opts[next])
                         }
                         "window_mode" => {
@@ -1699,6 +1749,41 @@ impl GraphicsSystem {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn pace_deadline_first_frame_does_not_wait() {
+        // No previous deadline: wait until now (no sleep), schedule now + target.
+        let now = Instant::now();
+        let target = Duration::from_millis(16);
+        let (wait_until, next) = pace_deadline(now, None, target);
+        assert_eq!(wait_until, now);
+        assert_eq!(next, now + target);
+    }
+
+    #[test]
+    fn pace_deadline_accumulates_exactly_when_ahead() {
+        // A frame finished early: the previous deadline is still in the future,
+        // so hold to it and accumulate exactly (no drift from `now`).
+        let now = Instant::now();
+        let target = Duration::from_millis(16);
+        let prev = now + Duration::from_millis(10);
+        let (wait_until, next) = pace_deadline(now, Some(prev), target);
+        assert_eq!(wait_until, prev);
+        assert_eq!(next, prev + target);
+    }
+
+    #[test]
+    fn pace_deadline_resets_after_overrun_without_burst() {
+        // The frame overran: the previous deadline is in the past, so re-base to
+        // `now` (no wait this frame) and schedule from now -- never a catch-up
+        // burst of un-paced frames.
+        let now = Instant::now();
+        let target = Duration::from_millis(16);
+        let past = now - Duration::from_millis(5);
+        let (wait_until, next) = pace_deadline(now, Some(past), target);
+        assert_eq!(wait_until, now);
+        assert_eq!(next, now + target);
+    }
 
     // A gated value label pulls in every element of the scroll row that holds
     // it (the row's background, name, value, and stepper glyphs), so the whole

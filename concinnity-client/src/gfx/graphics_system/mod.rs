@@ -51,6 +51,13 @@ pub struct GraphicsSystem {
     clear_color: [f32; 4],
     frames_in_flight: usize,
     vsync: bool,
+    // Frame-rate cap in FPS (GraphicsConfig.fps_cap; 0 = unlimited). Applied live
+    // by a CPU frame pacer at the top of each render step, so it is backend-
+    // agnostic and needs no trait method. Independent of the quality preset (a
+    // user/hardware preference, like vsync). `next_frame_deadline` is the pacer's
+    // running target for the next frame's start.
+    fps_cap: u32,
+    next_frame_deadline: Option<Instant>,
     max_frames: Option<u64>,
     shadow_map_size: u32,
     shadow_update: crate::assets::ShadowUpdate,
@@ -358,6 +365,8 @@ impl GraphicsSystem {
             clear_color: [0.01, 0.01, 0.02, 1.0],
             frames_in_flight: 2,
             vsync: false,
+            fps_cap: 0,
+            next_frame_deadline: None,
             max_frames: None,
             shadow_map_size: 2048,
             shadow_update: crate::assets::ShadowUpdate::default(),

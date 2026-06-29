@@ -79,6 +79,7 @@ impl GraphicsSystem {
             let args = c.to_args();
             self.frames_in_flight = args.frames_in_flight as usize;
             self.vsync = args.vsync;
+            self.fps_cap = args.fps_cap;
             self.clear_color = args.clear_color;
             self.max_frames = args.max_frames;
             self.shadow_map_size = args.shadow_map_size;
@@ -91,6 +92,12 @@ impl GraphicsSystem {
         // window_size, so it wins over both the authored value and the default.
         if let Some(v) = user_graphics.vsync {
             self.vsync = v;
+        }
+        // A persisted frame-rate cap overrides the world's value (0 = unlimited),
+        // applied live by the render-step pacer. Independent of the quality preset,
+        // like vsync, so no ceiling clamp.
+        if let Some(v) = user_graphics.fps_cap {
+            self.fps_cap = v;
         }
 
         // Shadow quality knobs (GraphicsConfig-sourced). Snapshot the world's
@@ -473,6 +480,7 @@ impl GraphicsSystem {
             self.window_args.height,
             self.render_scale,
         );
+        let fps_cap_val = self.fps_cap;
         // Display-group toggle states for the value-label sync (copies, so the
         // closure below does not borrow self while ctx is borrowed mutably).
         let (display_upscaling, display_hdr, display_pq) =
@@ -502,6 +510,7 @@ impl GraphicsSystem {
         let quality_cfg = self.post_config.clone();
         sync_setting_value_labels(ctx, |key| match key {
             "vsync" => Some(vsync as usize),
+            "fps_cap" => Some(crate::gfx::settings::fps_cap_index(fps_cap_val)),
             "window_mode" => Some(crate::gfx::settings::window_mode_index(mode)),
             "window_size" => Some(crate::gfx::settings::window_size_index(win_w, win_h)),
             "render_scale" => Some(crate::gfx::settings::render_scale_index(scale)),

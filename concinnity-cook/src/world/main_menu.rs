@@ -38,13 +38,18 @@ const VIDEO_ROWS: [(&str, &str); 3] = [
 // Rows tucked under the Video "Advanced" collapsible group (collapsed by
 // default), so the top of the Video tab stays uncrowded. More live
 // post-process sliders join these later. Cycle rows then slider rows.
-const VIDEO_ADVANCED_ROWS: [(&str, &str); 4] = [
+const VIDEO_ADVANCED_ROWS: [(&str, &str); 7] = [
     ("render_scale", "Render Scale"),
     // Display-output / upscaling preferences (Off/On + render-scale cycle).
     // Restart-required and independent of the quality preset.
     ("temporal_upscaling", "Temporal Upscaling"),
     ("hdr_display", "HDR Display"),
     ("hdr_pq", "HDR10 (PQ)"),
+    // System / streaming restart preferences. Buffering depth, two-pass occlusion
+    // culling, and texture-streaming quality (pool size + upload budget together).
+    ("frames_in_flight", "Frame Buffering"),
+    ("occlusion_two_pass", "Occlusion Culling"),
+    ("texture_quality", "Texture Quality"),
 ];
 // Live post-process sliders in the Advanced group. Each key's value range,
 // display format, and apply path live in the client (`concinnity_client::gfx::settings` +
@@ -52,10 +57,11 @@ const VIDEO_ADVANCED_ROWS: [(&str, &str); 4] = [
 // `ambient_intensity` are pure `PostProcessParams` fields applied via
 // `update_post_process`; `ambient_intensity` rides a dedicated backend setter
 // (Metal live; see the client `graphics_system`).
-const VIDEO_ADVANCED_SLIDERS: [(&str, &str); 6] = [
+const VIDEO_ADVANCED_SLIDERS: [(&str, &str); 7] = [
     ("exposure", "Exposure"),
     ("bloom_intensity", "Bloom"),
     ("bloom_threshold", "Bloom Threshold"),
+    ("bloom_knee", "Bloom Knee"),
     ("vignette", "Vignette"),
     ("lut_strength", "Color Grade"),
     ("ambient_intensity", "Ambient"),
@@ -84,6 +90,21 @@ const VIDEO_QUALITY_ROWS: [(&str, &str); 12] = [
     ("shadow_map_size", "Shadow Resolution"),
     ("shadow_update", "Shadow Update"),
     ("auto_exposure", "Auto Exposure"),
+];
+// Per-feature sub-quality sliders in the Video "Quality" group, tuning the
+// features the toggles / dropdowns above enable. Applied live on Metal by
+// mutating the backend's stored *Settings (no pass rebuild); look-tuning knobs,
+// independent of the master quality preset.
+const VIDEO_QUALITY_SLIDERS: [(&str, &str); 9] = [
+    ("ssao_radius", "AO Radius"),
+    ("ssao_intensity", "AO Intensity"),
+    ("ssr_intensity", "Reflection Intensity"),
+    ("ssr_max_distance", "Reflection Distance"),
+    ("ssgi_intensity", "GI Intensity"),
+    ("ssgi_max_distance", "GI Distance"),
+    ("auto_exposure_min_ev", "Auto Exposure Min"),
+    ("auto_exposure_max_ev", "Auto Exposure Max"),
+    ("auto_exposure_speed", "Auto Exposure Speed"),
 ];
 const AUDIO_ROWS: [(&str, &str); 1] = [("master_volume", "Master Volume")];
 // Controls-tab sliders, top to bottom: (setting key, display label). Mouse
@@ -742,6 +763,11 @@ fn settings_body_rows(active: &str) -> (Vec<BodyRow>, Vec<GroupSpec>) {
             rows.push(BodyRow::GroupHeader(0, "Quality"));
             for &(s, l) in &VIDEO_QUALITY_ROWS {
                 rows.push(BodyRow::Option(s, l, 0));
+            }
+            // The per-feature sub-quality sliders follow the toggles in the same
+            // Quality group.
+            for &(s, l) in &VIDEO_QUALITY_SLIDERS {
+                rows.push(BodyRow::Slider(s, l, 0));
             }
             rows.push(BodyRow::GroupHeader(1, "Advanced"));
             for &(s, l) in &VIDEO_ADVANCED_ROWS {
@@ -1569,6 +1595,7 @@ mod tests {
         for key in [
             "sld_bloom_intensity",
             "sld_bloom_threshold",
+            "sld_bloom_knee",
             "sld_vignette",
             "sld_lut_strength",
             "sld_ambient_intensity",
@@ -1579,8 +1606,16 @@ mod tests {
                 "{key} should be in the Advanced group"
             );
         }
-        // The display-output / upscaling preference rows also live in Advanced.
-        for key in ["opt_temporal_upscaling", "opt_hdr_display", "opt_hdr_pq"] {
+        // The display-output / upscaling preference + system / streaming restart
+        // rows also live in Advanced.
+        for key in [
+            "opt_temporal_upscaling",
+            "opt_hdr_display",
+            "opt_hdr_pq",
+            "opt_frames_in_flight",
+            "opt_occlusion_two_pass",
+            "opt_texture_quality",
+        ] {
             assert_eq!(
                 in_advanced(key),
                 Some(1),
@@ -1638,6 +1673,16 @@ mod tests {
             "opt_shadow_map_size",
             "opt_shadow_update",
             "opt_auto_exposure",
+            // The per-feature sub-quality sliders share the Quality group.
+            "sld_ssao_radius",
+            "sld_ssao_intensity",
+            "sld_ssr_intensity",
+            "sld_ssr_max_distance",
+            "sld_ssgi_intensity",
+            "sld_ssgi_max_distance",
+            "sld_auto_exposure_min_ev",
+            "sld_auto_exposure_max_ev",
+            "sld_auto_exposure_speed",
         ] {
             assert_eq!(
                 group_of(key),

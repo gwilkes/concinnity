@@ -93,6 +93,10 @@ pub struct GraphicsSettings {
     // `PostProcessConfig.bloom_threshold`. Applied live.
     #[serde(default)]
     pub bloom_threshold: Option<f32>,
+    // Bloom soft-knee width. `None` uses the world's `PostProcessConfig.bloom_knee`.
+    // Applied live (a `PostProcessParams` field, like the other bloom sliders).
+    #[serde(default)]
+    pub bloom_knee: Option<f32>,
     // Vignette strength in [0, 1]. `None` uses the world's
     // `PostProcessConfig.vignette_strength`. Applied live.
     #[serde(default)]
@@ -145,6 +149,29 @@ pub struct GraphicsSettings {
     // the SSGI sub-quality above (only bites when a reflection feature is on).
     #[serde(default)]
     pub reflection_blur_resolution: Option<crate::assets::ReflectionBlurResolution>,
+    // Per-feature sub-quality tunables (SSAO radius / intensity, SSR intensity /
+    // distance, SSGI intensity / distance, auto-exposure EV bounds + speed). Each
+    // `None` uses the world's `PostProcessConfig` value. Applied live on Metal via
+    // `update_quality_params` (the backend re-reads them into a per-frame uniform,
+    // no pass rebuild); look-tuning knobs, independent of the quality preset.
+    #[serde(default)]
+    pub ssao_radius: Option<f32>,
+    #[serde(default)]
+    pub ssao_intensity: Option<f32>,
+    #[serde(default)]
+    pub ssr_intensity: Option<f32>,
+    #[serde(default)]
+    pub ssr_max_distance: Option<f32>,
+    #[serde(default)]
+    pub ssgi_intensity: Option<f32>,
+    #[serde(default)]
+    pub ssgi_max_distance: Option<f32>,
+    #[serde(default)]
+    pub auto_exposure_min_ev: Option<f32>,
+    #[serde(default)]
+    pub auto_exposure_max_ev: Option<f32>,
+    #[serde(default)]
+    pub auto_exposure_speed: Option<f32>,
     // Shadow quality: cascade map resolution in texels (0 disables shadows) and
     // re-render cadence (`GraphicsConfig.shadow_map_size` / `shadow_update`).
     // `None` uses the world's value. Resolution is restart-required (the shadow
@@ -165,6 +192,20 @@ pub struct GraphicsSettings {
     pub hdr_display: Option<bool>,
     #[serde(default)]
     pub hdr_pq: Option<bool>,
+    // System / streaming restart preferences, independent of the master preset
+    // (like the display rows above) and each restart-required: ring-buffer depth
+    // (`GraphicsConfig.frames_in_flight`), two-pass occlusion culling
+    // (`PostProcessConfig.occlusion_two_pass`), and the texture-streaming pool /
+    // per-frame upload budget (`StreamingConfig.texture_cap` / `texture_budget`,
+    // driven together by one "Texture Quality" row). `None` uses the world's value.
+    #[serde(default)]
+    pub frames_in_flight: Option<u32>,
+    #[serde(default)]
+    pub occlusion_two_pass: Option<bool>,
+    #[serde(default)]
+    pub texture_cap: Option<u32>,
+    #[serde(default)]
+    pub texture_budget: Option<u32>,
 }
 
 // Persisted overrides for audio settings.
@@ -386,11 +427,25 @@ mod tests {
                 ssgi_rays: Some(16),
                 ssgi_steps: Some(24),
                 reflection_blur_resolution: Some(crate::assets::ReflectionBlurResolution::Full),
+                bloom_knee: Some(0.4),
+                ssao_radius: Some(0.6),
+                ssao_intensity: Some(1.2),
+                ssr_intensity: Some(0.8),
+                ssr_max_distance: Some(50.0),
+                ssgi_intensity: Some(0.7),
+                ssgi_max_distance: Some(10.0),
+                auto_exposure_min_ev: Some(-6.0),
+                auto_exposure_max_ev: Some(6.0),
+                auto_exposure_speed: Some(2.0),
                 shadow_map_size: Some(4096),
                 shadow_update: Some(crate::assets::ShadowUpdate::EveryFrame),
                 temporal_upscaling: Some(true),
                 hdr_display: Some(true),
                 hdr_pq: Some(false),
+                frames_in_flight: Some(3),
+                occlusion_two_pass: Some(true),
+                texture_cap: Some(192),
+                texture_budget: Some(8),
                 ..Default::default()
             },
             audio: AudioSettings {

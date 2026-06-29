@@ -555,18 +555,44 @@ impl GraphicsSystem {
                         // `settings::slider_apply_value` (shared with the
                         // persisted re-apply at init, so they cannot diverge).
                         let stored = settings::slider_apply_value(&cmd.setting, value);
+                        let is_qparam = settings::is_quality_param_slider(&cmd.setting);
                         match cmd.setting.as_str() {
                             "exposure" => self.post_process.exposure = stored,
                             "bloom_intensity" => self.post_process.bloom_intensity = stored,
                             "bloom_threshold" => self.post_process.bloom_threshold = stored,
+                            "bloom_knee" => self.post_process.bloom_knee = stored,
                             "vignette" => self.post_process.vignette = stored,
                             "lut_strength" => self.post_process.lut_strength = stored,
+                            // Per-feature sub-quality sliders live on the stored
+                            // PostProcessConfig (the source of truth a later rebuild
+                            // re-derives from); the live apply below mutates the
+                            // backend's stored settings without a rebuild.
+                            "ssao_radius" => self.post_config.ssao_radius = stored,
+                            "ssao_intensity" => self.post_config.ssao_intensity = stored,
+                            "ssr_intensity" => self.post_config.ssr_intensity = stored,
+                            "ssr_max_distance" => self.post_config.ssr_max_distance = stored,
+                            "ssgi_intensity" => self.post_config.ssgi_intensity = stored,
+                            "ssgi_max_distance" => self.post_config.ssgi_max_distance = stored,
+                            "auto_exposure_min_ev" => {
+                                self.post_config.auto_exposure_min_ev = stored
+                            }
+                            "auto_exposure_max_ev" => {
+                                self.post_config.auto_exposure_max_ev = stored
+                            }
+                            "auto_exposure_speed" => self.post_config.auto_exposure_speed = stored,
                             _ => {}
                         }
-                        // Mouse sensitivity is not a render param, so it skips
-                        // the post-process push (the other sliders, incl. the
-                        // ambient re-push, are harmless).
-                        if cmd.setting != "mouse_sensitivity" {
+                        // Apply live. The sub-quality sliders mutate the backend's
+                        // stored *Settings via update_quality_params (re-read into a
+                        // per-frame uniform, no pass rebuild). The post-process
+                        // sliders push PostProcessParams. Mouse sensitivity is not a
+                        // render param, so it skips both (handled below); the ambient
+                        // re-push through update_post_process is harmless.
+                        if is_qparam {
+                            backend.update_quality_params(super::derive_quality_settings(
+                                &self.post_config,
+                            ));
+                        } else if cmd.setting != "mouse_sensitivity" {
                             backend.update_post_process(self.post_process);
                         }
                         // Ambient (IBL) scale lives in LightUniforms, not
@@ -607,9 +633,25 @@ impl GraphicsSystem {
                                 "exposure" => cfg.graphics.exposure_ev = Some(value),
                                 "bloom_intensity" => cfg.graphics.bloom_intensity = Some(value),
                                 "bloom_threshold" => cfg.graphics.bloom_threshold = Some(value),
+                                "bloom_knee" => cfg.graphics.bloom_knee = Some(value),
                                 "vignette" => cfg.graphics.vignette = Some(value),
                                 "lut_strength" => cfg.graphics.lut_strength = Some(value),
                                 "ambient_intensity" => cfg.graphics.ambient_intensity = Some(value),
+                                "ssao_radius" => cfg.graphics.ssao_radius = Some(value),
+                                "ssao_intensity" => cfg.graphics.ssao_intensity = Some(value),
+                                "ssr_intensity" => cfg.graphics.ssr_intensity = Some(value),
+                                "ssr_max_distance" => cfg.graphics.ssr_max_distance = Some(value),
+                                "ssgi_intensity" => cfg.graphics.ssgi_intensity = Some(value),
+                                "ssgi_max_distance" => cfg.graphics.ssgi_max_distance = Some(value),
+                                "auto_exposure_min_ev" => {
+                                    cfg.graphics.auto_exposure_min_ev = Some(value)
+                                }
+                                "auto_exposure_max_ev" => {
+                                    cfg.graphics.auto_exposure_max_ev = Some(value)
+                                }
+                                "auto_exposure_speed" => {
+                                    cfg.graphics.auto_exposure_speed = Some(value)
+                                }
                                 // Persist the radians/pixel value (what the
                                 // camera reads), not the 1..100 UI value.
                                 "mouse_sensitivity" => {
@@ -1023,6 +1065,40 @@ impl GraphicsSystem {
                                 "graphics_quality",
                                 self.quality_preset.name(),
                             );
+                            Some(opts[next])
+                        }
+                        // System / streaming restart rows. Restart-required (the
+                        // ring buffers / cull pipeline / streaming pool are sized
+                        // once at init), so persist + display only; independent of
+                        // the quality preset, so no Custom-flip and no live call.
+                        "frames_in_flight" => {
+                            let cur =
+                                settings::frames_in_flight_index(self.frames_in_flight as u32);
+                            let next = settings::cycle(cur, opts.len(), cmd.op);
+                            self.frames_in_flight = settings::frames_in_flight_at(next) as usize;
+                            cfg.graphics.frames_in_flight = Some(self.frames_in_flight as u32);
+                            Some(opts[next])
+                        }
+                        "occlusion_two_pass" => {
+                            let next = settings::cycle(
+                                self.occlusion_two_pass as usize,
+                                opts.len(),
+                                cmd.op,
+                            );
+                            self.occlusion_two_pass = next == 1;
+                            cfg.graphics.occlusion_two_pass = Some(self.occlusion_two_pass);
+                            Some(opts[next])
+                        }
+                        // One row drives both the streaming pool cap and the
+                        // per-frame upload budget.
+                        "texture_quality" => {
+                            let cur = settings::texture_quality_index(self.texture_cap);
+                            let next = settings::cycle(cur, opts.len(), cmd.op);
+                            let (cap, budget) = settings::texture_quality_at(next);
+                            self.texture_cap = cap;
+                            self.texture_budget = budget;
+                            cfg.graphics.texture_cap = Some(cap);
+                            cfg.graphics.texture_budget = Some(budget);
                             Some(opts[next])
                         }
                         _ => None,
@@ -1489,9 +1565,20 @@ impl GraphicsSystem {
             "exposure" => self.post_process.exposure,
             "bloom_intensity" => self.post_process.bloom_intensity,
             "bloom_threshold" => self.post_process.bloom_threshold,
+            "bloom_knee" => self.post_process.bloom_knee,
             "vignette" => self.post_process.vignette,
             "lut_strength" => self.post_process.lut_strength,
             "ambient_intensity" => self.ambient_intensity,
+            // Per-feature sub-quality sliders read from the stored PostProcessConfig.
+            "ssao_radius" => self.post_config.ssao_radius,
+            "ssao_intensity" => self.post_config.ssao_intensity,
+            "ssr_intensity" => self.post_config.ssr_intensity,
+            "ssr_max_distance" => self.post_config.ssr_max_distance,
+            "ssgi_intensity" => self.post_config.ssgi_intensity,
+            "ssgi_max_distance" => self.post_config.ssgi_max_distance,
+            "auto_exposure_min_ev" => self.post_config.auto_exposure_min_ev,
+            "auto_exposure_max_ev" => self.post_config.auto_exposure_max_ev,
+            "auto_exposure_speed" => self.post_config.auto_exposure_speed,
             // Mouse sensitivity lives in the controls store (radians/pixel), not
             // the render params; read the persisted value or the authored default.
             "mouse_sensitivity" => crate::config::Settings::load()

@@ -220,6 +220,14 @@ pub struct GraphicsSystem {
     // values are `shadow_map_size` / `shadow_update` above.
     authored_shadow_map_size: u32,
     authored_shadow_update: crate::assets::ShadowUpdate,
+    // System / streaming restart preferences (the Advanced "Frame Buffering",
+    // "Occlusion Culling", and "Texture Quality" rows). Resolved at init from the
+    // world's config overridden by any persisted choice, passed to the backend
+    // ctor / streamer, and held here so the rows display + cycle them. Restart-
+    // required, independent of the quality preset. `frames_in_flight` lives above.
+    occlusion_two_pass: bool,
+    texture_cap: u32,
+    texture_budget: u32,
 }
 
 // One key-rebind row's runtime bookkeeping: the action it rebinds and the value
@@ -385,6 +393,9 @@ impl GraphicsSystem {
             hdr_pq: false,
             authored_shadow_map_size: 2048,
             authored_shadow_update: crate::assets::ShadowUpdate::default(),
+            occlusion_two_pass: false,
+            texture_cap: 96,
+            texture_budget: 4,
         }
     }
 }

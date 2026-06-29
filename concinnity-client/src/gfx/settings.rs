@@ -85,6 +85,20 @@ const SHADOW_RESOLUTION_SIZES: [u32; 4] = [0, 1024, 2048, 4096];
 // Applied live (the cascade scheduler reads the policy each frame).
 const SHADOW_UPDATE_OPTIONS: [&str; 2] = ["Every Frame", "Hybrid"];
 
+// Frame-buffering (ring-buffer depth / frames-in-flight) options, in cycle order.
+// Lower is less latency, higher is smoother pacing. Restart-required (the ring
+// buffers are sized once at init). Indices map via `frames_in_flight_at/_index`.
+const FRAME_BUFFERING_OPTIONS: [&str; 3] = ["1", "2", "3"];
+const FRAME_BUFFERING_COUNTS: [u32; 3] = [1, 2, 3];
+// Texture-quality options: one row drives both the streaming pool size
+// (`texture_cap`, how many high-resolution textures stay resident) and the
+// per-frame upload budget (`texture_budget`, how fast they stream in). Restart-
+// required (the pool is sized once at init). Indices map via
+// `texture_quality_at/_index`; the index is recovered from the pool size.
+const TEXTURE_QUALITY_OPTIONS: [&str; 4] = ["Low", "Medium", "High", "Ultra"];
+const TEXTURE_QUALITY_CAPS: [u32; 4] = [48, 96, 192, 384];
+const TEXTURE_QUALITY_BUDGETS: [u32; 4] = [2, 4, 8, 12];
+
 // The cycle (dropdown) quality knobs governed by the preset ceiling like the
 // boolean QUALITY_TOGGLE_KEYS. Each rides the feature's live-reinit rebuild
 // (`apply_quality_settings`) -- the sub-tunable travels in its settings payload,
@@ -140,8 +154,12 @@ pub(crate) fn options(key: &str) -> Option<&'static [&'static str]> {
         "reflection_blur_resolution" => Some(&REFLECTION_BLUR_OPTIONS),
         "shadow_map_size" => Some(&SHADOW_RESOLUTION_OPTIONS),
         "shadow_update" => Some(&SHADOW_UPDATE_OPTIONS),
-        // Display-output / upscaling preference toggles (Off/On).
-        "temporal_upscaling" | "hdr_display" | "hdr_pq" => Some(&OFF_ON_OPTIONS),
+        "frames_in_flight" => Some(&FRAME_BUFFERING_OPTIONS),
+        "texture_quality" => Some(&TEXTURE_QUALITY_OPTIONS),
+        // Display-output / upscaling preference + occlusion toggles (Off/On).
+        "temporal_upscaling" | "hdr_display" | "hdr_pq" | "occlusion_two_pass" => {
+            Some(&OFF_ON_OPTIONS)
+        }
         key if is_quality_toggle(key) => Some(&OFF_ON_OPTIONS),
         _ => None,
     }
@@ -279,6 +297,29 @@ pub(crate) fn shadow_update_index(update: ShadowUpdate) -> usize {
     }
 }
 
+// Frames-in-flight (ring-buffer depth) for an option index, and the index for a
+// count. Order matches FRAME_BUFFERING_OPTIONS (1, 2, 3); an out-of-range count
+// snaps to the nearest level.
+pub(crate) fn frames_in_flight_at(index: usize) -> u32 {
+    *FRAME_BUFFERING_COUNTS
+        .get(index)
+        .unwrap_or(&FRAME_BUFFERING_COUNTS[1])
+}
+pub(crate) fn frames_in_flight_index(count: u32) -> usize {
+    nearest_count_index(&FRAME_BUFFERING_COUNTS, count)
+}
+
+// Texture-quality level for an option index -> the (pool cap, per-frame budget)
+// pair it sets, and the index recovered from a pool cap (the quality axis). An
+// authored cap off the discrete levels snaps to the nearest level.
+pub(crate) fn texture_quality_at(index: usize) -> (u32, u32) {
+    let i = index.min(TEXTURE_QUALITY_CAPS.len() - 1);
+    (TEXTURE_QUALITY_CAPS[i], TEXTURE_QUALITY_BUDGETS[i])
+}
+pub(crate) fn texture_quality_index(cap: u32) -> usize {
+    nearest_count_index(&TEXTURE_QUALITY_CAPS, cap)
+}
+
 // Window (width, height) for a preset index.
 pub(crate) fn window_size_at(index: usize) -> (u32, u32) {
     let p = WINDOW_SIZE_PRESETS
@@ -340,6 +381,46 @@ const BLOOM_THRESHOLD_RANGE: (f32, f32) = (0.0, 4.0);
 const VIGNETTE_RANGE: (f32, f32) = (0.0, 1.0);
 const LUT_STRENGTH_RANGE: (f32, f32) = (0.0, 1.0);
 const AMBIENT_RANGE: (f32, f32) = (0.0, 4.0);
+// Soft-knee width below the bloom threshold. Rides the live `update_post_process`
+// path alongside the other bloom sliders (a `PostProcessParams` field).
+const BLOOM_KNEE_RANGE: (f32, f32) = (0.0, 1.0);
+// Per-feature sub-quality slider ranges. The UI ceilings are practical; the
+// engine clamps the applied value in each feature's `*Settings::resolve`, mirrored
+// by `slider_apply_value`. These ride the live `update_quality_params` path (the
+// backend re-reads them into a per-frame uniform, no pass rebuild).
+const SSAO_RADIUS_RANGE: (f32, f32) = (0.05, 2.0);
+const SSAO_INTENSITY_RANGE: (f32, f32) = (0.0, 4.0);
+const SSR_INTENSITY_RANGE: (f32, f32) = (0.0, 1.0);
+const SSR_MAX_DISTANCE_RANGE: (f32, f32) = (1.0, 200.0);
+const SSGI_INTENSITY_RANGE: (f32, f32) = (0.0, 4.0);
+const SSGI_MAX_DISTANCE_RANGE: (f32, f32) = (0.5, 40.0);
+const AE_MIN_EV_RANGE: (f32, f32) = (-16.0, 16.0);
+const AE_MAX_EV_RANGE: (f32, f32) = (-16.0, 16.0);
+const AE_SPEED_RANGE: (f32, f32) = (0.1, 6.0);
+
+// The per-feature sub-quality slider keys, applied live by mutating the backend's
+// stored `*Settings` (via `update_quality_params`) rather than rebuilding the pass.
+// `bloom_knee` is deliberately NOT here: it is a `PostProcessParams` field and
+// rides `update_post_process` like the other bloom sliders. These are look-tuning
+// knobs, independent of the master quality preset (no ceiling, no Custom-flip),
+// like the exposure / bloom / ambient sliders.
+pub(crate) const QUALITY_PARAM_SLIDER_KEYS: [&str; 9] = [
+    "ssao_radius",
+    "ssao_intensity",
+    "ssr_intensity",
+    "ssr_max_distance",
+    "ssgi_intensity",
+    "ssgi_max_distance",
+    "auto_exposure_min_ev",
+    "auto_exposure_max_ev",
+    "auto_exposure_speed",
+];
+
+// Whether `key` is one of the per-feature sub-quality sliders (applied live via
+// `update_quality_params`, the stored-settings mutation path).
+pub(crate) fn is_quality_param_slider(key: &str) -> bool {
+    QUALITY_PARAM_SLIDER_KEYS.contains(&key)
+}
 // Mouse-sensitivity slider: a 1..100 UI scale (what the row shows) mapped
 // linearly to a radians-per-pixel value in [MOUSE_SENS_MIN, MOUSE_SENS_MAX] by
 // `slider_apply_value`. The endpoints span slow..fast; the camera's authored
@@ -358,6 +439,16 @@ pub(crate) fn slider_range(key: &str) -> Option<(f32, f32)> {
         "vignette" => Some(VIGNETTE_RANGE),
         "lut_strength" => Some(LUT_STRENGTH_RANGE),
         "ambient_intensity" => Some(AMBIENT_RANGE),
+        "bloom_knee" => Some(BLOOM_KNEE_RANGE),
+        "ssao_radius" => Some(SSAO_RADIUS_RANGE),
+        "ssao_intensity" => Some(SSAO_INTENSITY_RANGE),
+        "ssr_intensity" => Some(SSR_INTENSITY_RANGE),
+        "ssr_max_distance" => Some(SSR_MAX_DISTANCE_RANGE),
+        "ssgi_intensity" => Some(SSGI_INTENSITY_RANGE),
+        "ssgi_max_distance" => Some(SSGI_MAX_DISTANCE_RANGE),
+        "auto_exposure_min_ev" => Some(AE_MIN_EV_RANGE),
+        "auto_exposure_max_ev" => Some(AE_MAX_EV_RANGE),
+        "auto_exposure_speed" => Some(AE_SPEED_RANGE),
         "mouse_sensitivity" => Some(MOUSE_SENSITIVITY_RANGE),
         _ => None,
     }
@@ -385,7 +476,12 @@ pub(crate) fn slider_fraction(key: &str, value: f32) -> Option<f32> {
 // Human-readable value text for a slider, shown in the row's value label.
 pub(crate) fn format_slider_value(key: &str, value: f32) -> String {
     match key {
-        "exposure" => format!("{value:+.1} EV"),
+        // Exposure and the auto-exposure EV bounds read in photographic stops.
+        "exposure" | "auto_exposure_min_ev" | "auto_exposure_max_ev" => {
+            format!("{value:+.1} EV")
+        }
+        // World-space distances / radii read in metres.
+        "ssr_max_distance" | "ssgi_max_distance" | "ssao_radius" => format!("{value:.1} m"),
         // [0, 1] strengths read more naturally as a percentage.
         "vignette" | "lut_strength" => format!("{}%", (value * 100.0).round() as i32),
         // Mouse sensitivity is a whole-number 1..100 scale.
@@ -404,8 +500,22 @@ pub(crate) fn slider_apply_value(key: &str, value: f32) -> f32 {
     match key {
         "exposure" => value.clamp(-16.0, 16.0).exp2(),
         "bloom_intensity" | "bloom_threshold" => value.max(0.0),
+        // Bloom soft-knee: lower-bounded only, like the other bloom params
+        // (`PostProcessConfig::resolve` floors it at 0).
+        "bloom_knee" => value.max(0.0),
         "vignette" | "lut_strength" => value.clamp(0.0, 1.0),
         "ambient_intensity" => value.clamp(0.0, 16.0),
+        // Per-feature sub-quality clamps, mirroring each `*Settings::resolve`.
+        "ssao_radius" => value.max(1.0e-3),
+        "ssao_intensity" => value.clamp(0.0, 4.0),
+        "ssr_intensity" => value.clamp(0.0, 1.0),
+        "ssr_max_distance" => value.clamp(1.0, 200.0),
+        "ssgi_intensity" => value.clamp(0.0, 4.0),
+        "ssgi_max_distance" => value.clamp(0.5, 100.0),
+        // The min/max EV bounds clamp to the engine EV limit; the resolve also
+        // orders them (min <= max), which happens when the config is resolved.
+        "auto_exposure_min_ev" | "auto_exposure_max_ev" => value.clamp(-16.0, 16.0),
+        "auto_exposure_speed" => value.clamp(1.0e-3, 20.0),
         // 1..100 UI value -> radians/pixel, linearly across the sensitivity span.
         "mouse_sensitivity" => {
             let v = value.clamp(MOUSE_SENSITIVITY_RANGE.0, MOUSE_SENSITIVITY_RANGE.1);
@@ -679,6 +789,37 @@ mod tests {
     }
 
     #[test]
+    fn frame_buffering_round_trips_and_snaps() {
+        for i in 0..FRAME_BUFFERING_COUNTS.len() {
+            assert_eq!(frames_in_flight_index(frames_in_flight_at(i)), i);
+        }
+        assert_eq!(frames_in_flight_at(0), 1);
+        // An out-of-range depth snaps to the nearest level.
+        assert_eq!(frames_in_flight_index(4), 2); // 4 -> 3
+        assert!(options("frames_in_flight").is_some());
+    }
+
+    #[test]
+    fn texture_quality_pairs_cap_and_budget() {
+        // Each level round-trips through its index (recovered from the pool cap),
+        // and sets both the pool cap and the per-frame upload budget.
+        for i in 0..TEXTURE_QUALITY_CAPS.len() {
+            let (cap, budget) = texture_quality_at(i);
+            assert_eq!(texture_quality_index(cap), i);
+            assert_eq!(cap, TEXTURE_QUALITY_CAPS[i]);
+            assert_eq!(budget, TEXTURE_QUALITY_BUDGETS[i]);
+        }
+        // The default world cap (96) reads as "Medium"; an authored cap off the
+        // levels snaps to the nearest.
+        assert_eq!(texture_quality_index(96), 1);
+        assert_eq!(texture_quality_index(300), 3); // 300 -> 384 (Ultra)
+        // occlusion_two_pass is an Off/On row, not a slider or preset knob.
+        assert_eq!(options("occlusion_two_pass"), Some(&["Off", "On"][..]));
+        assert!(slider_range("occlusion_two_pass").is_none());
+        assert!(!is_quality_toggle("occlusion_two_pass"));
+    }
+
+    #[test]
     fn render_scale_index_and_at_round_trip() {
         for q in [
             UpscaleQuality::Quality,
@@ -811,6 +952,42 @@ mod tests {
         // Exposure stores the linear multiplier 2^ev (clamped EV).
         assert_eq!(slider_apply_value("exposure", 2.0), 4.0);
         assert!((slider_recover_value("exposure", 4.0) - 2.0).abs() < 1.0e-5);
+        // Per-feature sub-quality sliders clamp to their `*Settings::resolve`
+        // domains; bloom_knee is lower-bounded like the other bloom params.
+        assert_eq!(slider_apply_value("bloom_knee", -1.0), 0.0);
+        assert_eq!(slider_apply_value("ssao_intensity", 100.0), 4.0);
+        assert_eq!(slider_apply_value("ssr_intensity", 9.0), 1.0);
+        assert_eq!(slider_apply_value("ssr_max_distance", 1.0e6), 200.0);
+        assert_eq!(slider_apply_value("ssgi_intensity", 99.0), 4.0);
+        assert_eq!(slider_apply_value("ssgi_max_distance", 1.0e6), 100.0);
+        assert_eq!(slider_apply_value("auto_exposure_min_ev", -100.0), -16.0);
+        assert_eq!(slider_apply_value("auto_exposure_max_ev", 100.0), 16.0);
+        assert_eq!(slider_apply_value("auto_exposure_speed", 100.0), 20.0);
+    }
+
+    #[test]
+    fn quality_param_sliders_are_independent_sliders() {
+        // Each sub-quality slider is registered as a slider (has a range) and is
+        // NOT a cycle row or a preset-governed quality knob (look-tuning, like the
+        // exposure / bloom sliders).
+        for key in QUALITY_PARAM_SLIDER_KEYS {
+            assert!(
+                is_quality_param_slider(key),
+                "{key} should be a qparam slider"
+            );
+            assert!(
+                slider_range(key).is_some(),
+                "{key} should have a slider range"
+            );
+            assert!(options(key).is_none(), "{key} should not be a cycle row");
+            assert!(
+                !QUALITY_CYCLE_KEYS.contains(&key),
+                "{key} should not be preset-governed"
+            );
+        }
+        // bloom_knee is a slider but rides update_post_process, not the qparam path.
+        assert!(slider_range("bloom_knee").is_some());
+        assert!(!is_quality_param_slider("bloom_knee"));
     }
 
     #[test]

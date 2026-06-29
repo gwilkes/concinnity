@@ -540,6 +540,22 @@ pub trait RenderBackend: SceneControl + Send {
         let _ = update;
     }
 
+    // Update the live scalar sub-tunables of the SSAO / SSR / SSGI / auto-exposure
+    // passes (radius, intensity, distance, EV bounds, adaptation speed). Unlike
+    // `apply_quality_settings`, this rebuilds nothing: each backend re-reads these
+    // values from its stored `*Settings` structs into a per-frame uniform every
+    // draw, so mutating them takes effect on the next frame with no pipeline /
+    // target rebuild and no TAA-history reset. Only the fields of a feature that is
+    // currently on are honoured (its settings are present); a value for an off
+    // feature is ignored here and applies when the feature next turns on. The
+    // structural sub-knobs (gather resolution, ray / step counts) are NOT live and
+    // still ride `apply_quality_settings`. Default no-op: a backend that reads
+    // these only at init keeps the init-time values (DirectX / Vulkan today), so
+    // the choice persists and takes effect at the next launch there.
+    fn update_quality_params(&mut self, settings: QualitySettings) {
+        let _ = settings;
+    }
+
     // Shared atomic flag the backend polls at frame start to trigger a
     // shader rebuild. `Some` only under `cn debug` on backends that ship
     // hot-reload (Metal today); `None` on production runs and on backends

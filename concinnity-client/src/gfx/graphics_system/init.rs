@@ -118,6 +118,13 @@ impl GraphicsSystem {
                 )
             }
         }
+        // Frames-in-flight (ring-buffer depth): a persisted override clamped to the
+        // 1..3 the backends support, applied unconditionally like vsync. Restart-
+        // required (the ring buffers are sized at backend init below), independent
+        // of the quality preset.
+        if let Some(v) = user_graphics.frames_in_flight {
+            self.frames_in_flight = (v as usize).clamp(1, 3);
+        }
 
         // Resolve post-process tunables. The first declared PostProcessConfig
         // wins; with none declared the renderer uses the stack defaults. The
@@ -151,6 +158,9 @@ impl GraphicsSystem {
         }
         if let Some(v) = user_graphics.lut_strength {
             post_process.lut_strength = slider_apply_value("lut_strength", v);
+        }
+        if let Some(v) = user_graphics.bloom_knee {
+            post_process.bloom_knee = slider_apply_value("bloom_knee", v);
         }
         // Keep a copy as the live source of truth for the slider settings to
         // read at init and mutate at runtime (PostProcessParams is Copy, so the
@@ -217,6 +227,38 @@ impl GraphicsSystem {
             }
             if let Some(v) = user_graphics.reflection_blur_resolution {
                 self.post_config.reflection_blur_resolution = v;
+            }
+            // Per-feature sub-quality slider overrides (look-tuning, applied live
+            // via update_quality_params). Clamped through the shared
+            // `slider_apply_value` so the value re-applied at launch matches the
+            // value applied at drag time. Not preset-governed, so no ceiling clamp.
+            use crate::gfx::settings::slider_apply_value as sav;
+            if let Some(v) = user_graphics.ssao_radius {
+                self.post_config.ssao_radius = sav("ssao_radius", v);
+            }
+            if let Some(v) = user_graphics.ssao_intensity {
+                self.post_config.ssao_intensity = sav("ssao_intensity", v);
+            }
+            if let Some(v) = user_graphics.ssr_intensity {
+                self.post_config.ssr_intensity = sav("ssr_intensity", v);
+            }
+            if let Some(v) = user_graphics.ssr_max_distance {
+                self.post_config.ssr_max_distance = sav("ssr_max_distance", v);
+            }
+            if let Some(v) = user_graphics.ssgi_intensity {
+                self.post_config.ssgi_intensity = sav("ssgi_intensity", v);
+            }
+            if let Some(v) = user_graphics.ssgi_max_distance {
+                self.post_config.ssgi_max_distance = sav("ssgi_max_distance", v);
+            }
+            if let Some(v) = user_graphics.auto_exposure_min_ev {
+                self.post_config.auto_exposure_min_ev = sav("auto_exposure_min_ev", v);
+            }
+            if let Some(v) = user_graphics.auto_exposure_max_ev {
+                self.post_config.auto_exposure_max_ev = sav("auto_exposure_max_ev", v);
+            }
+            if let Some(v) = user_graphics.auto_exposure_speed {
+                self.post_config.auto_exposure_speed = sav("auto_exposure_speed", v);
             }
         }
         // Apply the active quality preset as a performance ceiling over the
@@ -331,6 +373,38 @@ impl GraphicsSystem {
         let hdr_display = self.hdr_display;
         let hdr_pq = self.hdr_pq;
         let temporal_upscaling = self.temporal_upscaling;
+        // Two-pass Hi-Z occlusion + texture-streaming quality: also restart-class
+        // and independent of the preset, resolved here (before the value-label sync
+        // below) from the world's config overridden by any persisted choice.
+        // `occlusion_two_pass` is gated on the bindless GPU-cull path being active
+        // (the cull pipeline must exist). The texture pool size + per-frame upload
+        // budget come from the StreamingConfig, drained here so the override lands
+        // before the streamer is built later; the pool only bites where the world
+        // declares streaming.
+        self.occlusion_two_pass = user_graphics.occlusion_two_pass.unwrap_or_else(|| {
+            post_config
+                .as_ref()
+                .map(|c| c.occlusion_two_pass)
+                .unwrap_or(false)
+        });
+        let occlusion_two_pass = self.occlusion_two_pass;
+        let mut streaming_config = ctx.drain::<StreamingConfig>().into_iter().next();
+        if let Some(sc) = streaming_config.as_mut() {
+            if let Some(v) = user_graphics.texture_cap {
+                sc.texture_cap = v;
+            }
+            if let Some(v) = user_graphics.texture_budget {
+                sc.texture_budget = v;
+            }
+        }
+        self.texture_cap = streaming_config
+            .as_ref()
+            .map(|c| c.texture_cap)
+            .unwrap_or(96);
+        self.texture_budget = streaming_config
+            .as_ref()
+            .map(|c| c.texture_budget)
+            .unwrap_or(4);
         // Render-scale (upscaling quality): the world's choice overridden by any
         // persisted settings-menu choice. Restart-required -- the upscaler and
         // render targets are sized from this once, here. `self.render_scale` is
@@ -372,6 +446,9 @@ impl GraphicsSystem {
             (self.temporal_upscaling, self.hdr_display, self.hdr_pq);
         // Shadow knob states for the value-label sync (copies, same reason).
         let (shadow_size, shadow_update_val) = (self.shadow_map_size, self.shadow_update);
+        // System / streaming restart-row states for the value-label sync (copies).
+        // `occlusion_two_pass` is already a local above.
+        let (frames_in_flight_n, texture_cap_n) = (self.frames_in_flight as u32, self.texture_cap);
         // Audio / controls value labels read from the persisted settings store
         // (with the baseline default when unset); their owning systems apply the
         // value at their own init.
@@ -401,6 +478,12 @@ impl GraphicsSystem {
             // Shadow quality knobs (resolution restart-required, cadence live).
             "shadow_map_size" => Some(crate::gfx::settings::shadow_resolution_index(shadow_size)),
             "shadow_update" => Some(crate::gfx::settings::shadow_update_index(shadow_update_val)),
+            // System / streaming restart rows.
+            "frames_in_flight" => Some(crate::gfx::settings::frames_in_flight_index(
+                frames_in_flight_n,
+            )),
+            "occlusion_two_pass" => Some(occlusion_two_pass as usize),
+            "texture_quality" => Some(crate::gfx::settings::texture_quality_index(texture_cap_n)),
             // mouse_sensitivity is a slider now, synced by `init_sliders`.
             // Quality toggles: index 0 = Off, 1 = On, matching OFF_ON_OPTIONS.
             key if crate::gfx::settings::is_quality_toggle(key) => {
@@ -438,18 +521,6 @@ impl GraphicsSystem {
             .as_ref()
             .map(|c| c.upscale_backend)
             .unwrap_or_default();
-        // Two-pass Hi-Z occlusion toggle, gated on the bindless GPU-cull path
-        // being active (the phase-2 cull pipeline must exist).
-        let occlusion_two_pass = post_config
-            .as_ref()
-            .map(|c| c.occlusion_two_pass)
-            .unwrap_or(false);
-
-        // Resolve the asset-streaming config. The first declared StreamingConfig
-        // wins; with none declared, streaming stays off and every texture is
-        // uploaded eagerly at init as before.
-        let streaming_config = ctx.drain::<StreamingConfig>().into_iter().next();
-
         // Infinite-world chunk streaming. The first declared VoxelWorld wins;
         // with none declared, no chunks stream. BlockTypes are drained here so
         // the runtime can resolve the VoxelWorld palette to chunk-mesh data.

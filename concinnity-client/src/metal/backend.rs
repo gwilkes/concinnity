@@ -71,6 +71,7 @@ impl RenderBackend for MtlContext {
         fn set_keymap(&mut self, keymap: &crate::gfx::keymap::KeyMap);
         fn apply_quality_settings(&mut self, settings: QualitySettings);
         fn set_shadow_update(&mut self, update: crate::assets::ShadowUpdate);
+        fn update_quality_params(&mut self, settings: QualitySettings);
         fn take_input(&mut self) -> RenderInput;
         fn wait_idle(&self);
         fn update_view(&mut self, matrix: [[f32; 4]; 4]);

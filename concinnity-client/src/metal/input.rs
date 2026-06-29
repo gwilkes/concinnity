@@ -313,6 +313,32 @@ impl MtlContext {
         self.shadow_update = update;
     }
 
+    // Update the live scalar sub-tunables of the SSAO / SSR / SSGI / auto-exposure
+    // passes without rebuilding anything. The draw path rebuilds each pass's
+    // per-frame uniform from these stored `*Settings` structs every frame
+    // (`settings.params(...)`), so mutating the stored struct here is picked up on
+    // the next draw. Only a feature that is currently on has a settings struct to
+    // mutate; the rest are skipped (the value still persists for the next launch).
+    // SSAO / SSR / auto-exposure settings are fully scalar, so they are replaced
+    // wholesale; SSGI keeps its gather resolution / ray / step counts (those size
+    // the gather target or ride `apply_quality_settings`), so only its scalar
+    // intensity / distance are updated.
+    pub fn update_quality_params(&mut self, q: crate::gfx::backend::QualitySettings) {
+        if let (Some(live), Some(cur)) = (q.ssao, self.ssao.settings.as_mut()) {
+            *cur = live;
+        }
+        if let (Some(live), Some(cur)) = (q.ssr, self.ssr.settings.as_mut()) {
+            *cur = live;
+        }
+        if let (Some(live), Some(cur)) = (q.ssgi, self.ssgi.settings.as_mut()) {
+            cur.intensity = live.intensity;
+            cur.max_distance = live.max_distance;
+        }
+        if let (Some(live), Some(cur)) = (q.auto_exposure, self.auto_exposure.settings.as_mut()) {
+            *cur = live;
+        }
+    }
+
     // Snapshot the current input state for this frame.
     // Key booleans reflect what is held right now; mouse deltas are cleared
     // after being read so they don't accumulate across frames.

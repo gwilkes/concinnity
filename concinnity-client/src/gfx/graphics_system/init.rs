@@ -25,6 +25,45 @@ impl GraphicsSystem {
         // below (each field is None when the user never changed that setting).
         let user_graphics = crate::config::Settings::load().graphics;
 
+        // Detect the GPU before the backend is built so the auto-config quality
+        // ceiling can influence the render targets / effect pipelines sized at
+        // backend init. Held on self for later (e.g. the menu's preset label).
+        self.gpu_profile = probe_gpu_profile();
+        // Resolve the master quality preset. An ephemeral `CN_QUALITY_PRESET`
+        // env override wins first and is never persisted, so a test / CI / GPU
+        // smoke can force a preset (e.g. `custom` for no clamp) without touching
+        // settings.bin. Otherwise the persisted choice; `None` there = never
+        // configured (a first launch, or a settings file written before the
+        // preset existed): seed `Auto` and persist once, which records the
+        // detection without baking any per-field value (the per-field overrides
+        // keep their `None = world default` meaning). `Auto` re-resolves from the
+        // detected tier each launch; `Custom` / an unclassified GPU impose no
+        // ceiling.
+        use crate::gfx::quality_preset::QualityPreset;
+        let env_preset = std::env::var("CN_QUALITY_PRESET")
+            .ok()
+            .and_then(|s| QualityPreset::parse(&s));
+        let active_preset = env_preset.unwrap_or_else(|| {
+            user_graphics.quality_preset.unwrap_or_else(|| {
+                let mut s = crate::config::Settings::load();
+                s.graphics.quality_preset = Some(QualityPreset::Auto);
+                if let Err(e) = s.save() {
+                    tracing::warn!("first-launch quality preset save failed: {e}");
+                }
+                QualityPreset::Auto
+            })
+        });
+        // Hold the resolved preset as the live value the settings-menu master
+        // row cycles (and that an individual quality-row change flips to Custom).
+        self.quality_preset = active_preset;
+        let quality_ceiling =
+            crate::gfx::quality_preset::resolve_ceiling(active_preset, &self.gpu_profile);
+        tracing::info!(
+            "auto-config: GPU tier {:?}, quality preset {:?}",
+            self.gpu_profile.tier,
+            active_preset,
+        );
+
         if let Some(w) = ctx.drain::<Window>().into_iter().next() {
             self.window_args = w.to_args();
         }
@@ -40,10 +79,14 @@ impl GraphicsSystem {
             let args = c.to_args();
             self.frames_in_flight = args.frames_in_flight as usize;
             self.vsync = args.vsync;
+            self.fps_cap = args.fps_cap;
             self.clear_color = args.clear_color;
             self.max_frames = args.max_frames;
             self.shadow_map_size = args.shadow_map_size;
             self.shadow_update = args.shadow_update;
+            self.shadow_distance = args.shadow_distance;
+            self.shadow_cascades = args.shadow_cascades;
+            self.anisotropy = args.anisotropy;
         }
         // A persisted vsync choice overrides the world's value. Applied outside
         // the GraphicsConfig block (unconditional), matching window_mode /
@@ -51,10 +94,89 @@ impl GraphicsSystem {
         if let Some(v) = user_graphics.vsync {
             self.vsync = v;
         }
+        // A persisted frame-rate cap overrides the world's value (0 = unlimited),
+        // applied live by the render-step pacer. Independent of the quality preset,
+        // like vsync, so no ceiling clamp.
+        if let Some(v) = user_graphics.fps_cap {
+            self.fps_cap = v;
+        }
+
+        // Shadow quality knobs (GraphicsConfig-sourced). Snapshot the world's
+        // authored values as the baseline a live preset change re-clamps from,
+        // then apply any persisted override and otherwise clamp under the preset
+        // ceiling (an explicit override wins, like the quality toggles below). The
+        // resolution is restart-required -- the shadow map array is sized from
+        // `self.shadow_map_size` at backend init below -- while the cadence is read
+        // by the cascade scheduler each frame.
+        self.authored_shadow_map_size = self.shadow_map_size;
+        self.authored_shadow_update = self.shadow_update;
+        match user_graphics.shadow_map_size {
+            Some(v) => self.shadow_map_size = v,
+            None => {
+                self.shadow_map_size = crate::gfx::quality_preset::clamp_shadow_map_size(
+                    self.shadow_map_size,
+                    &quality_ceiling,
+                )
+            }
+        }
+        match user_graphics.shadow_update {
+            Some(v) => self.shadow_update = v,
+            None => {
+                self.shadow_update = crate::gfx::quality_preset::clamp_shadow_update(
+                    self.shadow_update,
+                    &quality_ceiling,
+                )
+            }
+        }
+        // Shadow distance (GraphicsConfig-sourced, live -- the per-frame cascade
+        // split reads it). Same baseline / override / ceiling-clamp shape as the
+        // shadow knobs above.
+        self.authored_shadow_distance = self.shadow_distance;
+        match user_graphics.shadow_distance {
+            Some(v) => self.shadow_distance = v,
+            None => {
+                self.shadow_distance = crate::gfx::quality_preset::clamp_shadow_distance(
+                    self.shadow_distance,
+                    &quality_ceiling,
+                )
+            }
+        }
+        // Shadow cascade count (GraphicsConfig-sourced, live -- the per-frame split
+        // + schedule read it). Same baseline / override / ceiling-clamp shape.
+        self.authored_shadow_cascades = self.shadow_cascades;
+        match user_graphics.shadow_cascades {
+            Some(v) => self.shadow_cascades = v,
+            None => {
+                self.shadow_cascades = crate::gfx::quality_preset::clamp_shadow_cascades(
+                    self.shadow_cascades,
+                    &quality_ceiling,
+                )
+            }
+        }
+        // Anisotropy (GraphicsConfig-sourced, restart-required -- the scene sampler
+        // is built from `self.anisotropy` at backend init below). Same baseline /
+        // override / ceiling-clamp shape as the shadow knobs above.
+        self.authored_anisotropy = self.anisotropy;
+        match user_graphics.anisotropy {
+            Some(v) => self.anisotropy = v,
+            None => {
+                self.anisotropy =
+                    crate::gfx::quality_preset::clamp_anisotropy(self.anisotropy, &quality_ceiling)
+            }
+        }
+        // Frames-in-flight (ring-buffer depth): a persisted override clamped to the
+        // 1..3 the backends support, applied unconditionally like vsync. Restart-
+        // required (the ring buffers are sized at backend init below), independent
+        // of the quality preset.
+        if let Some(v) = user_graphics.frames_in_flight {
+            self.frames_in_flight = (v as usize).clamp(1, 3);
+        }
 
         // Resolve post-process tunables. The first declared PostProcessConfig
         // wins; with none declared the renderer uses the stack defaults. The
-        // `taa` toggle is a plain bool threaded alongside the resolved params.
+        // AA mode resolves into a TAA gate (threaded alongside the params) and
+        // the composite `fxaa` flag inside `post_process` (refreshed below once
+        // the override + ceiling clamp have settled the final mode).
         let post_config = ctx.drain::<PostProcessConfig>().into_iter().next();
         let mut post_process = post_config
             .as_ref()
@@ -85,6 +207,9 @@ impl GraphicsSystem {
         if let Some(v) = user_graphics.lut_strength {
             post_process.lut_strength = slider_apply_value("lut_strength", v);
         }
+        if let Some(v) = user_graphics.bloom_knee {
+            post_process.bloom_knee = slider_apply_value("bloom_knee", v);
+        }
         // Keep a copy as the live source of truth for the slider settings to
         // read at init and mutate at runtime (PostProcessParams is Copy, so the
         // value is still passed into the backend below).
@@ -113,10 +238,12 @@ impl GraphicsSystem {
         // config would wrongly engage the upscaler). The stored copy is still
         // defaulted when absent so a runtime toggle has a config to flip.
         self.post_config = post_config.clone().unwrap_or_default();
+        // The pristine world baseline, before the user overrides + preset ceiling
+        // below. A live preset change re-clamps the quality toggles from this, so
+        // raising a preset restores the world's features (a ceiling never enables
+        // anything the world did not author, so re-clamping the baseline is exact).
+        self.authored_post_config = self.post_config.clone();
         if post_config.is_some() {
-            if let Some(v) = user_graphics.taa {
-                super::set_quality_toggle(&mut self.post_config, "taa", v);
-            }
             if let Some(v) = user_graphics.ssao {
                 super::set_quality_toggle(&mut self.post_config, "ssao", v);
             }
@@ -132,6 +259,121 @@ impl GraphicsSystem {
             if let Some(v) = user_graphics.auto_exposure {
                 super::set_quality_toggle(&mut self.post_config, "auto_exposure", v);
             }
+            // AA mode + SSGI gather + reflection blur sub-quality overrides
+            // (cycle dropdowns), alongside the boolean toggles above.
+            if let Some(v) = user_graphics.aa_mode {
+                self.post_config.aa_mode = v;
+            }
+            if let Some(v) = user_graphics.ssgi_resolution {
+                self.post_config.ssgi_resolution = v;
+            }
+            if let Some(v) = user_graphics.ssgi_rays {
+                self.post_config.ssgi_rays = v;
+            }
+            if let Some(v) = user_graphics.ssgi_steps {
+                self.post_config.ssgi_steps = v;
+            }
+            if let Some(v) = user_graphics.reflection_blur_resolution {
+                self.post_config.reflection_blur_resolution = v;
+            }
+            // Per-feature sub-quality slider overrides (look-tuning, applied live
+            // via update_quality_params). Clamped through the shared
+            // `slider_apply_value` so the value re-applied at launch matches the
+            // value applied at drag time. Not preset-governed, so no ceiling clamp.
+            use crate::gfx::settings::slider_apply_value as sav;
+            if let Some(v) = user_graphics.ssao_radius {
+                self.post_config.ssao_radius = sav("ssao_radius", v);
+            }
+            if let Some(v) = user_graphics.ssao_intensity {
+                self.post_config.ssao_intensity = sav("ssao_intensity", v);
+            }
+            if let Some(v) = user_graphics.ssr_intensity {
+                self.post_config.ssr_intensity = sav("ssr_intensity", v);
+            }
+            if let Some(v) = user_graphics.ssr_max_distance {
+                self.post_config.ssr_max_distance = sav("ssr_max_distance", v);
+            }
+            if let Some(v) = user_graphics.ssgi_intensity {
+                self.post_config.ssgi_intensity = sav("ssgi_intensity", v);
+            }
+            if let Some(v) = user_graphics.ssgi_max_distance {
+                self.post_config.ssgi_max_distance = sav("ssgi_max_distance", v);
+            }
+            if let Some(v) = user_graphics.auto_exposure_min_ev {
+                self.post_config.auto_exposure_min_ev = sav("auto_exposure_min_ev", v);
+            }
+            if let Some(v) = user_graphics.auto_exposure_max_ev {
+                self.post_config.auto_exposure_max_ev = sav("auto_exposure_max_ev", v);
+            }
+            if let Some(v) = user_graphics.auto_exposure_speed {
+                self.post_config.auto_exposure_speed = sav("auto_exposure_speed", v);
+            }
+        }
+        // Apply the active quality preset as a performance ceiling over the
+        // world's authored toggles: where the ceiling disallows a feature, force
+        // it off -- but only for a toggle the user did not explicitly override (an
+        // explicit choice wins), and never turning a feature on. A no-op under
+        // Custom / an unclassified GPU (the ceiling permits everything). Runs
+        // after the user-override overlay and before the per-feature derivation
+        // below, so the backend builds against the clamped config.
+        if post_config.is_some() {
+            let clamp = |cfg: &mut crate::assets::PostProcessConfig,
+                         key: &str,
+                         overridden: bool,
+                         allowed: bool| {
+                if !overridden && !allowed {
+                    super::set_quality_toggle(cfg, key, false);
+                }
+            };
+            clamp(
+                &mut self.post_config,
+                "ssao",
+                user_graphics.ssao.is_some(),
+                quality_ceiling.ssao,
+            );
+            clamp(
+                &mut self.post_config,
+                "ssr",
+                user_graphics.ssr.is_some(),
+                quality_ceiling.ssr,
+            );
+            clamp(
+                &mut self.post_config,
+                "ray_traced_reflections",
+                user_graphics.ray_traced_reflections.is_some(),
+                quality_ceiling.ray_traced_reflections,
+            );
+            clamp(
+                &mut self.post_config,
+                "ssgi",
+                user_graphics.ssgi.is_some(),
+                quality_ceiling.ssgi,
+            );
+            clamp(
+                &mut self.post_config,
+                "auto_exposure",
+                user_graphics.auto_exposure.is_some(),
+                quality_ceiling.auto_exposure,
+            );
+            // Clamp the cycle quality knobs (SSGI gather + reflection blur) under
+            // the ceiling too (coarser resolution / fewer rays / steps), skipping
+            // any the user explicitly overrode.
+            let cycle_overridden = |key: &str| match key {
+                "aa_mode" => user_graphics.aa_mode.is_some(),
+                "ssgi_resolution" => user_graphics.ssgi_resolution.is_some(),
+                "ssgi_rays" => user_graphics.ssgi_rays.is_some(),
+                "ssgi_steps" => user_graphics.ssgi_steps.is_some(),
+                "reflection_blur_resolution" => user_graphics.reflection_blur_resolution.is_some(),
+                _ => false,
+            };
+            for key in crate::gfx::settings::QUALITY_CYCLE_KEYS {
+                super::clamp_quality_cycle(
+                    &mut self.post_config,
+                    key,
+                    &quality_ceiling,
+                    cycle_overridden(key),
+                );
+            }
         }
         // Per-feature settings, derived from the overlaid config. Each is the
         // init-time gate the backend builds against; the same derivation feeds a
@@ -140,7 +382,17 @@ impl GraphicsSystem {
         // RT takes precedence over SSR where both are on (the graph builder picks
         // `RtReflections`), reusing the same SSR pre-pass G-buffer + resolve
         // target.
-        let taa_enabled = self.post_config.taa;
+        let taa_enabled = self.post_config.aa_mode.taa_enabled();
+        // The composite FXAA flag follows the final (overridden + ceiling-clamped)
+        // AA mode. resolve() seeded `post_process.fxaa` from the authored mode
+        // before the override/clamp above, so refresh both the local copy passed
+        // to the backend ctor and the live `self.post_process` here.
+        post_process.fxaa = if self.post_config.aa_mode.fxaa_enabled() {
+            1.0
+        } else {
+            0.0
+        };
+        self.post_process.fxaa = post_process.fxaa;
         let ssao_settings = self.post_config.ssao_settings();
         let ssr_settings = self.post_config.ssr_settings();
         let rt_reflection_settings = self.post_config.rt_reflection_settings();
@@ -151,17 +403,61 @@ impl GraphicsSystem {
         // `post_process.exposure` (resolve()) and the bias here is unused.
         let auto_exposure_settings = self.post_config.auto_exposure_settings();
         let auto_exposure_bias_ev = self.post_config.exposure_ev;
-        // HDR display output toggle, gated on the platform advertising an
-        // HDR-capable surface (else it warns and falls back to the SDR composite
-        // path).
-        let hdr_display = post_config.as_ref().map(|c| c.hdr_display).unwrap_or(false);
-        let hdr_pq = post_config.as_ref().map(|c| c.hdr_pq).unwrap_or(false);
-        // Temporal upscaling toggle + per-axis render scale, resolved from
-        // `PostProcessConfig.upscale_quality`.
-        let temporal_upscaling = post_config
+        // Display-output / upscaling preferences: the world's value overridden by
+        // any persisted settings-menu choice. Restart-required (the swapchain
+        // format + render targets are sized once at init), so they are read here,
+        // passed to the backend ctor below, and held on self for the settings rows
+        // to display + cycle. Independent of the quality preset (a user choice,
+        // not a tier), so they never clamp under the ceiling or flip it to Custom.
+        // HDR display output is additionally gated on the platform advertising an
+        // HDR-capable surface (else it warns and falls back to the SDR composite).
+        self.hdr_display = user_graphics
+            .hdr_display
+            .unwrap_or_else(|| post_config.as_ref().map(|c| c.hdr_display).unwrap_or(false));
+        self.hdr_pq = user_graphics
+            .hdr_pq
+            .unwrap_or_else(|| post_config.as_ref().map(|c| c.hdr_pq).unwrap_or(false));
+        self.temporal_upscaling = user_graphics.temporal_upscaling.unwrap_or_else(|| {
+            post_config
+                .as_ref()
+                .map(|c| c.temporal_upscaling)
+                .unwrap_or(false)
+        });
+        let hdr_display = self.hdr_display;
+        let hdr_pq = self.hdr_pq;
+        let temporal_upscaling = self.temporal_upscaling;
+        // Two-pass Hi-Z occlusion + texture-streaming quality: also restart-class
+        // and independent of the preset, resolved here (before the value-label sync
+        // below) from the world's config overridden by any persisted choice.
+        // `occlusion_two_pass` is gated on the bindless GPU-cull path being active
+        // (the cull pipeline must exist). The texture pool size + per-frame upload
+        // budget come from the StreamingConfig, drained here so the override lands
+        // before the streamer is built later; the pool only bites where the world
+        // declares streaming.
+        self.occlusion_two_pass = user_graphics.occlusion_two_pass.unwrap_or_else(|| {
+            post_config
+                .as_ref()
+                .map(|c| c.occlusion_two_pass)
+                .unwrap_or(false)
+        });
+        let occlusion_two_pass = self.occlusion_two_pass;
+        let mut streaming_config = ctx.drain::<StreamingConfig>().into_iter().next();
+        if let Some(sc) = streaming_config.as_mut() {
+            if let Some(v) = user_graphics.texture_cap {
+                sc.texture_cap = v;
+            }
+            if let Some(v) = user_graphics.texture_budget {
+                sc.texture_budget = v;
+            }
+        }
+        self.texture_cap = streaming_config
             .as_ref()
-            .map(|c| c.temporal_upscaling)
-            .unwrap_or(false);
+            .map(|c| c.texture_cap)
+            .unwrap_or(96);
+        self.texture_budget = streaming_config
+            .as_ref()
+            .map(|c| c.texture_budget)
+            .unwrap_or(4);
         // Render-scale (upscaling quality): the world's choice overridden by any
         // persisted settings-menu choice. Restart-required -- the upscaler and
         // render targets are sized from this once, here. `self.render_scale` is
@@ -170,12 +466,32 @@ impl GraphicsSystem {
             .as_ref()
             .map(|c| c.upscale_quality)
             .unwrap_or_default();
-        self.render_scale = user_graphics.render_scale.unwrap_or(world_quality);
+        // A persisted render-scale choice wins; otherwise the world's choice,
+        // clamped under the preset ceiling (the more aggressive of the two, so a
+        // weak-tier ceiling forces more upscaling but never less).
+        self.render_scale = match user_graphics.render_scale {
+            Some(v) => v,
+            None => crate::gfx::quality_preset::more_aggressive_upscale(
+                world_quality,
+                quality_ceiling.min_upscale,
+            ),
+        };
         let upscale_scale = if post_config.is_some() {
             self.render_scale.scale()
         } else {
             1.0
         };
+        // Upscaler backend (Auto / FSR3 / DLSS / XeSS): the persisted choice wins,
+        // else the world's value. Restart-required (the upscaler is selected +
+        // built once at init); independent of the quality preset, so no ceiling
+        // clamp. Resolved here (ahead of the value-label sync) so the settings row
+        // shows the live value. DirectX / Vulkan honour it; Metal uses MetalFX.
+        self.upscale_backend = user_graphics.upscale_backend.unwrap_or_else(|| {
+            post_config
+                .as_ref()
+                .map(|c| c.upscale_backend)
+                .unwrap_or_default()
+        });
 
         // Set each settings value label to its live value before the first
         // render, so a persisted/authored choice shows instead of the build's
@@ -188,6 +504,22 @@ impl GraphicsSystem {
             self.window_args.height,
             self.render_scale,
         );
+        let fps_cap_val = self.fps_cap;
+        // Display-group toggle states for the value-label sync (copies, so the
+        // closure below does not borrow self while ctx is borrowed mutably).
+        let (display_upscaling, display_hdr, display_pq) =
+            (self.temporal_upscaling, self.hdr_display, self.hdr_pq);
+        // Upscaler-backend selection for the value-label sync (a copy, same
+        // reason as the display tuple above).
+        let upscale_backend_sel = self.upscale_backend;
+        // Shadow knob states for the value-label sync (copies, same reason).
+        let (shadow_size, shadow_update_val) = (self.shadow_map_size, self.shadow_update);
+        let shadow_distance_val = self.shadow_distance;
+        let shadow_cascades_val = self.shadow_cascades;
+        let anisotropy_val = self.anisotropy;
+        // System / streaming restart-row states for the value-label sync (copies).
+        // `occlusion_two_pass` is already a local above.
+        let (frames_in_flight_n, texture_cap_n) = (self.frames_in_flight as u32, self.texture_cap);
         // Audio / controls value labels read from the persisted settings store
         // (with the baseline default when unset); their owning systems apply the
         // value at their own init.
@@ -206,17 +538,49 @@ impl GraphicsSystem {
         let quality_cfg = self.post_config.clone();
         sync_setting_value_labels(ctx, |key| match key {
             "vsync" => Some(vsync as usize),
+            "fps_cap" => Some(crate::gfx::settings::fps_cap_index(fps_cap_val)),
             "window_mode" => Some(crate::gfx::settings::window_mode_index(mode)),
             "window_size" => Some(crate::gfx::settings::window_size_index(win_w, win_h)),
             "render_scale" => Some(crate::gfx::settings::render_scale_index(scale)),
+            "upscale_backend" => Some(crate::gfx::settings::upscale_backend_index(
+                upscale_backend_sel,
+            )),
             "master_volume" => Some(crate::gfx::settings::master_volume_index(master_volume)),
+            // Display-output / upscaling toggles (Off/On), held on self.
+            "temporal_upscaling" => Some(display_upscaling as usize),
+            "hdr_display" => Some(display_hdr as usize),
+            "hdr_pq" => Some(display_pq as usize),
+            // Shadow quality knobs (resolution restart-required, cadence live).
+            "shadow_map_size" => Some(crate::gfx::settings::shadow_resolution_index(shadow_size)),
+            "shadow_update" => Some(crate::gfx::settings::shadow_update_index(shadow_update_val)),
+            "shadow_distance" => Some(crate::gfx::settings::shadow_distance_index(
+                shadow_distance_val,
+            )),
+            "shadow_cascades" => Some(crate::gfx::settings::shadow_cascades_index(
+                shadow_cascades_val,
+            )),
+            "anisotropy" => Some(crate::gfx::settings::anisotropy_index(anisotropy_val)),
+            // System / streaming restart rows.
+            "frames_in_flight" => Some(crate::gfx::settings::frames_in_flight_index(
+                frames_in_flight_n,
+            )),
+            "occlusion_two_pass" => Some(occlusion_two_pass as usize),
+            "texture_quality" => Some(crate::gfx::settings::texture_quality_index(texture_cap_n)),
             // mouse_sensitivity is a slider now, synced by `init_sliders`.
             // Quality toggles: index 0 = Off, 1 = On, matching OFF_ON_OPTIONS.
             key if crate::gfx::settings::is_quality_toggle(key) => {
                 super::quality_toggle_on(&quality_cfg, key).map(|on| on as usize)
             }
+            // SSGI gather sub-quality dropdowns.
+            key if super::is_quality_cycle(key) => super::quality_cycle_index(&quality_cfg, key),
             _ => None,
         });
+        // The master "Graphics Quality" row carries the resolved tier under Auto
+        // (e.g. "Auto (High)"), which the static option table cannot express, so
+        // it is set directly after the generic sync above writes the bare name.
+        let preset_label =
+            crate::gfx::quality_preset::preset_label(active_preset, &self.gpu_profile);
+        set_setting_row_label(ctx, "graphics_quality", &preset_label);
         // Capture the slider rows and sync each handle + value label to its live
         // value (e.g. the persisted/authored exposure). Like the cycle-row sync
         // above, this runs before UiInputSystem drains the HitRegions.
@@ -225,28 +589,18 @@ impl GraphicsSystem {
         // key (persisted or default). Like the slider sync, before UiInputSystem
         // drains the HitRegions.
         self.init_rebind_rows(ctx);
+        // Capture each cycle row's value-label id, so a preset change can relabel
+        // its dependent rows (and a quality-row change the master row) at runtime,
+        // when the HitRegions are gone. Also before UiInputSystem drains them.
+        self.init_cycle_value_labels(ctx);
         // Capture each ScrollPanel's per-element clip bands for the draw path,
         // before UiInputSystem drains the panels (init order: graphics first).
         self.init_clip_rects(ctx);
-        // Upscaler backend selector from `PostProcessConfig.upscale_backend`.
-        // Honoured by the DirectX and Vulkan backends (FSR3 / DLSS / XeSS);
-        // Metal always uses MetalFX, so it ignores the selector.
-        let upscale_backend = post_config
-            .as_ref()
-            .map(|c| c.upscale_backend)
-            .unwrap_or_default();
-        // Two-pass Hi-Z occlusion toggle, gated on the bindless GPU-cull path
-        // being active (the phase-2 cull pipeline must exist).
-        let occlusion_two_pass = post_config
-            .as_ref()
-            .map(|c| c.occlusion_two_pass)
-            .unwrap_or(false);
-
-        // Resolve the asset-streaming config. The first declared StreamingConfig
-        // wins; with none declared, streaming stays off and every texture is
-        // uploaded eagerly at init as before.
-        let streaming_config = ctx.drain::<StreamingConfig>().into_iter().next();
-
+        // Upscaler backend selector, resolved above (persisted choice over the
+        // world's `PostProcessConfig.upscale_backend`) and held on self for the
+        // settings row. Honoured by the DirectX and Vulkan backends (FSR3 / DLSS /
+        // XeSS); Metal always uses MetalFX, so it ignores the selector.
+        let upscale_backend = self.upscale_backend;
         // Infinite-world chunk streaming. The first declared VoxelWorld wins;
         // with none declared, no chunks stream. BlockTypes are drained here so
         // the runtime can resolve the VoxelWorld palette to chunk-mesh data.
@@ -1662,6 +2016,9 @@ impl GraphicsSystem {
             light_uniforms,
             self.shadow_map_size,
             self.shadow_update,
+            self.shadow_distance,
+            self.shadow_cascades,
+            self.anisotropy,
             text_atlas_data,
             env_map_bytes.as_deref(),
             post_process,
@@ -1858,6 +2215,17 @@ impl GraphicsSystem {
         if let Some(backend) = self.backend.as_deref_mut() {
             // Capability flags drive the settings-menu gating below.
             device_caps = backend.capabilities();
+            // Detected GPU performance profile, logged once at init so the
+            // classified tier is verifiable on each device.
+            let gpu = backend.gpu_profile();
+            tracing::info!(
+                "GPU profile: vendor={:?} tier={:?} memory_budget={} MB unified={} discrete={}",
+                gpu.vendor,
+                gpu.tier,
+                gpu.memory_budget_bytes / (1 << 20),
+                gpu.unified_memory,
+                gpu.discrete,
+            );
             backend.set_menu_mode(self.menu_mode);
             // Push the effective ambient scale (world value or persisted
             // override). The backend already seeds the world value at its own
@@ -1928,6 +2296,24 @@ fn sync_setting_value_labels(
                     l.content = text.to_string();
                     break;
                 }
+            }
+        }
+    }
+}
+
+// Set the value label of the settings row bound to `key` to `text` directly,
+// for a label that is not one of the row's static `options` (the master preset
+// row's "Auto (High)", or the live "Custom" flip when a quality row changes).
+fn set_setting_row_label(ctx: &mut PipelineContext, key: &str, text: &str) {
+    let label_id = ctx.query::<HitRegion>().find_map(|r| {
+        let row_key = r.action.strip_prefix("setting:")?.split(':').next()?;
+        (row_key == key).then_some(r.label).flatten()
+    });
+    if let Some(id) = label_id {
+        for l in ctx.query_mut::<TextLabel>() {
+            if l.asset_id == id {
+                l.content = text.to_string();
+                break;
             }
         }
     }

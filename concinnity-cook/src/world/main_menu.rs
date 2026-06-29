@@ -30,41 +30,95 @@ const SETTINGS_TABS: [(&str, &str); 3] = [
 // Setting rows per tab, top to bottom: (setting key, display label). The runtime
 // (`concinnity_client::gfx::settings`) knows each key's options and how to apply
 // it; this only chooses which rows appear.
-const VIDEO_ROWS: [(&str, &str); 3] = [
+const VIDEO_ROWS: [(&str, &str); 4] = [
     ("vsync", "Vsync"),
+    ("fps_cap", "Frame Rate"),
     ("window_mode", "Window Mode"),
     ("window_size", "Window Size"),
 ];
 // Rows tucked under the Video "Advanced" collapsible group (collapsed by
 // default), so the top of the Video tab stays uncrowded. More live
 // post-process sliders join these later. Cycle rows then slider rows.
-const VIDEO_ADVANCED_ROWS: [(&str, &str); 1] = [("render_scale", "Render Scale")];
+const VIDEO_ADVANCED_ROWS: [(&str, &str); 8] = [
+    ("render_scale", "Render Scale"),
+    // Upscaler backend (Auto/FSR3/DLSS/XeSS). Restart-required, independent of the
+    // quality preset; DirectX / Vulkan only (Metal uses MetalFX, so the row is
+    // inert there). Sits next to render scale since it only matters with temporal
+    // upscaling on.
+    ("upscale_backend", "Upscaler"),
+    // Display-output / upscaling preferences (Off/On + render-scale cycle).
+    // Restart-required and independent of the quality preset.
+    ("temporal_upscaling", "Temporal Upscaling"),
+    ("hdr_display", "HDR Display"),
+    ("hdr_pq", "HDR10 (PQ)"),
+    // System / streaming restart preferences. Buffering depth, two-pass occlusion
+    // culling, and texture-streaming quality (pool size + upload budget together).
+    ("frames_in_flight", "Frame Buffering"),
+    ("occlusion_two_pass", "Occlusion Culling"),
+    ("texture_quality", "Texture Quality"),
+];
 // Live post-process sliders in the Advanced group. Each key's value range,
 // display format, and apply path live in the client (`concinnity_client::gfx::settings` +
 // `graphics_system`); a row here only chooses which sliders appear. All but
 // `ambient_intensity` are pure `PostProcessParams` fields applied via
 // `update_post_process`; `ambient_intensity` rides a dedicated backend setter
 // (Metal live; see the client `graphics_system`).
-const VIDEO_ADVANCED_SLIDERS: [(&str, &str); 6] = [
+const VIDEO_ADVANCED_SLIDERS: [(&str, &str); 8] = [
     ("exposure", "Exposure"),
     ("bloom_intensity", "Bloom"),
     ("bloom_threshold", "Bloom Threshold"),
+    ("bloom_knee", "Bloom Knee"),
     ("vignette", "Vignette"),
     ("lut_strength", "Color Grade"),
     ("ambient_intensity", "Ambient"),
+    // Camera vertical field of view (degrees). Live, independent of the preset.
+    ("fov", "Field of View"),
 ];
 // Quality toggles in the Video "Quality" collapsible group (collapsed by
 // default): the heavier render features. Each is an Off/On cycle row. The
 // client (`concinnity_client::gfx::settings` + `graphics_system`) knows each key's options and
 // applies it live by rebuilding the affected render resources; on backends
 // without a live path the choice persists and applies at the next launch.
-const VIDEO_QUALITY_ROWS: [(&str, &str); 6] = [
-    ("taa", "Anti-Aliasing"),
+const VIDEO_QUALITY_ROWS: [(&str, &str); 15] = [
+    ("aa_mode", "Anti-Aliasing"),
     ("ssao", "Ambient Occlusion"),
     ("ssr", "Screen-Space Reflections"),
     ("ray_traced_reflections", "Ray-Traced Reflections"),
+    // Reflection blur resolution dropdown, grouped under the reflection toggles
+    // it governs (SSR + ray-traced).
+    ("reflection_blur_resolution", "Reflection Blur"),
     ("ssgi", "Global Illumination"),
+    // SSGI gather sub-quality (multi-option dropdowns), grouped under the GI
+    // toggle. The runtime knows each key's options and applies them live.
+    ("ssgi_resolution", "GI Resolution"),
+    ("ssgi_rays", "GI Rays"),
+    ("ssgi_steps", "GI Steps"),
+    // Shadow quality: cascade map resolution (restart-required) + re-render
+    // cadence (live) + distance (live) + cascade count (live). Preset-governed
+    // like the toggles above.
+    ("shadow_map_size", "Shadow Resolution"),
+    ("shadow_update", "Shadow Update"),
+    ("shadow_distance", "Shadow Distance"),
+    ("shadow_cascades", "Shadow Cascades"),
     ("auto_exposure", "Auto Exposure"),
+    // Anisotropic texture filtering (restart-required). Preset-governed like the
+    // toggles above.
+    ("anisotropy", "Anisotropic Filtering"),
+];
+// Per-feature sub-quality sliders in the Video "Quality" group, tuning the
+// features the toggles / dropdowns above enable. Applied live on Metal by
+// mutating the backend's stored *Settings (no pass rebuild); look-tuning knobs,
+// independent of the master quality preset.
+const VIDEO_QUALITY_SLIDERS: [(&str, &str); 9] = [
+    ("ssao_radius", "AO Radius"),
+    ("ssao_intensity", "AO Intensity"),
+    ("ssr_intensity", "Reflection Intensity"),
+    ("ssr_max_distance", "Reflection Distance"),
+    ("ssgi_intensity", "GI Intensity"),
+    ("ssgi_max_distance", "GI Distance"),
+    ("auto_exposure_min_ev", "Auto Exposure Min"),
+    ("auto_exposure_max_ev", "Auto Exposure Max"),
+    ("auto_exposure_speed", "Auto Exposure Speed"),
 ];
 const AUDIO_ROWS: [(&str, &str); 1] = [("master_volume", "Master Volume")];
 // Controls-tab sliders, top to bottom: (setting key, display label). Mouse
@@ -714,13 +768,20 @@ fn settings_body_rows(active: &str) -> (Vec<BodyRow>, Vec<GroupSpec>) {
         // vec below (and a row's group tag references that same gid). Quality is
         // declared first, so it is gid 0; Advanced second, so gid 1.
         _ => {
-            let mut rows: Vec<BodyRow> = VIDEO_ROWS
-                .iter()
-                .map(|&(s, l)| BodyRow::Option(s, l, -1))
-                .collect();
+            // The master "Graphics Quality" preset leads the tab (ungrouped, so it
+            // is always visible); the runtime cycles Auto/Low/Medium/High/Ultra/
+            // Custom and re-derives the toggles + render scale under its ceiling.
+            let mut rows: Vec<BodyRow> =
+                vec![BodyRow::Option("graphics_quality", "Graphics Quality", -1)];
+            rows.extend(VIDEO_ROWS.iter().map(|&(s, l)| BodyRow::Option(s, l, -1)));
             rows.push(BodyRow::GroupHeader(0, "Quality"));
             for &(s, l) in &VIDEO_QUALITY_ROWS {
                 rows.push(BodyRow::Option(s, l, 0));
+            }
+            // The per-feature sub-quality sliders follow the toggles in the same
+            // Quality group.
+            for &(s, l) in &VIDEO_QUALITY_SLIDERS {
+                rows.push(BodyRow::Slider(s, l, 0));
             }
             rows.push(BodyRow::GroupHeader(1, "Advanced"));
             for &(s, l) in &VIDEO_ADVANCED_ROWS {
@@ -1131,15 +1192,42 @@ mod tests {
         expand_main_menus(&mut assets).unwrap();
         for (setting, label) in [
             ("vsync", "Vsync"),
+            ("fps_cap", "Frame Rate"),
             ("window_mode", "Window Mode"),
             ("window_size", "Window Size"),
             ("render_scale", "Render Scale"),
+            ("upscale_backend", "Upscaler"),
         ] {
             let opt = by_name(&assets, &format!("m_settings_video_opt_{setting}"));
             assert_eq!(opt["type"], "OptionSelect");
             assert_eq!(opt["args"]["setting"], setting);
             assert_eq!(opt["args"]["label"], label);
         }
+    }
+
+    #[test]
+    fn video_tab_leads_with_the_master_quality_row() {
+        let mut assets = vec![serde_json::json!({"name":"m","type":"MainMenu"})];
+        expand_main_menus(&mut assets).unwrap();
+        // The master preset row is an ungrouped OptionSelect bound to the
+        // graphics_quality setting (the runtime knows its options + how to apply).
+        let opt = by_name(&assets, "m_settings_video_opt_graphics_quality");
+        assert_eq!(opt["type"], "OptionSelect");
+        assert_eq!(opt["args"]["setting"], "graphics_quality");
+        assert_eq!(opt["args"]["label"], "Graphics Quality");
+        // It leads the tab: it is emitted before the first core row (vsync).
+        let master_pos = assets
+            .iter()
+            .position(|v| asset_name(v) == "m_settings_video_opt_graphics_quality")
+            .expect("master row");
+        let vsync_pos = assets
+            .iter()
+            .position(|v| asset_name(v) == "m_settings_video_opt_vsync")
+            .expect("vsync row");
+        assert!(
+            master_pos < vsync_pos,
+            "master quality row should lead the tab"
+        );
     }
 
     #[test]
@@ -1523,9 +1611,28 @@ mod tests {
         for key in [
             "sld_bloom_intensity",
             "sld_bloom_threshold",
+            "sld_bloom_knee",
             "sld_vignette",
             "sld_lut_strength",
             "sld_ambient_intensity",
+            "sld_fov",
+        ] {
+            assert_eq!(
+                in_advanced(key),
+                Some(1),
+                "{key} should be in the Advanced group"
+            );
+        }
+        // The display-output / upscaling preference + system / streaming restart
+        // rows also live in Advanced.
+        for key in [
+            "opt_upscale_backend",
+            "opt_temporal_upscaling",
+            "opt_hdr_display",
+            "opt_hdr_pq",
+            "opt_frames_in_flight",
+            "opt_occlusion_two_pass",
+            "opt_texture_quality",
         ] {
             assert_eq!(
                 in_advanced(key),
@@ -1536,8 +1643,8 @@ mod tests {
     }
 
     // The Video "Quality" group (gid 0): a header row that toggles group 0 and
-    // the six render-feature toggles tagged into group 0, the panel declaring it
-    // collapsed.
+    // the render-feature toggles + SSGI sub-quality dropdowns tagged into group
+    // 0, the panel declaring it collapsed.
     #[test]
     fn video_quality_group_holds_render_feature_toggles() {
         let mut assets = vec![serde_json::json!({"name":"m","type":"MainMenu"})];
@@ -1572,12 +1679,31 @@ mod tests {
                 .map(|r| r["group"].as_i64().unwrap())
         };
         for key in [
-            "opt_taa",
+            "opt_aa_mode",
             "opt_ssao",
             "opt_ssr",
             "opt_ray_traced_reflections",
+            "opt_reflection_blur_resolution",
             "opt_ssgi",
+            "opt_ssgi_resolution",
+            "opt_ssgi_rays",
+            "opt_ssgi_steps",
+            "opt_shadow_map_size",
+            "opt_shadow_update",
+            "opt_shadow_distance",
+            "opt_shadow_cascades",
             "opt_auto_exposure",
+            "opt_anisotropy",
+            // The per-feature sub-quality sliders share the Quality group.
+            "sld_ssao_radius",
+            "sld_ssao_intensity",
+            "sld_ssr_intensity",
+            "sld_ssr_max_distance",
+            "sld_ssgi_intensity",
+            "sld_ssgi_max_distance",
+            "sld_auto_exposure_min_ev",
+            "sld_auto_exposure_max_ev",
+            "sld_auto_exposure_speed",
         ] {
             assert_eq!(
                 group_of(key),

@@ -13,6 +13,7 @@ mod device;
 mod draw;
 mod fog;
 mod glass;
+mod gpu_profile;
 mod graph_exec;
 mod hiz;
 mod hot_reload;
@@ -41,3 +42,4 @@ mod transient_pool;
 pub(crate) mod window;
 
 pub use context::VkContext;
+pub(crate) use gpu_profile::probe_gpu_profile;

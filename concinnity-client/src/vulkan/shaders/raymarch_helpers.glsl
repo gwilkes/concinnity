@@ -66,6 +66,7 @@ const int RAYMARCH_NUM_SHADOW_CASCADES = 4;
 layout(std140, set = 0, binding = 2) uniform RaymarchShadowBlock {
     mat4 light_vps[4];
     vec4 cascade_splits;
+    uint active_cascades;
 } shadow_uni;
 
 layout(set = 0, binding = 3) uniform sampler2DArrayShadow shadow_map;
@@ -263,7 +264,7 @@ float sampleSunShadow(vec3 world_pos, float view_depth, vec2 screen_xy) {
     else if (view_depth < shadow_uni.cascade_splits[1]) cascade = 1;
     else if (view_depth < shadow_uni.cascade_splits[2]) cascade = 2;
     else if (view_depth < shadow_uni.cascade_splits[3]) cascade = 3;
-    if (cascade >= 4) return 1.0;
+    if (cascade >= int(shadow_uni.active_cascades)) return 1.0;
 
     vec4 lc = shadow_uni.light_vps[cascade] * vec4(world_pos, 1.0);
     vec3 ndc = lc.xyz / max(lc.w, 1e-6);

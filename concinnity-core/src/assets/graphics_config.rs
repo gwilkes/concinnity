@@ -48,6 +48,11 @@ pub struct GraphicsConfig {
     /// to `true` to lock presentation to the monitor refresh, eliminating tearing
     /// and the wasted frames that never reach the screen.
     pub vsync: bool,
+    /// Cap the frame rate to this many frames per second. `0` (default) leaves
+    /// the loop uncapped. The cap is a CPU-side frame pacer, so it composes with
+    /// `vsync`: the more restrictive of the two wins. Useful for limiting heat,
+    /// fan noise, and power draw, or matching a fixed refresh.
+    pub fps_cap: u32,
     /// Background clear colour [r, g, b, a] in linear 0..1 space.
     pub clear_color: [f32; 4],
     /// Rotation speed of the demo object in radians per second. Only used when
@@ -59,6 +64,23 @@ pub struct GraphicsConfig {
     /// the far cascades across frames; `every_frame` refreshes them all every
     /// frame. See [ShadowUpdate].
     pub shadow_update: ShadowUpdate,
+    /// How far from the camera shadows are cast, in world units (e.g. 80). The
+    /// cascades cover from the near plane out to this distance; a larger value
+    /// shadows more of the scene but spreads the same shadow-map resolution over
+    /// more area (softer, blockier shadows). Capped at the camera far plane.
+    pub shadow_distance: u32,
+    /// Number of shadow cascades, 1 to 4 (`4` is the default and the maximum).
+    /// More cascades keep distant shadows sharper by splitting the view range
+    /// into finer slices, at the cost of an extra shadow-map render per cascade;
+    /// fewer is cheaper but blockier far from the camera. The slice count covers
+    /// the same `shadow_distance` regardless.
+    pub shadow_cascades: u32,
+    /// Maximum anisotropic-filtering degree for the scene texture sampler
+    /// (albedo + normal maps), e.g. 8. Higher keeps textures viewed at a grazing
+    /// angle (floors, walls receding into the distance) sharp instead of blurring
+    /// along the minor axis, at a small sampling cost. `1` disables anisotropy
+    /// (plain trilinear). Clamped to the GPU's supported range (1..16) at init.
+    pub anisotropy: u32,
 }
 
 impl Default for GraphicsConfig {
@@ -67,10 +89,14 @@ impl Default for GraphicsConfig {
             max_frames: None,
             frames_in_flight: 2,
             vsync: false,
+            fps_cap: 0,
             clear_color: [0.01, 0.01, 0.02, 1.0],
             rotation_speed: 1.0,
             shadow_map_size: 2048,
             shadow_update: ShadowUpdate::default(),
+            shadow_distance: 80,
+            shadow_cascades: 4,
+            anisotropy: 8,
         }
     }
 }
@@ -183,6 +209,51 @@ mod tests {
         // Explicit true is honoured.
         let cfg: GraphicsConfig = serde_json::from_str(r#"{"vsync":true}"#).expect("parse");
         assert!(cfg.vsync);
+    }
+
+    #[test]
+    fn fps_cap_defaults_to_unlimited_and_round_trips() {
+        // Omitted -> 0 (uncapped).
+        assert_eq!(GraphicsConfig::default().fps_cap, 0);
+        let cfg: GraphicsConfig =
+            serde_json::from_str(r#"{"shadow_map_size":1024}"#).expect("parse");
+        assert_eq!(cfg.fps_cap, 0);
+        // Explicit cap is honoured.
+        let cfg: GraphicsConfig = serde_json::from_str(r#"{"fps_cap":60}"#).expect("parse");
+        assert_eq!(cfg.fps_cap, 60);
+    }
+
+    #[test]
+    fn shadow_distance_defaults_to_80_and_round_trips() {
+        assert_eq!(GraphicsConfig::default().shadow_distance, 80);
+        let cfg: GraphicsConfig =
+            serde_json::from_str(r#"{"shadow_distance":160}"#).expect("parse");
+        assert_eq!(cfg.shadow_distance, 160);
+        let cfg: GraphicsConfig =
+            serde_json::from_str(r#"{"shadow_map_size":1024}"#).expect("parse");
+        assert_eq!(cfg.shadow_distance, 80);
+    }
+
+    #[test]
+    fn shadow_cascades_defaults_to_4_and_round_trips() {
+        assert_eq!(GraphicsConfig::default().shadow_cascades, 4);
+        let cfg: GraphicsConfig = serde_json::from_str(r#"{"shadow_cascades":2}"#).expect("parse");
+        assert_eq!(cfg.shadow_cascades, 2);
+        let cfg: GraphicsConfig =
+            serde_json::from_str(r#"{"shadow_map_size":1024}"#).expect("parse");
+        assert_eq!(cfg.shadow_cascades, 4);
+    }
+
+    #[test]
+    fn anisotropy_defaults_to_8_and_round_trips() {
+        // The default matches the value the backends historically hardcoded.
+        assert_eq!(GraphicsConfig::default().anisotropy, 8);
+        // An authored value is honoured; omitting the field falls back to 8.
+        let cfg: GraphicsConfig = serde_json::from_str(r#"{"anisotropy":16}"#).expect("parse");
+        assert_eq!(cfg.anisotropy, 16);
+        let cfg: GraphicsConfig =
+            serde_json::from_str(r#"{"shadow_map_size":1024}"#).expect("parse");
+        assert_eq!(cfg.anisotropy, 8);
     }
 
     #[test]

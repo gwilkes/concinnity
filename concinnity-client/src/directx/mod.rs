@@ -13,6 +13,7 @@ mod dxc;
 mod fog;
 mod geometry_rebuild;
 mod glass;
+mod gpu_profile;
 mod graph_exec;
 mod hiz;
 mod hot_reload;
@@ -38,3 +39,4 @@ mod transient_pool;
 mod window;
 
 pub use context::DxContext;
+pub(crate) use gpu_profile::probe_gpu_profile;

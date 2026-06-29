@@ -24,6 +24,9 @@ cbuffer PostBlock : register(b0)
     float lut_strength;
     float hdr_output;
     float pq_output;
+    // 1.0 = run the FXAA edge filter on the SDR path; 0.0 = skip it (the Off
+    // anti-aliasing mode). Ignored on the HDR path, which never runs FXAA.
+    float fxaa;
 };
 
 // SDR reference white in cd/m² (nits). BT.2408 recommends 203 nits as the
@@ -155,6 +158,15 @@ float4 main(PsIn p) : SV_TARGET
     // Tonemap the centre sample and its 4-neighbourhood; each neighbour goes
     // through the same tonemap so the FXAA luma compares stay consistent.
     float3 c = tonemap(p.uv);
+
+    // FXAA gated by `fxaa` (off for the Off anti-aliasing mode). When disabled,
+    // grade + vignette the tonemapped centre directly and skip the neighbour
+    // samples the edge filter would otherwise take.
+    if (fxaa < 0.5)
+    {
+        return float4(grade(c) * vignette_factor(p.uv), 1.0);
+    }
+
     float3 n = tonemap(p.uv + float2(0.0, -inv_size.y));
     float3 s = tonemap(p.uv + float2(0.0,  inv_size.y));
     float3 e = tonemap(p.uv + float2( inv_size.x, 0.0));

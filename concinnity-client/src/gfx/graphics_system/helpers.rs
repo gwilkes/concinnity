@@ -164,6 +164,33 @@ pub(super) fn build_texture_payload_source(
     ))
 }
 
+// Probe the active GPU's coarse performance profile before the backend is built,
+// so the auto-config quality ceiling can influence the render targets / effect
+// pipelines the backend sizes at init. Each backend creates only the cheap
+// throwaway handle it needs and classifies it: Metal the default-device handle,
+// DirectX the DXGI adapter (no device / swapchain), Vulkan a surface-free
+// instance (destroyed immediately). The three `backend_*` cfgs are mutually
+// exclusive, so exactly one arm compiles; the fallback returns `UNKNOWN` (which
+// the resolver treats as "no ceiling") only when no backend is configured.
+pub(super) fn probe_gpu_profile() -> crate::gfx::backend::GpuProfile {
+    #[cfg(backend_dx)]
+    {
+        crate::directx::probe_gpu_profile()
+    }
+    #[cfg(backend_vk)]
+    {
+        crate::vulkan::probe_gpu_profile()
+    }
+    #[cfg(backend_metal)]
+    {
+        crate::metal::probe_gpu_profile()
+    }
+    #[cfg(not(any(backend_dx, backend_vk, backend_metal)))]
+    {
+        crate::gfx::backend::GpuProfile::UNKNOWN
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn init_backend(
     window_args: &WindowArgs,
@@ -206,6 +233,18 @@ pub(super) fn init_backend(
     // shadow-cascade update policy from GraphicsConfig.shadow_update. The shared
     // `ShadowCascadeScheduler` staggers which cascades re-render each frame.
     shadow_update: crate::assets::ShadowUpdate,
+    // Shadow distance (world units) from GraphicsConfig.shadow_distance. Each
+    // backend's per-frame cascade-split computation reads it (capped at the camera
+    // far plane); live on Metal via set_shadow_distance.
+    shadow_distance: u32,
+    // Shadow cascade count (1..=4) from GraphicsConfig.shadow_cascades. Each
+    // backend's per-frame split + schedule read it; live on Metal via
+    // set_shadow_cascades.
+    shadow_cascades: u32,
+    // Scene-sampler max anisotropy from GraphicsConfig.anisotropy. Each backend
+    // builds its albedo / normal-map sampler with this (clamped to the GPU's
+    // 1..16 range) at init; restart-required.
+    anisotropy: u32,
     // glyph atlas textures for text rendering; empty = no text support
     text_atlases: Vec<(u32, u32, Vec<u8>)>,
     // serialised EnvironmentMap payload (irradiance + prefilter cubemaps).
@@ -216,7 +255,7 @@ pub(super) fn init_backend(
     // serialised ColorLut payload (3D grading LUT). None disables grading;
     // the runtime then binds an identity LUT.
     color_lut_bytes: Option<&[u8]>,
-    // temporal anti-aliasing toggle from PostProcessConfig.taa.
+    // temporal anti-aliasing toggle from PostProcessConfig.aa_mode.
     taa_enabled: bool,
     // SSAO (GTAO) settings from PostProcessConfig; None disables SSAO.
     ssao_settings: Option<crate::gfx::ssao::SsaoSettings>,
@@ -345,6 +384,9 @@ pub(super) fn init_backend(
             light_uniforms,
             shadow_map_size,
             shadow_update,
+            shadow_distance,
+            shadow_cascades,
+            anisotropy,
             text_atlases,
             env_map_bytes,
             post_process,
@@ -405,6 +447,9 @@ pub(super) fn init_backend(
             light_uniforms,
             shadow_map_size,
             shadow_update,
+            shadow_distance,
+            shadow_cascades,
+            anisotropy,
             text_atlases,
             env_map_bytes,
             post_process,
@@ -464,6 +509,9 @@ pub(super) fn init_backend(
             light_uniforms,
             shadow_map_size,
             shadow_update,
+            shadow_distance,
+            shadow_cascades,
+            anisotropy,
             text_atlases,
             env_map_bytes,
             post_process,

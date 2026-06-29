@@ -18,7 +18,7 @@
 // surface is small (five entry points, ~10 structs) and concentrated.
 //
 // The scaler does temporal accumulation itself, so the existing TAA pass
-// is bypassed while upscaling is on (`PostProcessConfig.taa` is
+// is bypassed while upscaling is on (`PostProcessConfig.aa_mode` is
 // ignored). The unified G-buffer pre-pass still runs; FSR consumes its
 // motion + depth targets. Projection jitter is still applied, but per FSR's
 // `ffxQueryDescUpscaleGetJitterOffset`, not the engine's stock Halton

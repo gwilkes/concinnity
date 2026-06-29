@@ -70,6 +70,10 @@ impl RenderBackend for MtlContext {
         fn set_ambient_intensity(&mut self, value: f32);
         fn set_keymap(&mut self, keymap: &crate::gfx::keymap::KeyMap);
         fn apply_quality_settings(&mut self, settings: QualitySettings);
+        fn set_shadow_update(&mut self, update: crate::assets::ShadowUpdate);
+        fn set_shadow_distance(&mut self, distance: u32);
+        fn set_shadow_cascades(&mut self, count: u32);
+        fn update_quality_params(&mut self, settings: QualitySettings);
         fn take_input(&mut self) -> RenderInput;
         fn wait_idle(&self);
         fn update_view(&mut self, matrix: [[f32; 4]; 4]);
@@ -92,6 +96,7 @@ impl RenderBackend for MtlContext {
         fn remove_chunk_mesh(&mut self, draw_idx: usize, retire_frame: u64) -> Result<(), String>;
         fn set_chunk_model(&mut self, draw_idx: usize, model: [[f32; 4]; 4]) -> Result<(), String>;
         fn capabilities(&self) -> crate::gfx::backend::DeviceCapabilities;
+        fn gpu_profile(&self) -> crate::gfx::backend::GpuProfile;
         fn logical_size(&self) -> (f32, f32);
         fn render_stats(&self) -> RenderStats;
         fn update_color_lut(&mut self, size: u32, data: &[u8]) -> Result<(), String>;

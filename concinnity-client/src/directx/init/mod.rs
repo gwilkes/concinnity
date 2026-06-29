@@ -86,6 +86,15 @@ impl DxContext {
         // Shadow-cascade re-render policy: hybrid amortizes the far cascades
         // across frames, every_frame refreshes all cascades every frame.
         shadow_update: crate::assets::ShadowUpdate,
+        // Shadow distance (GraphicsConfig.shadow_distance, world units). The
+        // per-frame cascade split reads it, capped at the camera far plane.
+        shadow_distance: u32,
+        // Shadow cascade count (GraphicsConfig.shadow_cascades, 1..=4). The
+        // per-frame split + schedule read it; applies at the next launch.
+        shadow_cascades: u32,
+        // Scene-sampler max anisotropy (GraphicsConfig.anisotropy), clamped to the
+        // D3D12 1..16 range where the sampler is built below.
+        anisotropy: u32,
         text_atlases: Vec<(u32, u32, Vec<u8>)>,
         // Serialised EnvironmentMap payload (irradiance + prefilter cubemaps).
         // None disables IBL; the runtime binds 1×1 grey fallback cubes and
@@ -100,7 +109,7 @@ impl DxContext {
         // pass. `None` binds a 2×2×2 identity LUT, so the grade is a no-op at
         // any `lut_strength`.
         color_lut_bytes: Option<&[u8]>,
-        // Temporal anti-aliasing toggle (resolved from `PostProcessConfig.taa`).
+        // Temporal anti-aliasing toggle (resolved from `PostProcessConfig.aa_mode`).
         // When set, the renderer jitters the projection, runs a velocity
         // pre-pass + a history-resolve pass, and feeds the resolved image to
         // the bloom + composite passes.
@@ -227,7 +236,7 @@ impl DxContext {
         // FSR3 needs the velocity buffer + the TAA-velocity pre-pass
         // PSOs, both of which live inside `TaaResources`. When upscale
         // is on we force the TAA resources to be built even if the
-        // world's `PostProcessConfig.taa` is off; the TAA *resolve*
+        // world's `PostProcessConfig.aa_mode` is off; the TAA *resolve*
         // pass is still skipped (see `record_frame::seed_inputs`),
         // because FSR owns the temporal accumulation.
         let taa_enabled = taa_enabled || temporal_upscaling;
@@ -589,7 +598,7 @@ impl DxContext {
         let samp_cpu_base = unsafe { sampler_heap.GetCPUDescriptorHandleForHeapStart() };
         let samp_gpu_base = unsafe { sampler_heap.GetGPUDescriptorHandleForHeapStart() };
 
-        create_samplers(&device, samp_cpu_base, sampler_descriptor_size);
+        create_samplers(&device, samp_cpu_base, sampler_descriptor_size, anisotropy);
 
         let shadow_sampler_gpu = D3D12_GPU_DESCRIPTOR_HANDLE {
             ptr: samp_gpu_base.ptr,
@@ -1961,6 +1970,8 @@ impl DxContext {
                 srv_gpu: shadow_srv_gpu,
                 light_dir: shadow_light_dir,
                 update: shadow_update,
+                distance: shadow_distance,
+                cascades: shadow_cascades,
                 scheduler: Default::default(),
                 render_mask: 0,
                 uniforms: crate::gfx::csm::empty_shadow_uniforms(),
@@ -2218,7 +2229,14 @@ impl DxContext {
     }
 }
 
-fn create_samplers(device: &ID3D12Device, base_cpu: D3D12_CPU_DESCRIPTOR_HANDLE, stride: usize) {
+fn create_samplers(
+    device: &ID3D12Device,
+    base_cpu: D3D12_CPU_DESCRIPTOR_HANDLE,
+    stride: usize,
+    // Scene-sampler max anisotropy from GraphicsConfig.anisotropy, clamped to the
+    // D3D12 1..16 range below.
+    anisotropy: u32,
+) {
     // [0] Shadow comparison sampler (LESS_EQUAL).
     let shadow_samp = D3D12_SAMPLER_DESC {
         Filter: D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT,
@@ -2239,14 +2257,15 @@ fn create_samplers(device: &ID3D12Device, base_cpu: D3D12_CPU_DESCRIPTOR_HANDLE,
 
     // [1] Anisotropic repeat (albedo + normal map). Anisotropic filtering plus
     // the unclamped MaxLOD lets minified scene textures trilinear-select down
-    // their mip chain instead of aliasing from mip 0. 8x is well within the
-    // D3D12 feature-level-11 guaranteed maximum of 16.
+    // their mip chain instead of aliasing from mip 0. The degree comes from
+    // GraphicsConfig.anisotropy (default 8), clamped to the D3D12 feature-level-11
+    // guaranteed 1..16 range.
     let linear_samp = D3D12_SAMPLER_DESC {
         Filter: D3D12_FILTER_ANISOTROPIC,
         AddressU: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
         AddressV: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
         AddressW: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
-        MaxAnisotropy: 8,
+        MaxAnisotropy: anisotropy.clamp(1, 16),
         MinLOD: 0.0,
         MaxLOD: f32::MAX,
         ..Default::default()

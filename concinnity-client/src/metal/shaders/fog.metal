@@ -60,6 +60,7 @@ struct FogFroxelParams {
 struct ShadowUniforms {
     float4x4 light_vps[NUM_SHADOW_CASCADES];
     float4   cascade_splits;
+    uint     active_cascades;
 };
 
 // Closed-form Henyey-Greenstein phase function. `cos_theta` is the cosine
@@ -87,7 +88,7 @@ static float fog_shadow_factor(
     else if (view_depth < shadow.cascade_splits[1]) cascade = 1;
     else if (view_depth < shadow.cascade_splits[2]) cascade = 2;
     else if (view_depth < shadow.cascade_splits[3]) cascade = 3;
-    if (cascade >= NUM_SHADOW_CASCADES) return 1.0;
+    if (cascade >= shadow.active_cascades) return 1.0;
 
     float4 light_clip = shadow.light_vps[cascade] * float4(world_pos, 1.0);
     float3 ndc = light_clip.xyz / light_clip.w;

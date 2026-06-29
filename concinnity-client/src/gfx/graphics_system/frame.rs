@@ -11,6 +11,7 @@ use crate::gfx::{
     draw_list::{self},
     scene_reel, settings, sprite as gfx_sprite, text,
 };
+use std::time::{Duration, Instant};
 
 use super::helpers::*;
 use super::*;
@@ -86,6 +87,22 @@ fn set_label_content(ctx: &mut PipelineContext, id: AssetId, text: &str) {
     }
 }
 
+// Set a cycle row's value label from its init-captured id. Used to update a
+// row other than the one that was clicked (the master preset relabels the
+// quality toggles + render scale; a quality-toggle change relabels the master
+// row). The menu's HitRegions are drained after init, so the row -> label map
+// is captured once (`init_cycle_value_labels`) rather than re-queried here.
+fn set_cached_row_label(
+    labels: &std::collections::HashMap<String, AssetId>,
+    ctx: &mut PipelineContext,
+    key: &str,
+    text: &str,
+) {
+    if let Some(&id) = labels.get(key) {
+        set_label_content(ctx, id, text);
+    }
+}
+
 // Move the Sprite with the given id to `x` (its left edge), if present. Used to
 // slide a slider's handle along its track.
 fn set_sprite_x(ctx: &mut PipelineContext, id: AssetId, x: f32) {
@@ -113,10 +130,56 @@ fn rebind_key_of(action: &str) -> Option<&str> {
         .filter(|k| !k.is_empty())
 }
 
+// Frame-pacing math for the FPS cap, split from the sleep so the drift / no-burst
+// logic is unit-testable. Given the current time, the previously scheduled
+// deadline (if any), and the target frame interval, returns `(wait_until, next)`:
+// the deadline to hold this frame's start to, and the deadline to store for the
+// next frame. When the previous deadline is still in the future the cap is met by
+// waiting to it and accumulating exactly (no drift); when it has already passed
+// (a frame that overran the budget) it resets to `now` so a slow frame never
+// triggers a catch-up burst of un-paced frames.
+fn pace_deadline(now: Instant, prev: Option<Instant>, target: Duration) -> (Instant, Instant) {
+    let wait_until = prev.filter(|d| *d > now).unwrap_or(now);
+    (wait_until, wait_until + target)
+}
+
+// The setting key of a cycle row's forward stepper (`setting:<key>:next`), or
+// `None`. A cycle row emits a matching `:prev` region with the same value label,
+// so capturing the `:next` region alone maps each cycle key once.
+fn cycle_next_key_of(action: &str) -> Option<&str> {
+    action
+        .strip_prefix("setting:")?
+        .strip_suffix(":next")
+        .filter(|k| !k.is_empty())
+}
+
 impl GraphicsSystem {
     pub(super) fn run_step(&mut self, ctx: &mut PipelineContext) -> StepResult {
         if self.failed {
             return StepResult::Done;
+        }
+
+        // Frame-rate cap: hold each frame's start to the target interval so the
+        // loop presents at most `fps_cap` times a second. A CPU pacer here is
+        // backend-agnostic -- every backend's present runs later in this same
+        // step -- and runs before `elapsed` below so `dt` reflects the capped
+        // interval. Coarse-sleep to ~1ms before the deadline, then spin for
+        // sub-millisecond precision. `0` = unlimited (skip, and clear the running
+        // deadline so re-enabling starts fresh).
+        if self.fps_cap > 0 {
+            let target = Duration::from_secs_f64(1.0 / self.fps_cap as f64);
+            let (wait_until, next) =
+                pace_deadline(Instant::now(), self.next_frame_deadline, target);
+            while let Some(remaining) = wait_until.checked_duration_since(Instant::now()) {
+                if remaining > Duration::from_millis(1) {
+                    std::thread::sleep(remaining - Duration::from_millis(1));
+                } else {
+                    std::hint::spin_loop();
+                }
+            }
+            self.next_frame_deadline = Some(next);
+        } else {
+            self.next_frame_deadline = None;
         }
 
         let elapsed = self
@@ -529,18 +592,44 @@ impl GraphicsSystem {
                         // `settings::slider_apply_value` (shared with the
                         // persisted re-apply at init, so they cannot diverge).
                         let stored = settings::slider_apply_value(&cmd.setting, value);
+                        let is_qparam = settings::is_quality_param_slider(&cmd.setting);
                         match cmd.setting.as_str() {
                             "exposure" => self.post_process.exposure = stored,
                             "bloom_intensity" => self.post_process.bloom_intensity = stored,
                             "bloom_threshold" => self.post_process.bloom_threshold = stored,
+                            "bloom_knee" => self.post_process.bloom_knee = stored,
                             "vignette" => self.post_process.vignette = stored,
                             "lut_strength" => self.post_process.lut_strength = stored,
+                            // Per-feature sub-quality sliders live on the stored
+                            // PostProcessConfig (the source of truth a later rebuild
+                            // re-derives from); the live apply below mutates the
+                            // backend's stored settings without a rebuild.
+                            "ssao_radius" => self.post_config.ssao_radius = stored,
+                            "ssao_intensity" => self.post_config.ssao_intensity = stored,
+                            "ssr_intensity" => self.post_config.ssr_intensity = stored,
+                            "ssr_max_distance" => self.post_config.ssr_max_distance = stored,
+                            "ssgi_intensity" => self.post_config.ssgi_intensity = stored,
+                            "ssgi_max_distance" => self.post_config.ssgi_max_distance = stored,
+                            "auto_exposure_min_ev" => {
+                                self.post_config.auto_exposure_min_ev = stored
+                            }
+                            "auto_exposure_max_ev" => {
+                                self.post_config.auto_exposure_max_ev = stored
+                            }
+                            "auto_exposure_speed" => self.post_config.auto_exposure_speed = stored,
                             _ => {}
                         }
-                        // Mouse sensitivity is not a render param, so it skips
-                        // the post-process push (the other sliders, incl. the
-                        // ambient re-push, are harmless).
-                        if cmd.setting != "mouse_sensitivity" {
+                        // Apply live. The sub-quality sliders mutate the backend's
+                        // stored *Settings via update_quality_params (re-read into a
+                        // per-frame uniform, no pass rebuild). The post-process
+                        // sliders push PostProcessParams. Mouse sensitivity is not a
+                        // render param, so it skips both (handled below); the ambient
+                        // re-push through update_post_process is harmless.
+                        if is_qparam {
+                            backend.update_quality_params(super::derive_quality_settings(
+                                &self.post_config,
+                            ));
+                        } else if cmd.setting != "mouse_sensitivity" && cmd.setting != "fov" {
                             backend.update_post_process(self.post_process);
                         }
                         // Ambient (IBL) scale lives in LightUniforms, not
@@ -549,14 +638,23 @@ impl GraphicsSystem {
                             self.ambient_intensity = stored;
                             backend.set_ambient_intensity(stored);
                         }
-                        // Mouse sensitivity is owned by the camera controller,
-                        // not the renderer: hand the new radians/pixel value
-                        // across as a ControlsCommand the camera reads this tick
-                        // (live, no restart).
+                        // Mouse sensitivity and FOV take effect on the camera, not
+                        // the renderer: hand the new value across as a
+                        // ControlsCommand the camera reads this tick (live, no
+                        // restart). Each carries only the field it changed.
                         if cmd.setting == "mouse_sensitivity" {
                             ctx.events_mut::<crate::assets::ControlsCommand>().send(
                                 crate::assets::ControlsCommand {
-                                    mouse_sensitivity: stored,
+                                    mouse_sensitivity: Some(stored),
+                                    fov_y_degrees: None,
+                                },
+                            );
+                        }
+                        if cmd.setting == "fov" {
+                            ctx.events_mut::<crate::assets::ControlsCommand>().send(
+                                crate::assets::ControlsCommand {
+                                    mouse_sensitivity: None,
+                                    fov_y_degrees: Some(stored),
                                 },
                             );
                         }
@@ -581,14 +679,33 @@ impl GraphicsSystem {
                                 "exposure" => cfg.graphics.exposure_ev = Some(value),
                                 "bloom_intensity" => cfg.graphics.bloom_intensity = Some(value),
                                 "bloom_threshold" => cfg.graphics.bloom_threshold = Some(value),
+                                "bloom_knee" => cfg.graphics.bloom_knee = Some(value),
                                 "vignette" => cfg.graphics.vignette = Some(value),
                                 "lut_strength" => cfg.graphics.lut_strength = Some(value),
                                 "ambient_intensity" => cfg.graphics.ambient_intensity = Some(value),
+                                "ssao_radius" => cfg.graphics.ssao_radius = Some(value),
+                                "ssao_intensity" => cfg.graphics.ssao_intensity = Some(value),
+                                "ssr_intensity" => cfg.graphics.ssr_intensity = Some(value),
+                                "ssr_max_distance" => cfg.graphics.ssr_max_distance = Some(value),
+                                "ssgi_intensity" => cfg.graphics.ssgi_intensity = Some(value),
+                                "ssgi_max_distance" => cfg.graphics.ssgi_max_distance = Some(value),
+                                "auto_exposure_min_ev" => {
+                                    cfg.graphics.auto_exposure_min_ev = Some(value)
+                                }
+                                "auto_exposure_max_ev" => {
+                                    cfg.graphics.auto_exposure_max_ev = Some(value)
+                                }
+                                "auto_exposure_speed" => {
+                                    cfg.graphics.auto_exposure_speed = Some(value)
+                                }
                                 // Persist the radians/pixel value (what the
                                 // camera reads), not the 1..100 UI value.
                                 "mouse_sensitivity" => {
                                     cfg.controls.mouse_sensitivity = Some(stored)
                                 }
+                                // FOV persists the clamped degrees (a graphics
+                                // preference, stored alongside the look sliders).
+                                "fov" => cfg.graphics.fov = Some(stored),
                                 _ => {}
                             }
                             if let Err(e) = cfg.save() {
@@ -598,6 +715,197 @@ impl GraphicsSystem {
                                     e
                                 );
                             }
+                        }
+                        continue;
+                    }
+                    // Master "Graphics Quality" preset row. A preset is a
+                    // performance ceiling over the world's authored look (it never
+                    // enables a feature the world did not author), so picking a
+                    // tier / Auto clears the per-row quality overrides and
+                    // re-derives the toggles + render scale from the world's
+                    // authored config under the new ceiling: raising a preset
+                    // restores the world's features, lowering it clamps them off.
+                    // Custom resolves to the no-op ceiling (the world's look).
+                    // Render scale is restart-required, so it only persists +
+                    // relabels here. See gfx/quality_preset.rs.
+                    if cmd.setting == "graphics_quality" {
+                        use crate::gfx::quality_preset;
+                        let opts = settings::options("graphics_quality").unwrap_or(&[]);
+                        let cur = quality_preset::preset_index(self.quality_preset);
+                        let next = settings::cycle(cur, opts.len(), cmd.op);
+                        let preset = quality_preset::preset_at(next);
+                        self.quality_preset = preset;
+                        let ceiling = quality_preset::resolve_ceiling(preset, &self.gpu_profile);
+
+                        // Re-derive the live quality toggles from the world
+                        // baseline under the new ceiling (force off where
+                        // disallowed; never turn on).
+                        self.post_config = self.authored_post_config.clone();
+                        for (key, allowed) in [
+                            ("ssao", ceiling.ssao),
+                            ("ssr", ceiling.ssr),
+                            ("ray_traced_reflections", ceiling.ray_traced_reflections),
+                            ("ssgi", ceiling.ssgi),
+                            ("auto_exposure", ceiling.auto_exposure),
+                        ] {
+                            if !allowed {
+                                super::set_quality_toggle(&mut self.post_config, key, false);
+                            }
+                        }
+                        // And clamp the cycle quality knobs (AA mode + SSGI gather
+                        // + reflection blur) under the ceiling (overrides cleared,
+                        // so clamp every one).
+                        for key in settings::QUALITY_CYCLE_KEYS {
+                            super::clamp_quality_cycle(&mut self.post_config, key, &ceiling, false);
+                        }
+                        // The composite FXAA flag rides PostProcessParams (pushed
+                        // by update_post_process below), so refresh it from the
+                        // re-derived AA mode before that push.
+                        self.post_process.fxaa = if self.post_config.aa_mode.fxaa_enabled() {
+                            1.0
+                        } else {
+                            0.0
+                        };
+                        backend.apply_quality_settings(super::derive_quality_settings(
+                            &self.post_config,
+                        ));
+                        // Auto-exposure may have flipped off; re-push the static
+                        // post-process params so exposure reverts (mirrors the
+                        // quality-toggle arm below).
+                        backend.update_post_process(self.post_process);
+                        // Restart-required: update the live render scale for the
+                        // row label only (the upscaler + targets are sized at init,
+                        // so it takes effect at the next launch).
+                        self.render_scale = quality_preset::more_aggressive_upscale(
+                            self.authored_post_config.upscale_quality,
+                            ceiling.min_upscale,
+                        );
+                        // Re-derive the shadow knobs from the authored baselines
+                        // under the new ceiling. The cadence is live (the scheduler
+                        // reads it each frame); the resolution is restart-required,
+                        // so it only updates the row label below.
+                        self.shadow_map_size = quality_preset::clamp_shadow_map_size(
+                            self.authored_shadow_map_size,
+                            &ceiling,
+                        );
+                        self.shadow_update = quality_preset::clamp_shadow_update(
+                            self.authored_shadow_update,
+                            &ceiling,
+                        );
+                        backend.set_shadow_update(self.shadow_update);
+                        // Shadow distance: live (the cascade-split math reads it
+                        // each frame), so re-derive from the authored baseline and
+                        // push it to the backend.
+                        self.shadow_distance = quality_preset::clamp_shadow_distance(
+                            self.authored_shadow_distance,
+                            &ceiling,
+                        );
+                        backend.set_shadow_distance(self.shadow_distance);
+                        // Shadow cascade count: live (the per-frame split + schedule
+                        // read it), so re-derive from the authored baseline and push.
+                        self.shadow_cascades = quality_preset::clamp_shadow_cascades(
+                            self.authored_shadow_cascades,
+                            &ceiling,
+                        );
+                        backend.set_shadow_cascades(self.shadow_cascades);
+                        // Anisotropy: restart-required, so re-derive from the
+                        // authored baseline for the row label only (the sampler is
+                        // built at init; the new degree takes effect next launch).
+                        self.anisotropy =
+                            quality_preset::clamp_anisotropy(self.authored_anisotropy, &ceiling);
+
+                        // Persist the preset and drop the per-row quality overrides,
+                        // so the next launch re-resolves them from the world +
+                        // ceiling exactly as this live re-derive did.
+                        let mut cfg = crate::config::Settings::load();
+                        cfg.graphics.quality_preset = Some(preset);
+                        cfg.graphics.aa_mode = None;
+                        cfg.graphics.ssao = None;
+                        cfg.graphics.ssr = None;
+                        cfg.graphics.ray_traced_reflections = None;
+                        cfg.graphics.ssgi = None;
+                        cfg.graphics.auto_exposure = None;
+                        cfg.graphics.ssgi_resolution = None;
+                        cfg.graphics.ssgi_rays = None;
+                        cfg.graphics.ssgi_steps = None;
+                        cfg.graphics.reflection_blur_resolution = None;
+                        cfg.graphics.shadow_map_size = None;
+                        cfg.graphics.shadow_update = None;
+                        cfg.graphics.shadow_distance = None;
+                        cfg.graphics.shadow_cascades = None;
+                        cfg.graphics.anisotropy = None;
+                        cfg.graphics.render_scale = None;
+                        if let Err(e) = cfg.save() {
+                            tracing::warn!("GraphicsSystem: persist preset: {e}");
+                        }
+
+                        // Refresh the dependent rows (quality toggles + render
+                        // scale) from the init-captured value-label ids -- the
+                        // menu's HitRegions are drained by UiInputSystem after
+                        // init, so they cannot be re-queried here.
+                        for key in settings::QUALITY_TOGGLE_KEYS {
+                            let on =
+                                super::quality_toggle_on(&self.post_config, key).unwrap_or(false);
+                            if let Some(text) =
+                                settings::options(key).and_then(|o| o.get(on as usize).copied())
+                            {
+                                set_cached_row_label(&self.cycle_value_labels, ctx, key, text);
+                            }
+                        }
+                        if let Some(text) = settings::options("render_scale").and_then(|o| {
+                            o.get(settings::render_scale_index(self.render_scale))
+                                .copied()
+                        }) {
+                            set_cached_row_label(
+                                &self.cycle_value_labels,
+                                ctx,
+                                "render_scale",
+                                text,
+                            );
+                        }
+                        for key in settings::QUALITY_CYCLE_KEYS {
+                            if let Some(text) = super::quality_cycle_index(&self.post_config, key)
+                                .and_then(|idx| {
+                                    settings::options(key).and_then(|o| o.get(idx).copied())
+                                })
+                            {
+                                set_cached_row_label(&self.cycle_value_labels, ctx, key, text);
+                            }
+                        }
+                        // And the shadow + anisotropy rows (their state lives on
+                        // self, not the post_config, so they relabel from the live
+                        // fields).
+                        for key in [
+                            "shadow_map_size",
+                            "shadow_update",
+                            "shadow_distance",
+                            "shadow_cascades",
+                            "anisotropy",
+                        ] {
+                            let idx = match key {
+                                "shadow_map_size" => {
+                                    settings::shadow_resolution_index(self.shadow_map_size)
+                                }
+                                "shadow_distance" => {
+                                    settings::shadow_distance_index(self.shadow_distance)
+                                }
+                                "shadow_cascades" => {
+                                    settings::shadow_cascades_index(self.shadow_cascades)
+                                }
+                                "anisotropy" => settings::anisotropy_index(self.anisotropy),
+                                _ => settings::shadow_update_index(self.shadow_update),
+                            };
+                            if let Some(text) =
+                                settings::options(key).and_then(|o| o.get(idx).copied())
+                            {
+                                set_cached_row_label(&self.cycle_value_labels, ctx, key, text);
+                            }
+                        }
+                        // The master row's own label carries the Auto(tier) suffix
+                        // and is updated through the event-carried value-label id.
+                        let label = quality_preset::preset_label(preset, &self.gpu_profile);
+                        if let Some(id) = cmd.value_label {
+                            set_label_content(ctx, id, &label);
                         }
                         continue;
                     }
@@ -615,6 +923,19 @@ impl GraphicsSystem {
                             self.vsync = next == 1;
                             backend.set_vsync(self.vsync);
                             cfg.graphics.vsync = Some(self.vsync);
+                            Some(opts[next])
+                        }
+                        "fps_cap" => {
+                            let cur = settings::fps_cap_index(self.fps_cap);
+                            let next = settings::cycle(cur, opts.len(), cmd.op);
+                            self.fps_cap = settings::fps_cap_at(next);
+                            // Live with no backend call: the pacer at the top of
+                            // run_step reads self.fps_cap each frame. Clearing the
+                            // running deadline re-bases the pacer from the next
+                            // frame, so changing the cap never leaves one stale
+                            // long wait. Independent of the preset (no Custom flip).
+                            self.next_frame_deadline = None;
+                            cfg.graphics.fps_cap = Some(self.fps_cap);
                             Some(opts[next])
                         }
                         "window_mode" => {
@@ -660,6 +981,39 @@ impl GraphicsSystem {
                             let next = settings::cycle(cur, opts.len(), cmd.op);
                             self.render_scale = settings::render_scale_at(next);
                             cfg.graphics.render_scale = Some(self.render_scale);
+                            // Render scale is ceiling-governed, so an explicit
+                            // choice opts the master preset out to Custom.
+                            self.quality_preset = crate::gfx::quality_preset::QualityPreset::Custom;
+                            cfg.graphics.quality_preset = Some(self.quality_preset);
+                            set_cached_row_label(
+                                &self.cycle_value_labels,
+                                ctx,
+                                "graphics_quality",
+                                self.quality_preset.name(),
+                            );
+                            Some(opts[next])
+                        }
+                        "upscale_backend" => {
+                            // Restart-required: persist + display only; the
+                            // upscaler is selected + built once at init. Independent
+                            // of the quality preset (a user / hardware preference,
+                            // not a tier), so no Custom-flip and no live backend
+                            // call. The cycle skips upscalers this GPU vendor does
+                            // not offer (DLSS NVIDIA-only, XeSS Intel-only); Auto /
+                            // FSR3 are always available, so the loop terminates.
+                            let mut next = settings::cycle(
+                                settings::upscale_backend_index(self.upscale_backend),
+                                opts.len(),
+                                cmd.op,
+                            );
+                            while !settings::upscale_backend_available(
+                                settings::upscale_backend_at(next),
+                                self.gpu_profile.vendor,
+                            ) {
+                                next = settings::cycle(next, opts.len(), cmd.op);
+                            }
+                            self.upscale_backend = settings::upscale_backend_at(next);
+                            cfg.graphics.upscale_backend = Some(self.upscale_backend);
                             Some(opts[next])
                         }
                         "master_volume" => {
@@ -695,7 +1049,6 @@ impl GraphicsSystem {
                             let on = next == 1;
                             super::set_quality_toggle(&mut self.post_config, key, on);
                             match key {
-                                "taa" => cfg.graphics.taa = Some(on),
                                 "ssao" => cfg.graphics.ssao = Some(on),
                                 "ssr" => cfg.graphics.ssr = Some(on),
                                 "ray_traced_reflections" => {
@@ -705,6 +1058,17 @@ impl GraphicsSystem {
                                 "auto_exposure" => cfg.graphics.auto_exposure = Some(on),
                                 _ => {}
                             }
+                            // An explicit per-row quality change opts the master
+                            // preset out to Custom (no ceiling clamps the user's
+                            // choice), and updates the master row's label to match.
+                            self.quality_preset = crate::gfx::quality_preset::QualityPreset::Custom;
+                            cfg.graphics.quality_preset = Some(self.quality_preset);
+                            set_cached_row_label(
+                                &self.cycle_value_labels,
+                                ctx,
+                                "graphics_quality",
+                                self.quality_preset.name(),
+                            );
                             backend.apply_quality_settings(super::derive_quality_settings(
                                 &self.post_config,
                             ));
@@ -719,6 +1083,222 @@ impl GraphicsSystem {
                             if key == "auto_exposure" {
                                 backend.update_post_process(self.post_process);
                             }
+                            Some(opts[next])
+                        }
+                        // Cycle quality knobs (SSGI gather sub-quality dropdowns):
+                        // cycle the value on the stored config, persist it, flip
+                        // the preset to Custom, then rebuild the affected effect
+                        // live (Metal; a no-op backend keeps the choice for the
+                        // next launch). Rides the same apply_quality_settings path
+                        // as the toggles -- the sub-tunable travels in the feature's
+                        // settings payload, so no new backend method is needed.
+                        key if super::is_quality_cycle(key) => {
+                            let cur =
+                                super::quality_cycle_index(&self.post_config, key).unwrap_or(0);
+                            let next = settings::cycle(cur, opts.len(), cmd.op);
+                            super::set_quality_cycle(&mut self.post_config, key, next);
+                            match key {
+                                "aa_mode" => cfg.graphics.aa_mode = Some(self.post_config.aa_mode),
+                                "ssgi_resolution" => {
+                                    cfg.graphics.ssgi_resolution =
+                                        Some(self.post_config.ssgi_resolution)
+                                }
+                                "ssgi_rays" => {
+                                    cfg.graphics.ssgi_rays = Some(self.post_config.ssgi_rays)
+                                }
+                                "ssgi_steps" => {
+                                    cfg.graphics.ssgi_steps = Some(self.post_config.ssgi_steps)
+                                }
+                                "reflection_blur_resolution" => {
+                                    cfg.graphics.reflection_blur_resolution =
+                                        Some(self.post_config.reflection_blur_resolution)
+                                }
+                                _ => {}
+                            }
+                            self.quality_preset = crate::gfx::quality_preset::QualityPreset::Custom;
+                            cfg.graphics.quality_preset = Some(self.quality_preset);
+                            set_cached_row_label(
+                                &self.cycle_value_labels,
+                                ctx,
+                                "graphics_quality",
+                                self.quality_preset.name(),
+                            );
+                            backend.apply_quality_settings(super::derive_quality_settings(
+                                &self.post_config,
+                            ));
+                            // The AA mode also drives the composite FXAA flag,
+                            // which rides PostProcessParams rather than the
+                            // QualitySettings rebuild above. Refresh it and push it
+                            // live (the TAA pass itself rebuilt via the call above).
+                            if key == "aa_mode" {
+                                self.post_process.fxaa = if self.post_config.aa_mode.fxaa_enabled()
+                                {
+                                    1.0
+                                } else {
+                                    0.0
+                                };
+                                backend.update_post_process(self.post_process);
+                            }
+                            Some(opts[next])
+                        }
+                        // Display-output / upscaling preference toggles. Restart-
+                        // required: persist + display only (the swapchain format /
+                        // render targets are sized once at init, so it applies at
+                        // the next launch). Independent of the quality preset, so
+                        // no Custom-flip and no live backend call.
+                        key @ ("temporal_upscaling" | "hdr_display" | "hdr_pq") => {
+                            let cur = match key {
+                                "temporal_upscaling" => self.temporal_upscaling,
+                                "hdr_display" => self.hdr_display,
+                                _ => self.hdr_pq,
+                            };
+                            let next = settings::cycle(cur as usize, opts.len(), cmd.op);
+                            let on = next == 1;
+                            match key {
+                                "temporal_upscaling" => {
+                                    self.temporal_upscaling = on;
+                                    cfg.graphics.temporal_upscaling = Some(on);
+                                }
+                                "hdr_display" => {
+                                    self.hdr_display = on;
+                                    cfg.graphics.hdr_display = Some(on);
+                                }
+                                _ => {
+                                    self.hdr_pq = on;
+                                    cfg.graphics.hdr_pq = Some(on);
+                                }
+                            }
+                            Some(opts[next])
+                        }
+                        // Shadow resolution: restart-required (the shadow map array
+                        // is sized once at init), so persist + display only; the
+                        // new size takes effect at the next launch. Preset-governed,
+                        // so an explicit choice opts the master preset out to Custom.
+                        "shadow_map_size" => {
+                            let cur = settings::shadow_resolution_index(self.shadow_map_size);
+                            let next = settings::cycle(cur, opts.len(), cmd.op);
+                            self.shadow_map_size = settings::shadow_resolution_at(next);
+                            cfg.graphics.shadow_map_size = Some(self.shadow_map_size);
+                            self.quality_preset = crate::gfx::quality_preset::QualityPreset::Custom;
+                            cfg.graphics.quality_preset = Some(self.quality_preset);
+                            set_cached_row_label(
+                                &self.cycle_value_labels,
+                                ctx,
+                                "graphics_quality",
+                                self.quality_preset.name(),
+                            );
+                            Some(opts[next])
+                        }
+                        // Anisotropic filtering: restart-required (the scene
+                        // sampler is built once at init), so persist + display only;
+                        // the new degree takes effect at the next launch. Preset-
+                        // governed, so an explicit choice opts the master preset out
+                        // to Custom.
+                        "anisotropy" => {
+                            let cur = settings::anisotropy_index(self.anisotropy);
+                            let next = settings::cycle(cur, opts.len(), cmd.op);
+                            self.anisotropy = settings::anisotropy_at(next);
+                            cfg.graphics.anisotropy = Some(self.anisotropy);
+                            self.quality_preset = crate::gfx::quality_preset::QualityPreset::Custom;
+                            cfg.graphics.quality_preset = Some(self.quality_preset);
+                            set_cached_row_label(
+                                &self.cycle_value_labels,
+                                ctx,
+                                "graphics_quality",
+                                self.quality_preset.name(),
+                            );
+                            Some(opts[next])
+                        }
+                        // Shadow re-render cadence: live -- the cascade scheduler
+                        // reads the policy each frame, so it applies on the next
+                        // draw. Preset-governed, so an explicit choice flips the
+                        // master preset to Custom.
+                        "shadow_update" => {
+                            let cur = settings::shadow_update_index(self.shadow_update);
+                            let next = settings::cycle(cur, opts.len(), cmd.op);
+                            self.shadow_update = settings::shadow_update_at(next);
+                            backend.set_shadow_update(self.shadow_update);
+                            cfg.graphics.shadow_update = Some(self.shadow_update);
+                            self.quality_preset = crate::gfx::quality_preset::QualityPreset::Custom;
+                            cfg.graphics.quality_preset = Some(self.quality_preset);
+                            set_cached_row_label(
+                                &self.cycle_value_labels,
+                                ctx,
+                                "graphics_quality",
+                                self.quality_preset.name(),
+                            );
+                            Some(opts[next])
+                        }
+                        // Shadow distance: live -- the per-frame cascade-split math
+                        // reads it, so it applies on the next draw. Preset-governed,
+                        // so an explicit choice flips the master preset to Custom.
+                        "shadow_distance" => {
+                            let cur = settings::shadow_distance_index(self.shadow_distance);
+                            let next = settings::cycle(cur, opts.len(), cmd.op);
+                            self.shadow_distance = settings::shadow_distance_at(next);
+                            backend.set_shadow_distance(self.shadow_distance);
+                            cfg.graphics.shadow_distance = Some(self.shadow_distance);
+                            self.quality_preset = crate::gfx::quality_preset::QualityPreset::Custom;
+                            cfg.graphics.quality_preset = Some(self.quality_preset);
+                            set_cached_row_label(
+                                &self.cycle_value_labels,
+                                ctx,
+                                "graphics_quality",
+                                self.quality_preset.name(),
+                            );
+                            Some(opts[next])
+                        }
+                        // Shadow cascade count: live -- the per-frame split + schedule
+                        // read it, so it applies on the next draw. Preset-governed, so
+                        // an explicit choice flips the master preset to Custom.
+                        "shadow_cascades" => {
+                            let cur = settings::shadow_cascades_index(self.shadow_cascades);
+                            let next = settings::cycle(cur, opts.len(), cmd.op);
+                            self.shadow_cascades = settings::shadow_cascades_at(next);
+                            backend.set_shadow_cascades(self.shadow_cascades);
+                            cfg.graphics.shadow_cascades = Some(self.shadow_cascades);
+                            self.quality_preset = crate::gfx::quality_preset::QualityPreset::Custom;
+                            cfg.graphics.quality_preset = Some(self.quality_preset);
+                            set_cached_row_label(
+                                &self.cycle_value_labels,
+                                ctx,
+                                "graphics_quality",
+                                self.quality_preset.name(),
+                            );
+                            Some(opts[next])
+                        }
+                        // System / streaming restart rows. Restart-required (the
+                        // ring buffers / cull pipeline / streaming pool are sized
+                        // once at init), so persist + display only; independent of
+                        // the quality preset, so no Custom-flip and no live call.
+                        "frames_in_flight" => {
+                            let cur =
+                                settings::frames_in_flight_index(self.frames_in_flight as u32);
+                            let next = settings::cycle(cur, opts.len(), cmd.op);
+                            self.frames_in_flight = settings::frames_in_flight_at(next) as usize;
+                            cfg.graphics.frames_in_flight = Some(self.frames_in_flight as u32);
+                            Some(opts[next])
+                        }
+                        "occlusion_two_pass" => {
+                            let next = settings::cycle(
+                                self.occlusion_two_pass as usize,
+                                opts.len(),
+                                cmd.op,
+                            );
+                            self.occlusion_two_pass = next == 1;
+                            cfg.graphics.occlusion_two_pass = Some(self.occlusion_two_pass);
+                            Some(opts[next])
+                        }
+                        // One row drives both the streaming pool cap and the
+                        // per-frame upload budget.
+                        "texture_quality" => {
+                            let cur = settings::texture_quality_index(self.texture_cap);
+                            let next = settings::cycle(cur, opts.len(), cmd.op);
+                            let (cap, budget) = settings::texture_quality_at(next);
+                            self.texture_cap = cap;
+                            self.texture_budget = budget;
+                            cfg.graphics.texture_cap = Some(cap);
+                            cfg.graphics.texture_budget = Some(budget);
                             Some(opts[next])
                         }
                         _ => None,
@@ -1096,6 +1676,21 @@ impl GraphicsSystem {
         self.rebind_rows = rows;
     }
 
+    // Capture each cycle row's setting key -> value-label id, so a runtime change
+    // can relabel a row other than the one clicked (the master preset relabels
+    // its dependents; a quality-toggle change relabels the master row). Runs at
+    // init, before UiInputSystem drains the HitRegions (GraphicsSystem.init runs
+    // first), since they cannot be re-queried once drained.
+    pub(super) fn init_cycle_value_labels(&mut self, ctx: &mut PipelineContext) {
+        let mut labels = std::collections::HashMap::new();
+        for r in ctx.query::<HitRegion>() {
+            if let (Some(key), Some(value_id)) = (cycle_next_key_of(&r.action), r.label) {
+                labels.insert(key.to_string(), value_id);
+            }
+        }
+        self.cycle_value_labels = labels;
+    }
+
     // Capture each ScrollPanel's per-element clip band (reference space) so the
     // draw path scissors scroll-content elements to their panel and off-band
     // rows do not bleed over the chrome. Runs at init, before UiInputSystem
@@ -1170,15 +1765,32 @@ impl GraphicsSystem {
             "exposure" => self.post_process.exposure,
             "bloom_intensity" => self.post_process.bloom_intensity,
             "bloom_threshold" => self.post_process.bloom_threshold,
+            "bloom_knee" => self.post_process.bloom_knee,
             "vignette" => self.post_process.vignette,
             "lut_strength" => self.post_process.lut_strength,
             "ambient_intensity" => self.ambient_intensity,
+            // Per-feature sub-quality sliders read from the stored PostProcessConfig.
+            "ssao_radius" => self.post_config.ssao_radius,
+            "ssao_intensity" => self.post_config.ssao_intensity,
+            "ssr_intensity" => self.post_config.ssr_intensity,
+            "ssr_max_distance" => self.post_config.ssr_max_distance,
+            "ssgi_intensity" => self.post_config.ssgi_intensity,
+            "ssgi_max_distance" => self.post_config.ssgi_max_distance,
+            "auto_exposure_min_ev" => self.post_config.auto_exposure_min_ev,
+            "auto_exposure_max_ev" => self.post_config.auto_exposure_max_ev,
+            "auto_exposure_speed" => self.post_config.auto_exposure_speed,
             // Mouse sensitivity lives in the controls store (radians/pixel), not
             // the render params; read the persisted value or the authored default.
             "mouse_sensitivity" => crate::config::Settings::load()
                 .controls
                 .mouse_sensitivity
                 .unwrap_or(settings::DEFAULT_MOUSE_SENSITIVITY),
+            // FOV lives in the graphics store (degrees); read the persisted value
+            // or the authored default.
+            "fov" => crate::config::Settings::load()
+                .graphics
+                .fov
+                .unwrap_or(settings::DEFAULT_FOV),
             _ => return None,
         };
         // Invert `slider_apply_value` to the user-facing value (exposure: 2^ev ->
@@ -1191,6 +1803,41 @@ impl GraphicsSystem {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn pace_deadline_first_frame_does_not_wait() {
+        // No previous deadline: wait until now (no sleep), schedule now + target.
+        let now = Instant::now();
+        let target = Duration::from_millis(16);
+        let (wait_until, next) = pace_deadline(now, None, target);
+        assert_eq!(wait_until, now);
+        assert_eq!(next, now + target);
+    }
+
+    #[test]
+    fn pace_deadline_accumulates_exactly_when_ahead() {
+        // A frame finished early: the previous deadline is still in the future,
+        // so hold to it and accumulate exactly (no drift from `now`).
+        let now = Instant::now();
+        let target = Duration::from_millis(16);
+        let prev = now + Duration::from_millis(10);
+        let (wait_until, next) = pace_deadline(now, Some(prev), target);
+        assert_eq!(wait_until, prev);
+        assert_eq!(next, prev + target);
+    }
+
+    #[test]
+    fn pace_deadline_resets_after_overrun_without_burst() {
+        // The frame overran: the previous deadline is in the past, so re-base to
+        // `now` (no wait this frame) and schedule from now -- never a catch-up
+        // burst of un-paced frames.
+        let now = Instant::now();
+        let target = Duration::from_millis(16);
+        let past = now - Duration::from_millis(5);
+        let (wait_until, next) = pace_deadline(now, Some(past), target);
+        assert_eq!(wait_until, now);
+        assert_eq!(next, now + target);
+    }
 
     // A gated value label pulls in every element of the scroll row that holds
     // it (the row's background, name, value, and stepper glyphs), so the whole

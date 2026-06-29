@@ -51,9 +51,29 @@ pub struct GraphicsSystem {
     clear_color: [f32; 4],
     frames_in_flight: usize,
     vsync: bool,
+    // Frame-rate cap in FPS (GraphicsConfig.fps_cap; 0 = unlimited). Applied live
+    // by a CPU frame pacer at the top of each render step, so it is backend-
+    // agnostic and needs no trait method. Independent of the quality preset (a
+    // user/hardware preference, like vsync). `next_frame_deadline` is the pacer's
+    // running target for the next frame's start.
+    fps_cap: u32,
+    next_frame_deadline: Option<Instant>,
     max_frames: Option<u64>,
     shadow_map_size: u32,
     shadow_update: crate::assets::ShadowUpdate,
+    // Shadow distance in world units (GraphicsConfig.shadow_distance). Applied
+    // live via set_shadow_distance (the per-frame cascade-split math reads it);
+    // preset-governed (a manual change flips the master preset to Custom).
+    shadow_distance: u32,
+    // Active shadow cascade count, 1..=4 (GraphicsConfig.shadow_cascades). Applied
+    // live via set_shadow_cascades (the per-frame split + schedule read it);
+    // preset-governed (a manual change flips the master preset to Custom).
+    shadow_cascades: u32,
+    // Scene-sampler max anisotropy. Restart-required (the sampler is built once at
+    // backend init from this), so this is display/persist state; the value reaches
+    // the backend through the ctor. Preset-governed (a manual change flips the
+    // master preset to Custom).
+    anisotropy: u32,
     failed: bool,
     start_time: Option<Instant>,
     frame_count: u64,
@@ -71,6 +91,11 @@ pub struct GraphicsSystem {
     // cycles + persists it; it is restart-required, so this is display/persist
     // state only (the upscaler is sized once at init).
     render_scale: crate::assets::UpscaleQuality,
+    // Current upscaler backend (Auto / FSR3 / DLSS / XeSS), seeded at init from
+    // the world's PostProcessConfig overridden by any persisted choice. Like
+    // render_scale this is restart-required display/persist state (the upscaler
+    // is selected + built once at init); DirectX / Vulkan only.
+    upscale_backend: crate::assets::UpscalerBackend,
     // The active render backend, constructed during init() and driven each
     // step. Boxed `dyn RenderBackend` so the per-frame logic in init.rs /
     // frame.rs / streaming.rs / scene.rs runs as one cfg-free path across
@@ -166,6 +191,12 @@ pub struct GraphicsSystem {
     // handle Sprites. Drives the handle position + value-label update when a
     // slider changes, and the one-time sync of both to the live value at init.
     sliders: Vec<SliderViz>,
+    // Cycle rows' setting key -> value-label id, captured at init from their
+    // `setting:<key>:next` HitRegions (drained by UiInputSystem afterwards). Lets
+    // a runtime change relabel a row other than the one clicked: the master
+    // "Graphics Quality" preset relabels the quality toggles + render scale it
+    // re-derives, and an individual quality-row change relabels the master row.
+    cycle_value_labels: std::collections::HashMap<String, AssetId>,
     // Per-element clip bands (reference space) captured at init from the world's
     // ScrollPanels: each scroll-content element id maps to its panel's content
     // band, so the draw path scissors it and off-band rows do not bleed over the
@@ -185,6 +216,53 @@ pub struct GraphicsSystem {
     // cannot provide (e.g. ray-traced reflections without hardware ray tracing)
     // is grayed out and made inert. Held in memory only, never persisted.
     caps: crate::gfx::backend::DeviceCapabilities,
+    // Coarse GPU performance profile, probed before the backend is built so the
+    // auto-config quality ceiling can influence the render targets / effect
+    // pipelines sized at backend init. Held in memory only, never persisted.
+    gpu_profile: crate::gfx::backend::GpuProfile,
+    // The live master "Graphics Quality" preset the settings-menu row cycles.
+    // Seeded at init from the persisted choice (or `Auto` on first launch);
+    // changing a preset re-derives the quality toggles + render scale under its
+    // ceiling, and changing any individual quality row flips this to `Custom`.
+    quality_preset: crate::gfx::quality_preset::QualityPreset,
+    // The world's authored PostProcessConfig before the user overrides + preset
+    // ceiling are applied (defaulted when the world declares none). The pristine
+    // baseline a live preset change re-clamps from, so up-shifting a preset
+    // restores the world's features and down-shifting clamps them off.
+    authored_post_config: crate::assets::PostProcessConfig,
+    // Display-output / upscaling preferences (the Display settings rows). Resolved
+    // at init from the world's `PostProcessConfig` overridden by any persisted
+    // choice, passed to the backend ctor, and held here so the rows display +
+    // cycle them. Restart-required (swapchain format / render targets are sized
+    // once at init), so a runtime change only persists + relabels; independent of
+    // the quality preset.
+    temporal_upscaling: bool,
+    hdr_display: bool,
+    hdr_pq: bool,
+    // The world's authored shadow knobs before the user overrides + preset ceiling
+    // (defaulted when the world declares no GraphicsConfig). The pristine baseline
+    // a live preset change re-clamps from, like `authored_post_config`. The live
+    // values are `shadow_map_size` / `shadow_update` above.
+    authored_shadow_map_size: u32,
+    authored_shadow_update: crate::assets::ShadowUpdate,
+    // The world's authored shadow distance, the baseline a live preset change
+    // re-clamps from. The live value is `shadow_distance` above.
+    authored_shadow_distance: u32,
+    // The world's authored shadow cascade count, the baseline a live preset
+    // change re-clamps from. The live value is `shadow_cascades` above.
+    authored_shadow_cascades: u32,
+    // The world's authored anisotropy degree before the user override + preset
+    // ceiling, the baseline a live preset change re-clamps from (like
+    // `authored_shadow_map_size`). The live value is `anisotropy` above.
+    authored_anisotropy: u32,
+    // System / streaming restart preferences (the Advanced "Frame Buffering",
+    // "Occlusion Culling", and "Texture Quality" rows). Resolved at init from the
+    // world's config overridden by any persisted choice, passed to the backend
+    // ctor / streamer, and held here so the rows display + cycle them. Restart-
+    // required, independent of the quality preset. `frames_in_flight` lives above.
+    occlusion_two_pass: bool,
+    texture_cap: u32,
+    texture_budget: u32,
 }
 
 // One key-rebind row's runtime bookkeeping: the action it rebinds and the value
@@ -299,15 +377,21 @@ impl GraphicsSystem {
             clear_color: [0.01, 0.01, 0.02, 1.0],
             frames_in_flight: 2,
             vsync: false,
+            fps_cap: 0,
+            next_frame_deadline: None,
             max_frames: None,
             shadow_map_size: 2048,
             shadow_update: crate::assets::ShadowUpdate::default(),
+            shadow_distance: 80,
+            shadow_cascades: 4,
+            anisotropy: 8,
             failed: false,
             start_time: None,
             frame_count: 0,
             cursor_pos: (0.0, 0.0),
             menu_mode: false,
             render_scale: crate::assets::UpscaleQuality::default(),
+            upscale_backend: crate::assets::UpscalerBackend::default(),
             backend: None,
             reel: None,
             scene_cmd_cursor: crate::ecs::EventCursor::default(),
@@ -332,11 +416,30 @@ impl GraphicsSystem {
             // Default until init resolves the world's config + persisted toggles.
             post_config: crate::assets::PostProcessConfig::default(),
             sliders: Vec::new(),
+            cycle_value_labels: std::collections::HashMap::new(),
             clip_rects: std::collections::HashMap::new(),
             keymap: crate::gfx::keymap::KeyMap::default(),
             rebind_rows: Vec::new(),
             // All-capable until the backend reports otherwise at init.
             caps: crate::gfx::backend::DeviceCapabilities::ALL,
+            // Conservative until probed at init.
+            gpu_profile: crate::gfx::backend::GpuProfile::UNKNOWN,
+            // Seeded at init from the persisted preset (Auto on first launch).
+            quality_preset: crate::gfx::quality_preset::QualityPreset::Auto,
+            // Defaulted until init captures the world's authored config.
+            authored_post_config: crate::assets::PostProcessConfig::default(),
+            // Resolved at init from the world's config + persisted overrides.
+            temporal_upscaling: false,
+            hdr_display: false,
+            hdr_pq: false,
+            authored_shadow_map_size: 2048,
+            authored_shadow_update: crate::assets::ShadowUpdate::default(),
+            authored_shadow_distance: 80,
+            authored_shadow_cascades: 4,
+            authored_anisotropy: 8,
+            occlusion_two_pass: false,
+            texture_cap: 96,
+            texture_budget: 4,
         }
     }
 }
@@ -417,7 +520,6 @@ impl GraphicsSystem {
 // key that is not a quality toggle.
 pub(super) fn quality_toggle_on(cfg: &crate::assets::PostProcessConfig, key: &str) -> Option<bool> {
     match key {
-        "taa" => Some(cfg.taa),
         "ssao" => Some(cfg.ssao),
         "ssr" => Some(cfg.ssr),
         "ray_traced_reflections" => Some(cfg.ray_traced_reflections),
@@ -430,7 +532,6 @@ pub(super) fn quality_toggle_on(cfg: &crate::assets::PostProcessConfig, key: &st
 // Flip quality toggle `key` to `on` in `cfg`. Unknown keys are ignored.
 pub(super) fn set_quality_toggle(cfg: &mut crate::assets::PostProcessConfig, key: &str, on: bool) {
     match key {
-        "taa" => cfg.taa = on,
         "ssao" => cfg.ssao = on,
         "ssr" => cfg.ssr = on,
         "ray_traced_reflections" => cfg.ray_traced_reflections = on,
@@ -446,6 +547,86 @@ pub(super) fn set_quality_toggle(cfg: &mut crate::assets::PostProcessConfig, key
     }
 }
 
+// Whether `key` is one of the cycle (dropdown) quality knobs governed by the
+// preset ceiling like the boolean toggles (a manual change flips the preset to
+// Custom). The set lives in `settings::QUALITY_CYCLE_KEYS`.
+pub(super) fn is_quality_cycle(key: &str) -> bool {
+    crate::gfx::settings::QUALITY_CYCLE_KEYS.contains(&key)
+}
+
+// The current menu option index of cycle quality knob `key` in `cfg`, or `None`
+// for a key that is not a cycle quality knob.
+pub(super) fn quality_cycle_index(
+    cfg: &crate::assets::PostProcessConfig,
+    key: &str,
+) -> Option<usize> {
+    use crate::gfx::settings;
+    match key {
+        "aa_mode" => Some(settings::aa_mode_index(cfg.aa_mode)),
+        "ssgi_resolution" => Some(settings::ssgi_resolution_index(cfg.ssgi_resolution)),
+        "ssgi_rays" => Some(settings::ssgi_rays_index(cfg.ssgi_rays)),
+        "ssgi_steps" => Some(settings::ssgi_steps_index(cfg.ssgi_steps)),
+        "reflection_blur_resolution" => Some(settings::reflection_blur_index(
+            cfg.reflection_blur_resolution,
+        )),
+        _ => None,
+    }
+}
+
+// Set cycle quality knob `key` in `cfg` from a menu option index. Unknown keys
+// are ignored.
+pub(super) fn set_quality_cycle(
+    cfg: &mut crate::assets::PostProcessConfig,
+    key: &str,
+    index: usize,
+) {
+    use crate::gfx::settings;
+    match key {
+        "aa_mode" => cfg.aa_mode = settings::aa_mode_at(index),
+        "ssgi_resolution" => cfg.ssgi_resolution = settings::ssgi_resolution_at(index),
+        "ssgi_rays" => cfg.ssgi_rays = settings::ssgi_rays_at(index),
+        "ssgi_steps" => cfg.ssgi_steps = settings::ssgi_steps_at(index),
+        "reflection_blur_resolution" => {
+            cfg.reflection_blur_resolution = settings::reflection_blur_at(index)
+        }
+        _ => {}
+    }
+}
+
+// Clamp cycle quality knob `key` in `cfg` DOWN under the ceiling (coarser
+// resolution / smaller count; never raises), a no-op when the user explicitly
+// overrode it. Shared by the init clamp and the live preset re-derive so both
+// produce the same result.
+pub(super) fn clamp_quality_cycle(
+    cfg: &mut crate::assets::PostProcessConfig,
+    key: &str,
+    ceiling: &crate::gfx::quality_preset::QualityCeiling,
+    overridden: bool,
+) {
+    if overridden {
+        return;
+    }
+    use crate::gfx::quality_preset::{
+        clamp_aa_mode, coarser_reflection_blur, coarser_ssgi_resolution,
+    };
+    match key {
+        "aa_mode" => cfg.aa_mode = clamp_aa_mode(cfg.aa_mode, ceiling.aa_mode),
+        "ssgi_resolution" => {
+            cfg.ssgi_resolution =
+                coarser_ssgi_resolution(cfg.ssgi_resolution, ceiling.ssgi_resolution)
+        }
+        "ssgi_rays" => cfg.ssgi_rays = cfg.ssgi_rays.min(ceiling.ssgi_rays),
+        "ssgi_steps" => cfg.ssgi_steps = cfg.ssgi_steps.min(ceiling.ssgi_steps),
+        "reflection_blur_resolution" => {
+            cfg.reflection_blur_resolution = coarser_reflection_blur(
+                cfg.reflection_blur_resolution,
+                ceiling.reflection_blur_resolution,
+            )
+        }
+        _ => {}
+    }
+}
+
 // Derive the backend's per-feature `QualitySettings` from a resolved config.
 // Mirrors the init-time derivation (the same `*_settings()` methods), so a
 // live rebuild reproduces exactly what a launch with this config would build.
@@ -453,7 +634,7 @@ pub(super) fn derive_quality_settings(
     cfg: &crate::assets::PostProcessConfig,
 ) -> crate::gfx::backend::QualitySettings {
     crate::gfx::backend::QualitySettings {
-        taa: cfg.taa,
+        taa: cfg.aa_mode.taa_enabled(),
         ssao: cfg.ssao_settings(),
         ssr: cfg.ssr_settings(),
         rt_reflections: cfg.rt_reflection_settings(),

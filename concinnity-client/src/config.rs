@@ -57,9 +57,21 @@ pub struct Settings {
 // fall back to the world's GraphicsConfig / Window / PostProcessConfig defaults.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct GraphicsSettings {
+    // Master graphics-quality preset. `None` means never configured: the first
+    // launch seeds `Auto` (detect the GPU tier and clamp quality under the
+    // world's authored look) and saves once. `Auto` re-resolves from the
+    // detected tier each launch; a named tier is a fixed ceiling; `Custom`
+    // imposes no ceiling (only the per-field overrides below apply).
+    #[serde(default)]
+    pub quality_preset: Option<crate::gfx::quality_preset::QualityPreset>,
     // Display sync (vsync). `None` uses the world's `GraphicsConfig.vsync`.
     #[serde(default)]
     pub vsync: Option<bool>,
+    // Frame-rate cap in FPS (0 = unlimited). `None` uses the world's
+    // `GraphicsConfig.fps_cap`. Applied live (the render loop's frame pacer reads
+    // it each frame); independent of the quality preset.
+    #[serde(default)]
+    pub fps_cap: Option<u32>,
     // Window mode (windowed / borderless / fullscreen). `None` uses the world's
     // `Window.mode`. Applied live.
     #[serde(default)]
@@ -73,6 +85,12 @@ pub struct GraphicsSettings {
     // and render targets are sized once at init).
     #[serde(default)]
     pub render_scale: Option<crate::assets::UpscaleQuality>,
+    // Upscaler backend (`PostProcessConfig.upscale_backend`: Auto / FSR3 / DLSS /
+    // XeSS). `None` uses the world's value. Applied at next launch (the upscaler
+    // is selected + built once at init); DirectX / Vulkan only (Metal uses
+    // MetalFX). A user/hardware preference, independent of the quality preset.
+    #[serde(default)]
+    pub upscale_backend: Option<crate::assets::UpscalerBackend>,
     // Exposure offset in photographic stops. `None` uses the world's
     // `PostProcessConfig.exposure_ev`. Applied live (a pure post-process
     // uniform), and re-applied at init for a persisted choice.
@@ -86,6 +104,10 @@ pub struct GraphicsSettings {
     // `PostProcessConfig.bloom_threshold`. Applied live.
     #[serde(default)]
     pub bloom_threshold: Option<f32>,
+    // Bloom soft-knee width. `None` uses the world's `PostProcessConfig.bloom_knee`.
+    // Applied live (a `PostProcessParams` field, like the other bloom sliders).
+    #[serde(default)]
+    pub bloom_knee: Option<f32>,
     // Vignette strength in [0, 1]. `None` uses the world's
     // `PostProcessConfig.vignette_strength`. Applied live.
     #[serde(default)]
@@ -99,14 +121,24 @@ pub struct GraphicsSettings {
     // `LightUniforms`, not `PostProcessParams`); re-applied at init.
     #[serde(default)]
     pub ambient_intensity: Option<f32>,
+    // Camera vertical field of view in degrees. `None` uses the world's authored
+    // `Camera3D.fov_y_degrees`. Applied live (Camera3DSystem updates the camera
+    // from a ControlsCommand; the projection rebuilds from it each frame) and
+    // re-applied at init. A user preference, independent of the quality preset.
+    #[serde(default)]
+    pub fov: Option<f32>,
+    // Anti-aliasing mode (`PostProcessConfig.aa_mode`: off / FXAA / TAA). `None`
+    // uses the world's value. Applied live on Metal (the TAA pass rebuilds and
+    // the composite FXAA flag updates in place) and governed by the quality
+    // preset ceiling like the toggles below.
+    #[serde(default)]
+    pub aa_mode: Option<crate::assets::AaMode>,
     // Quality-feature toggles. Each `None` uses the world's
     // `PostProcessConfig` value. They gate render passes whose GPU resources
     // (pipelines, targets, acceleration structures) are built at init, so a
     // change rebuilds those resources: applied live on Metal (the backend
     // rebuilds the affected effects in place); on backends without a live path
     // the choice persists and applies at the next launch.
-    #[serde(default)]
-    pub taa: Option<bool>,
     #[serde(default)]
     pub ssao: Option<bool>,
     #[serde(default)]
@@ -120,6 +152,99 @@ pub struct GraphicsSettings {
     pub ssgi: Option<bool>,
     #[serde(default)]
     pub auto_exposure: Option<bool>,
+    // SSGI gather sub-quality: internal resolution, hemisphere rays per pixel,
+    // and ray-march steps per ray (`PostProcessConfig.ssgi_resolution`/`_rays`/
+    // `_steps`). Each `None` uses the world's value. Applied live on Metal (the
+    // backend rebuilds the SSGI pass in place); persisted + applied at the next
+    // launch on backends without a live path. Governed by the quality preset
+    // ceiling like the toggles above.
+    #[serde(default)]
+    pub ssgi_resolution: Option<crate::assets::SsgiResolution>,
+    #[serde(default)]
+    pub ssgi_rays: Option<u32>,
+    #[serde(default)]
+    pub ssgi_steps: Option<u32>,
+    // Roughness-aware reflection blur resolution
+    // (`PostProcessConfig.reflection_blur_resolution`). `None` uses the world's
+    // value. Applied live on Metal; governed by the quality preset ceiling like
+    // the SSGI sub-quality above (only bites when a reflection feature is on).
+    #[serde(default)]
+    pub reflection_blur_resolution: Option<crate::assets::ReflectionBlurResolution>,
+    // Per-feature sub-quality tunables (SSAO radius / intensity, SSR intensity /
+    // distance, SSGI intensity / distance, auto-exposure EV bounds + speed). Each
+    // `None` uses the world's `PostProcessConfig` value. Applied live on Metal via
+    // `update_quality_params` (the backend re-reads them into a per-frame uniform,
+    // no pass rebuild); look-tuning knobs, independent of the quality preset.
+    #[serde(default)]
+    pub ssao_radius: Option<f32>,
+    #[serde(default)]
+    pub ssao_intensity: Option<f32>,
+    #[serde(default)]
+    pub ssr_intensity: Option<f32>,
+    #[serde(default)]
+    pub ssr_max_distance: Option<f32>,
+    #[serde(default)]
+    pub ssgi_intensity: Option<f32>,
+    #[serde(default)]
+    pub ssgi_max_distance: Option<f32>,
+    #[serde(default)]
+    pub auto_exposure_min_ev: Option<f32>,
+    #[serde(default)]
+    pub auto_exposure_max_ev: Option<f32>,
+    #[serde(default)]
+    pub auto_exposure_speed: Option<f32>,
+    // Shadow quality: cascade map resolution in texels (0 disables shadows) and
+    // re-render cadence (`GraphicsConfig.shadow_map_size` / `shadow_update`).
+    // `None` uses the world's value. Resolution is restart-required (the shadow
+    // map array is sized once at backend init); cadence is applied live on Metal.
+    // Both are governed by the quality preset ceiling like the toggles above.
+    #[serde(default)]
+    pub shadow_map_size: Option<u32>,
+    #[serde(default)]
+    pub shadow_update: Option<crate::assets::ShadowUpdate>,
+    // Shadow distance in world units (`GraphicsConfig.shadow_distance`). `None`
+    // uses the world's value. Applied live on Metal (the cascade-split math reads
+    // it each frame) and governed by the quality preset ceiling like the shadow
+    // knobs above.
+    #[serde(default)]
+    pub shadow_distance: Option<u32>,
+    // Shadow cascade count, 1..4 (`GraphicsConfig.shadow_cascades`). `None` uses
+    // the world's value. Applied live on Metal (the per-frame split + schedule
+    // read it) and governed by the quality preset ceiling like the shadow knobs
+    // above.
+    #[serde(default)]
+    pub shadow_cascades: Option<u32>,
+    // Anisotropic-filtering degree for the scene sampler
+    // (`GraphicsConfig.anisotropy`). `None` uses the world's value. Restart-
+    // required (the sampler is built once at backend init) and governed by the
+    // quality preset ceiling like the shadow knobs above.
+    #[serde(default)]
+    pub anisotropy: Option<u32>,
+    // Display-output / upscaling preferences. Unlike the quality knobs above,
+    // these are independent of the master preset (a user choice, not a tier), and
+    // each is restart-required: the swapchain format / render targets are sized
+    // once at backend init, so a change persists and applies at the next launch.
+    // `None` uses the world's `PostProcessConfig` value.
+    #[serde(default)]
+    pub temporal_upscaling: Option<bool>,
+    #[serde(default)]
+    pub hdr_display: Option<bool>,
+    #[serde(default)]
+    pub hdr_pq: Option<bool>,
+    // System / streaming restart preferences, independent of the master preset
+    // (like the display rows above) and each restart-required: ring-buffer depth
+    // (`GraphicsConfig.frames_in_flight`), two-pass occlusion culling
+    // (`PostProcessConfig.occlusion_two_pass`), and the texture-streaming pool /
+    // per-frame upload budget (`StreamingConfig.texture_cap` / `texture_budget`,
+    // driven together by one "Texture Quality" row). `None` uses the world's value.
+    #[serde(default)]
+    pub frames_in_flight: Option<u32>,
+    #[serde(default)]
+    pub occlusion_two_pass: Option<bool>,
+    #[serde(default)]
+    pub texture_cap: Option<u32>,
+    #[serde(default)]
+    pub texture_budget: Option<u32>,
 }
 
 // Persisted overrides for audio settings.
@@ -322,20 +447,50 @@ mod tests {
     fn settings_cbor_roundtrip() {
         let s = Settings {
             graphics: GraphicsSettings {
+                quality_preset: Some(crate::gfx::quality_preset::QualityPreset::High),
                 vsync: Some(true),
+                fps_cap: Some(144),
                 window_size: Some([1920, 1080]),
+                upscale_backend: Some(crate::assets::UpscalerBackend::Xess),
                 exposure_ev: Some(-1.5),
                 bloom_intensity: Some(0.8),
                 bloom_threshold: Some(1.2),
                 vignette: Some(0.3),
                 lut_strength: Some(0.75),
                 ambient_intensity: Some(1.5),
-                taa: Some(true),
+                fov: Some(90.0),
+                aa_mode: Some(crate::assets::AaMode::Taa),
                 ssao: Some(false),
                 ssr: Some(true),
                 ray_traced_reflections: Some(false),
                 ssgi: Some(true),
                 auto_exposure: Some(false),
+                ssgi_resolution: Some(crate::assets::SsgiResolution::Quarter),
+                ssgi_rays: Some(16),
+                ssgi_steps: Some(24),
+                reflection_blur_resolution: Some(crate::assets::ReflectionBlurResolution::Full),
+                bloom_knee: Some(0.4),
+                ssao_radius: Some(0.6),
+                ssao_intensity: Some(1.2),
+                ssr_intensity: Some(0.8),
+                ssr_max_distance: Some(50.0),
+                ssgi_intensity: Some(0.7),
+                ssgi_max_distance: Some(10.0),
+                auto_exposure_min_ev: Some(-6.0),
+                auto_exposure_max_ev: Some(6.0),
+                auto_exposure_speed: Some(2.0),
+                shadow_map_size: Some(4096),
+                shadow_update: Some(crate::assets::ShadowUpdate::EveryFrame),
+                shadow_distance: Some(160),
+                shadow_cascades: Some(3),
+                anisotropy: Some(16),
+                temporal_upscaling: Some(true),
+                hdr_display: Some(true),
+                hdr_pq: Some(false),
+                frames_in_flight: Some(3),
+                occlusion_two_pass: Some(true),
+                texture_cap: Some(192),
+                texture_budget: Some(8),
                 ..Default::default()
             },
             audio: AudioSettings {

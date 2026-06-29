@@ -231,6 +231,14 @@ pub struct MtlContext {
     // Cascade re-render policy from GraphicsConfig.shadow_update. Hybrid
     // refreshes the near cascade every frame and the far cascades round-robin.
     pub(super) shadow_update: crate::assets::ShadowUpdate,
+    // Shadow distance in world units (GraphicsConfig.shadow_distance), read by the
+    // per-frame cascade-split computation and capped at the camera far plane.
+    // Mutable so set_shadow_distance can change it live.
+    pub(super) shadow_distance: u32,
+    // Active shadow cascade count, 1..=4 (GraphicsConfig.shadow_cascades). The
+    // per-frame split + schedule read it; only the first `shadow_cascades` of the
+    // four slots are rendered + sampled. Mutable so set_shadow_cascades is live.
+    pub(super) shadow_cascades: u32,
     // Round-robin clock + primed-set for the cascade schedule; advanced once per
     // frame by `next_shadow_cascade_mask`.
     pub(super) shadow_scheduler: crate::gfx::shadow_schedule::ShadowCascadeScheduler,
@@ -957,6 +965,12 @@ impl MtlContext {
         crate::gfx::backend::DeviceCapabilities {
             ray_tracing: super::raytrace::raytracing_supported(&self.device),
         }
+    }
+
+    // Coarse GPU performance profile for default-quality selection, read live
+    // from the MTLDevice (cheap; the same kind of device query as capabilities).
+    pub fn gpu_profile(&self) -> crate::gfx::backend::GpuProfile {
+        super::gpu_profile::device_profile(&self.device)
     }
 
     // Render statistics for the most recent `draw_frame`, for the profiler

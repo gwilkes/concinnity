@@ -23,10 +23,14 @@ is not user-configurable.
 - `max_frames`: An integer. Cap the render loop at this many frames, then exit. Unset runs until the window is closed.
 - `frames_in_flight`: An integer. Preferred number of frames in flight (1-3). Higher can smooth pacing at the cost of input latency. Defaults to `2`.
 - `vsync`: A boolean. Cap the frame rate to the display refresh (vsync). Defaults to `false`: the render loop runs uncapped (DirectX presents with tearing allowed, Vulkan uses a mailbox present mode), which is what a benchmark wants. Set to `true` to lock presentation to the monitor refresh, eliminating tearing and the wasted frames that never reach the screen.
+- `fps_cap`: An integer. Cap the frame rate to this many frames per second. `0` (default) leaves the loop uncapped. The cap is a CPU-side frame pacer, so it composes with `vsync`: the more restrictive of the two wins. Useful for limiting heat, fan noise, and power draw, or matching a fixed refresh.
 - `clear_color`: An array of 4 floats. Background clear colour [r, g, b, a] in linear 0..1 space. Defaults to `[0.01, 0.01, 0.02, 1.0]`.
 - `rotation_speed`: A float. Rotation speed of the demo object in radians per second. Only used when no camera is present. Defaults to `1.0`.
 - `shadow_map_size`: An integer. Shadow map resolution in texels (e.g. 2048). Set to 0 to disable shadows. Defaults to `2048`.
 - `shadow_update`: A string (one of `every_frame` or `hybrid`). How often shadow cascades are re-rendered. `hybrid` (default) amortizes the far cascades across frames; `every_frame` refreshes them all every frame. See [ShadowUpdate].
+- `shadow_distance`: An integer. How far from the camera shadows are cast, in world units (e.g. 80). The cascades cover from the near plane out to this distance; a larger value shadows more of the scene but spreads the same shadow-map resolution over more area (softer, blockier shadows). Capped at the camera far plane. Defaults to `80`.
+- `shadow_cascades`: An integer. Number of shadow cascades, 1 to 4 (`4` is the default and the maximum). More cascades keep distant shadows sharper by splitting the view range into finer slices, at the cost of an extra shadow-map render per cascade; fewer is cheaper but blockier far from the camera. The slice count covers the same `shadow_distance` regardless.
+- `anisotropy`: An integer. Maximum anisotropic-filtering degree for the scene texture sampler (albedo + normal maps), e.g. 8. Higher keeps textures viewed at a grazing angle (floors, walls receding into the distance) sharp instead of blurring along the minor axis, at a small sampling cost. `1` disables anisotropy (plain trilinear). Clamped to the GPU's supported range (1..16) at init. Defaults to `8`.
 
 ### ShaderStage
 
@@ -1366,7 +1370,7 @@ value.
 ```jsonl
 {"name":"post","type":"PostProcessConfig","args":{"bloom_intensity":0.8}}
 {"name":"post_dim","type":"PostProcessConfig","args":{"exposure_ev":-1.0,"vignette_strength":0.4}}
-{"name":"post_taa","type":"PostProcessConfig","args":{"taa":true}}
+{"name":"post_taa","type":"PostProcessConfig","args":{"aa_mode":"taa"}}
 {"name":"post_ssao","type":"PostProcessConfig","args":{"ssao":true,"ssao_radius":0.6}}
 {"name":"post_ssr","type":"PostProcessConfig","args":{"ssr":true,"ssr_intensity":0.8}}
 {"name":"post_rt","type":"PostProcessConfig","args":{"ray_traced_reflections":true,"ssr_intensity":0.8}}
@@ -1388,7 +1392,7 @@ value.
 - `exposure_ev`: A float. Exposure offset in photographic stops. Each +1 doubles scene brightness before bloom and tonemapping; 0 is neutral. Defaults to `0.0`.
 - `vignette_strength`: A float. Vignette strength in `[0, 1]`. 0 disables the corner darkening. Defaults to `0.0`.
 - `lut_strength`: A float. Colour-LUT blend in `[0, 1]`. Mixes the graded colour over the ungraded one by this amount. Only matters when the world declares a [ColorLut](#colorlut); with none, grading is a no-op at any strength. Defaults to `1.0`.
-- `taa`: A boolean. Temporal anti-aliasing toggle. Smooths edges by jittering and accumulating detail across frames. Defaults to `false`.
+- `aa_mode`: A string (one of `off`, `fxaa`, or `taa`). Anti-aliasing mode. `fxaa` (default) applies a cheap composite-pass edge filter; `taa` adds a temporal pass that jitters the projection and accumulates detail across frames for the cleanest edges, at the cost of a velocity pre-pass and a history buffer; `off` disables edge smoothing.
 - `ssao`: A boolean. Screen-space ambient occlusion toggle. Darkens creases and contact areas where ambient light is occluded. Defaults to `false`.
 - `ssao_radius`: A float. How far the ambient-occlusion search reaches for occluders, in world units. Larger values pick up broader, softer occlusion. Defaults to `0.5`.
 - `ssao_intensity`: A float. Ambient-occlusion strength, clamped to `[0, 4]`. 1.0 is the natural amount; higher values exaggerate the contact darkening. Defaults to `1.0`.

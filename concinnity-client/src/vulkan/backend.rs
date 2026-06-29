@@ -64,6 +64,10 @@ impl RenderBackend for VkContext {
         fn set_keymap(&mut self, keymap: &crate::gfx::keymap::KeyMap);
         fn set_reflection_probes(&mut self, probes: &[crate::gfx::reflection_probe::ProbePlacement]);
         fn apply_quality_settings(&mut self, settings: crate::gfx::backend::QualitySettings);
+        fn set_shadow_update(&mut self, update: crate::assets::ShadowUpdate);
+        fn set_shadow_distance(&mut self, distance: u32);
+        fn set_shadow_cascades(&mut self, count: u32);
+        fn update_quality_params(&mut self, settings: crate::gfx::backend::QualitySettings);
         fn take_input(&mut self) -> RenderInput;
         fn wait_idle(&self);
         fn draw_frame(&mut self, elapsed: f32, fov_y_radians: f32, near: f32, far: f32, cam_pos: [f32; 3], text_calls: &[TextDrawCall]) -> Result<(), String>;
@@ -90,6 +94,7 @@ impl RenderBackend for VkContext {
         fn remove_decal(&mut self, decal_id: usize) -> Result<(), String>;
         fn render_stats(&self) -> RenderStats;
         fn capabilities(&self) -> crate::gfx::backend::DeviceCapabilities;
+        fn gpu_profile(&self) -> crate::gfx::backend::GpuProfile;
         fn logical_size(&self) -> (f32, f32);
         fn update_color_lut(&mut self, size: u32, data: &[u8]) -> Result<(), String>;
         fn update_environment_map(&mut self, payload: &[u8]) -> Result<(), String>;

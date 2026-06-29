@@ -94,8 +94,11 @@ pub struct SkinnedSlotLayout {
 // ignores this (the choice still persists and applies at the next launch).
 #[allow(dead_code)] // fields read only by Metal's apply_quality_settings.
 pub struct QualitySettings {
-    // Temporal anti-aliasing on/off. The backend additionally suppresses TAA
-    // while temporal upscaling is active (the scaler does its own accumulation).
+    // Temporal anti-aliasing on/off (the `Taa` anti-aliasing mode). The backend
+    // additionally suppresses TAA while temporal upscaling is active (the scaler
+    // does its own accumulation). The other anti-aliasing modes are the composite
+    // FXAA edge filter, which rides `PostProcessParams.fxaa` (pushed via
+    // `update_post_process`), not this pass-rebuild payload.
     pub taa: bool,
     pub ssao: Option<SsaoSettings>,
     pub ssr: Option<SsrSettings>,
@@ -138,6 +141,120 @@ impl DeviceCapabilities {
 impl Default for DeviceCapabilities {
     fn default() -> Self {
         Self::ALL
+    }
+}
+
+// Coarse GPU vendor class, derived per backend from the adapter's reported
+// vendor id (DirectX / Vulkan) or unified-memory / Apple-family signals (Metal).
+// Used only to pick default quality and to gate vendor-specific options (e.g.
+// which upscalers to offer); never persisted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GpuVendor {
+    Apple,
+    Nvidia,
+    Amd,
+    Intel,
+    Other,
+}
+
+// Coarse performance class for default-quality selection, ordered low -> high so
+// callers can compare with `>=`. Each backend maps its native signals (memory
+// budget, discrete / integrated, Apple GPU family) onto this via `classify_tier`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum GpuTier {
+    // Unknown hardware: the conservative default, never the top preset. Sorts
+    // lowest so a comparison-based resolver treats it as the floor.
+    Unknown,
+    // Integrated / low-power GPU: the lowest quality tier.
+    Integrated,
+    // Older or small discrete GPU, or an Apple base M-series: entry quality.
+    EntryDiscrete,
+    // Mainstream discrete GPU, or an Apple Pro: mid quality.
+    MidDiscrete,
+    // Enthusiast discrete GPU, or an Apple Max / Ultra: high quality.
+    HighDiscrete,
+}
+
+// A coarse, Copy snapshot of the active GPU's class, queried from the backend
+// once it is built (mirrors `DeviceCapabilities`). Read at init to choose
+// sensible default graphics quality; never persisted, re-queried each launch so
+// it is always correct for the current device + driver. The GPU *name* is
+// deliberately omitted (it is not `Copy`); a backend exposes the name separately
+// when a UI needs it.
+#[derive(Clone, Copy, Debug)]
+pub struct GpuProfile {
+    pub vendor: GpuVendor,
+    pub tier: GpuTier,
+    // Dedicated VRAM on a discrete GPU, or the recommended working-set on a
+    // unified-memory GPU. 0 when the backend / driver cannot report it.
+    pub memory_budget_bytes: u64,
+    pub unified_memory: bool,
+    pub discrete: bool,
+}
+
+impl GpuProfile {
+    // Conservative fallback for a backend that does not report a profile:
+    // unknown hardware picks the cautious baseline, never a high preset. The
+    // opposite default from `DeviceCapabilities::ALL` -- a feature gate fails
+    // open (assume capable, no-op with a warning if not), but quality
+    // auto-config fails safe (assume modest, never overdrive a weak GPU).
+    pub const UNKNOWN: Self = Self {
+        vendor: GpuVendor::Other,
+        tier: GpuTier::Unknown,
+        memory_budget_bytes: 0,
+        unified_memory: false,
+        discrete: false,
+    };
+}
+
+impl Default for GpuProfile {
+    fn default() -> Self {
+        Self::UNKNOWN
+    }
+}
+
+// The cheap signals every backend can gather about its GPU, mapped to a coarse
+// `GpuTier` by one shared rule so the three backends classify consistently and
+// the mapping is unit-testable without a GPU. The backends differ in what they
+// can report (Apple exposes a GPU family; DirectX / Vulkan expose a VRAM figure
+// and a discrete / integrated flag), so this carries the union and the rule
+// uses whichever signals are present.
+pub(crate) struct GpuClassInput {
+    pub vendor: GpuVendor,
+    pub memory_budget_bytes: u64,
+    pub discrete: bool,
+    // Apple GPU family generation rank (7 = M1 .. 10 = M4), or 0 for a non-Apple
+    // GPU. Apple silicon classifies by generation; everything else by VRAM.
+    pub apple_family: u8,
+}
+
+// Map the gathered GPU signals to a coarse performance tier. Apple silicon is
+// classified by GPU family generation (family alone cannot separate base from
+// Pro / Max / Ultra within a generation -- a working-set refinement can split
+// them later); a non-Apple integrated / low-power GPU is the lowest tier; a
+// discrete GPU is bucketed by dedicated VRAM. An unreporting device (no memory,
+// not discrete) stays `Unknown` so the resolver uses the conservative baseline.
+pub(crate) fn classify_tier(input: &GpuClassInput) -> GpuTier {
+    const GB: u64 = 1 << 30;
+    // Apple silicon: classify by GPU family generation.
+    if input.vendor == GpuVendor::Apple && input.apple_family >= 7 {
+        return match input.apple_family {
+            7 => GpuTier::EntryDiscrete, // M1 class
+            8 => GpuTier::MidDiscrete,   // M2 class
+            _ => GpuTier::HighDiscrete,  // M3 / M4 and newer
+        };
+    }
+    // Any non-Apple integrated / low-power GPU is the lowest tier (Apple silicon
+    // is unified too, but it returned above via its family branch).
+    if !input.discrete {
+        return GpuTier::Integrated;
+    }
+    // Discrete GPU: bucket by dedicated VRAM.
+    match input.memory_budget_bytes {
+        0 => GpuTier::Unknown,
+        b if b >= 12 * GB => GpuTier::HighDiscrete,
+        b if b >= 6 * GB => GpuTier::MidDiscrete,
+        _ => GpuTier::EntryDiscrete,
     }
 }
 
@@ -302,6 +419,14 @@ pub trait RenderBackend: SceneControl + Send {
         DeviceCapabilities::ALL
     }
 
+    // Coarse GPU performance profile, queried once the backend is built. Read at
+    // init to pick default graphics quality on first launch. Default: `UNKNOWN`
+    // (the conservative tier), so a backend that does not report a profile never
+    // makes the resolver auto-select a high preset.
+    fn gpu_profile(&self) -> GpuProfile {
+        GpuProfile::UNKNOWN
+    }
+
     // Metal-only diagnostics; default no-op for parity.
     fn logical_size(&self) -> (f32, f32) {
         (0.0, 0.0)
@@ -405,6 +530,54 @@ pub trait RenderBackend: SceneControl + Send {
     // runtime changes (DirectX / Vulkan today), so the choice persists and takes
     // effect at the next launch there.
     fn apply_quality_settings(&mut self, settings: QualitySettings) {
+        let _ = settings;
+    }
+
+    // Set the shadow cascade re-render cadence live. The cascade scheduler reads
+    // the policy at the start of each shadow pass, so a change takes effect on the
+    // next draw with no pipeline rebuild or allocation (unlike the shadow map
+    // resolution, which is sized once at init). Default no-op: a backend that only
+    // reads the cadence at init keeps the init-time value (DirectX / Vulkan
+    // today), so the choice persists and takes effect at the next launch there.
+    fn set_shadow_update(&mut self, update: crate::assets::ShadowUpdate) {
+        let _ = update;
+    }
+
+    // Set the shadow distance (world units the cascades cover, capped at the
+    // camera far plane) live. The per-frame cascade-split computation reads it
+    // each draw, so a change takes effect on the next frame with no allocation or
+    // rebuild (it sizes no GPU resource, unlike the shadow map resolution).
+    // Default no-op: a backend that only reads the distance at init keeps the
+    // init-time value (DirectX / Vulkan today), so the choice persists and takes
+    // effect at the next launch there.
+    fn set_shadow_distance(&mut self, distance: u32) {
+        let _ = distance;
+    }
+
+    // Set the live shadow cascade count (1..=4). The cascade-split math + the
+    // re-render schedule read it each frame and only the first `count` cascades
+    // are projected, rendered, and sampled (the array capacity stays 4), so a
+    // change takes effect on the next frame with no resize or rebuild. Default
+    // no-op: a backend that only reads the count at init keeps the init-time
+    // value (DirectX / Vulkan today), so the choice persists and takes effect at
+    // the next launch there.
+    fn set_shadow_cascades(&mut self, count: u32) {
+        let _ = count;
+    }
+
+    // Update the live scalar sub-tunables of the SSAO / SSR / SSGI / auto-exposure
+    // passes (radius, intensity, distance, EV bounds, adaptation speed). Unlike
+    // `apply_quality_settings`, this rebuilds nothing: each backend re-reads these
+    // values from its stored `*Settings` structs into a per-frame uniform every
+    // draw, so mutating them takes effect on the next frame with no pipeline /
+    // target rebuild and no TAA-history reset. Only the fields of a feature that is
+    // currently on are honoured (its settings are present); a value for an off
+    // feature is ignored here and applies when the feature next turns on. The
+    // structural sub-knobs (gather resolution, ray / step counts) are NOT live and
+    // still ride `apply_quality_settings`. Default no-op: a backend that reads
+    // these only at init keeps the init-time values (DirectX / Vulkan today), so
+    // the choice persists and takes effect at the next launch there.
+    fn update_quality_params(&mut self, settings: QualitySettings) {
         let _ = settings;
     }
 
@@ -709,5 +882,119 @@ pub trait RenderBackend: SceneControl + Send {
     ) -> Result<(), String> {
         let _ = (vert_bytes, frag_bytes, shadow_bytes, vert_instanced_bytes);
         Err("update_world_shader_pipelines: not implemented on this backend".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GB: u64 = 1 << 30;
+
+    fn input(
+        vendor: GpuVendor,
+        memory_budget_bytes: u64,
+        discrete: bool,
+        apple_family: u8,
+    ) -> GpuClassInput {
+        GpuClassInput {
+            vendor,
+            memory_budget_bytes,
+            discrete,
+            apple_family,
+        }
+    }
+
+    #[test]
+    fn unknown_profile_is_the_conservative_default() {
+        // The opposite default from capabilities: quality auto-config fails safe.
+        let p = GpuProfile::default();
+        assert_eq!(p.tier, GpuTier::Unknown);
+        assert_eq!(p.vendor, GpuVendor::Other);
+        assert_eq!(p.memory_budget_bytes, 0);
+        // Unknown sorts below every real tier, so a `>=` resolver treats it as
+        // the floor.
+        assert!(GpuTier::Unknown < GpuTier::Integrated);
+        assert!(GpuTier::Integrated < GpuTier::EntryDiscrete);
+        assert!(GpuTier::EntryDiscrete < GpuTier::MidDiscrete);
+        assert!(GpuTier::MidDiscrete < GpuTier::HighDiscrete);
+    }
+
+    #[test]
+    fn apple_silicon_classifies_by_generation() {
+        // Unified memory is large on Apple silicon, but the family generation
+        // (not the working-set) decides the tier, so the huge shared budget does
+        // not read as a high-VRAM discrete card.
+        assert_eq!(
+            classify_tier(&input(GpuVendor::Apple, 16 * GB, false, 7)),
+            GpuTier::EntryDiscrete // M1
+        );
+        assert_eq!(
+            classify_tier(&input(GpuVendor::Apple, 24 * GB, false, 8)),
+            GpuTier::MidDiscrete // M2
+        );
+        assert_eq!(
+            classify_tier(&input(GpuVendor::Apple, 48 * GB, false, 9)),
+            GpuTier::HighDiscrete // M3
+        );
+        assert_eq!(
+            classify_tier(&input(GpuVendor::Apple, 64 * GB, false, 10)),
+            GpuTier::HighDiscrete // M4 and newer cap at high
+        );
+    }
+
+    #[test]
+    fn discrete_gpu_classifies_by_vram() {
+        // An Intel-Mac AMD dGPU or a PC discrete card: vendor is not Apple and
+        // there is no Apple family, so VRAM buckets the tier.
+        assert_eq!(
+            classify_tier(&input(GpuVendor::Nvidia, 24 * GB, true, 0)),
+            GpuTier::HighDiscrete
+        );
+        assert_eq!(
+            classify_tier(&input(GpuVendor::Amd, 8 * GB, true, 0)),
+            GpuTier::MidDiscrete
+        );
+        assert_eq!(
+            classify_tier(&input(GpuVendor::Nvidia, 4 * GB, true, 0)),
+            GpuTier::EntryDiscrete
+        );
+        // A discrete card that reports no memory budget is left Unknown rather
+        // than guessed high.
+        assert_eq!(
+            classify_tier(&input(GpuVendor::Amd, 0, true, 0)),
+            GpuTier::Unknown
+        );
+    }
+
+    #[test]
+    fn integrated_gpu_is_the_lowest_tier() {
+        // Non-Apple integrated part: no dedicated memory, not unified, no Apple
+        // family.
+        assert_eq!(
+            classify_tier(&input(GpuVendor::Intel, 0, false, 0)),
+            GpuTier::Integrated
+        );
+    }
+
+    #[test]
+    fn vram_bucket_boundaries() {
+        // Boundaries are inclusive lower bounds (>= 12 GB high, >= 6 GB mid).
+        assert_eq!(
+            classify_tier(&input(GpuVendor::Nvidia, 12 * GB, true, 0)),
+            GpuTier::HighDiscrete
+        );
+        assert_eq!(
+            classify_tier(&input(GpuVendor::Nvidia, 12 * GB - 1, true, 0)),
+            GpuTier::MidDiscrete
+        );
+        assert_eq!(
+            classify_tier(&input(GpuVendor::Nvidia, 6 * GB, true, 0)),
+            GpuTier::MidDiscrete
+        );
+        assert_eq!(
+            classify_tier(&input(GpuVendor::Nvidia, 6 * GB - 1, true, 0)),
+            GpuTier::EntryDiscrete
+        );
     }
 }

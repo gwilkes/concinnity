@@ -191,6 +191,7 @@ fn shadow_uniforms_layout() -> ExpectedStruct {
         fields: vec![
             field!(ShadowUniforms, light_vps),
             field!(ShadowUniforms, cascade_splits),
+            field!(ShadowUniforms, active_cascades),
         ],
     }
 }

@@ -19,7 +19,7 @@ use crate::gfx::render_types::PostProcessParams;
 /// ```jsonl
 /// {"name":"post","type":"PostProcessConfig","args":{"bloom_intensity":0.8}}
 /// {"name":"post_dim","type":"PostProcessConfig","args":{"exposure_ev":-1.0,"vignette_strength":0.4}}
-/// {"name":"post_taa","type":"PostProcessConfig","args":{"taa":true}}
+/// {"name":"post_taa","type":"PostProcessConfig","args":{"aa_mode":"taa"}}
 /// {"name":"post_ssao","type":"PostProcessConfig","args":{"ssao":true,"ssao_radius":0.6}}
 /// {"name":"post_ssr","type":"PostProcessConfig","args":{"ssr":true,"ssr_intensity":0.8}}
 /// {"name":"post_rt","type":"PostProcessConfig","args":{"ray_traced_reflections":true,"ssr_intensity":0.8}}
@@ -51,9 +51,11 @@ pub struct PostProcessConfig {
     /// one by this amount. Only matters when the world declares a
     /// [ColorLut](#colorlut); with none, grading is a no-op at any strength.
     pub lut_strength: f32,
-    /// Temporal anti-aliasing toggle. Smooths edges by jittering and
-    /// accumulating detail across frames.
-    pub taa: bool,
+    /// Anti-aliasing mode. `fxaa` (default) applies a cheap composite-pass edge
+    /// filter; `taa` adds a temporal pass that jitters the projection and
+    /// accumulates detail across frames for the cleanest edges, at the cost of a
+    /// velocity pre-pass and a history buffer; `off` disables edge smoothing.
+    pub aa_mode: AaMode,
     /// Screen-space ambient occlusion toggle. Darkens creases and contact areas
     /// where ambient light is occluded.
     pub ssao: bool,
@@ -206,6 +208,37 @@ pub enum UpscalerBackend {
     Xess,
 }
 
+/// Anti-aliasing mode for `PostProcessConfig.aa_mode`. `Off` runs no edge
+/// smoothing; `Fxaa` (default) applies the composite's single-frame edge
+/// filter, which is nearly free; `Taa` adds a temporal pass that jitters the
+/// projection and reprojects detail across frames for the cleanest edges, at
+/// the cost of a velocity pre-pass and a per-frame history buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[derive(Default)]
+pub enum AaMode {
+    Off,
+    #[default]
+    Fxaa,
+    Taa,
+}
+
+impl AaMode {
+    /// Whether the temporal anti-aliasing pass runs. Only the `Taa` mode does;
+    /// it needs the velocity pre-pass and the history buffer the other modes
+    /// skip.
+    pub fn taa_enabled(self) -> bool {
+        matches!(self, AaMode::Taa)
+    }
+
+    /// Whether the composite's FXAA edge filter runs. Every mode except `Off`
+    /// does (so `Taa` keeps FXAA as a cheap spatial cleanup on top of the
+    /// temporal resolve).
+    pub fn fxaa_enabled(self) -> bool {
+        !matches!(self, AaMode::Off)
+    }
+}
+
 /// Indirect-diffuse lighting source for `PostProcessConfig.indirect_lighting`.
 /// `Ibl` is the image-based-lighting-only ambient term the renderer has always
 /// used; `Ssgi` layers a screen-space global-illumination bounce on top.
@@ -289,7 +322,7 @@ impl Default for PostProcessConfig {
             exposure_ev: 0.0,
             vignette_strength: 0.0,
             lut_strength: 1.0,
-            taa: false,
+            aa_mode: AaMode::Fxaa,
             ssao: false,
             ssao_radius: 0.5,
             ssao_intensity: 1.0,
@@ -341,6 +374,11 @@ impl PostProcessConfig {
             lut_strength: self.lut_strength.clamp(0.0, 1.0),
             hdr_output: 0.0,
             pq_output: 0.0,
+            fxaa: if self.aa_mode.fxaa_enabled() {
+                1.0
+            } else {
+                0.0
+            },
         }
     }
 
@@ -519,13 +557,33 @@ mod tests {
     }
 
     #[test]
-    fn taa_defaults_off_and_round_trips_through_args() {
-        assert!(!PostProcessConfig::default().taa);
+    fn aa_mode_defaults_to_fxaa_and_round_trips_through_args() {
+        assert_eq!(PostProcessConfig::default().aa_mode, AaMode::Fxaa);
         let cfg = PostProcessConfig {
-            taa: true,
+            aa_mode: AaMode::Taa,
             ..Default::default()
         };
-        assert!(PostProcessConfig::from_args(cfg.to_args()).taa);
+        assert_eq!(
+            PostProcessConfig::from_args(cfg.to_args()).aa_mode,
+            AaMode::Taa
+        );
+    }
+
+    #[test]
+    fn aa_mode_gates_taa_and_fxaa() {
+        assert!(!AaMode::Off.taa_enabled());
+        assert!(!AaMode::Off.fxaa_enabled());
+        assert!(!AaMode::Fxaa.taa_enabled());
+        assert!(AaMode::Fxaa.fxaa_enabled());
+        assert!(AaMode::Taa.taa_enabled());
+        assert!(AaMode::Taa.fxaa_enabled());
+        // resolve() carries the FXAA gate into the composite uniform.
+        let off = PostProcessConfig {
+            aa_mode: AaMode::Off,
+            ..Default::default()
+        };
+        assert_eq!(off.resolve().fxaa, 0.0);
+        assert_eq!(PostProcessConfig::default().resolve().fxaa, 1.0);
     }
 
     #[test]
@@ -813,13 +871,16 @@ mod tests {
     }
 
     #[test]
-    fn taa_deserialises_from_jsonl_args() {
-        let cfg: PostProcessConfig = serde_json::from_str(r#"{"taa":true}"#).expect("parse");
-        assert!(cfg.taa);
-        // Omitting the field leaves TAA off.
+    fn aa_mode_deserialises_from_jsonl_args() {
+        let cfg: PostProcessConfig = serde_json::from_str(r#"{"aa_mode":"taa"}"#).expect("parse");
+        assert_eq!(cfg.aa_mode, AaMode::Taa);
+        // Omitting the field falls back to the FXAA default.
         let cfg: PostProcessConfig =
             serde_json::from_str(r#"{"bloom_intensity":0.5}"#).expect("parse");
-        assert!(!cfg.taa);
+        assert_eq!(cfg.aa_mode, AaMode::Fxaa);
+        // "off" disables edge smoothing entirely.
+        let cfg: PostProcessConfig = serde_json::from_str(r#"{"aa_mode":"off"}"#).expect("parse");
+        assert_eq!(cfg.aa_mode, AaMode::Off);
     }
 
     #[test]

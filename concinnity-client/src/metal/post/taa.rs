@@ -28,7 +28,7 @@ use crate::metal::uniforms::TaaUniforms;
 // frame counter). The pipeline / targets are `Some` / non-empty only when TAA
 // is enabled (and not bypassed by the upscaler).
 pub(crate) struct TaaState {
-    // Toggle resolved from `PostProcessConfig.taa`; false skips the TAA pass
+    // Toggle resolved from `PostProcessConfig.aa_mode`; false skips the TAA pass
     // + projection jitter entirely.
     pub enabled: bool,
     // Resolve pipeline (fullscreen triangle). `Some` only when TAA is on.

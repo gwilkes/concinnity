@@ -305,6 +305,55 @@ impl MtlContext {
         self.light_uniforms.ambient_intensity = value;
     }
 
+    // Set the live shadow cascade re-render cadence. The scheduler reads
+    // `shadow_update` at the start of each shadow pass, so a change takes effect
+    // on the next draw. Every cascade is already primed, so switching policy never
+    // leaves a slice unsampled (priming is one-shot per cascade, not per policy).
+    pub fn set_shadow_update(&mut self, update: crate::assets::ShadowUpdate) {
+        self.shadow_update = update;
+    }
+
+    // Set the live shadow distance (world units). The per-frame cascade-split
+    // computation reads `shadow_distance` each draw, so a change takes effect on
+    // the next frame with no allocation (it sizes no GPU resource).
+    pub fn set_shadow_distance(&mut self, distance: u32) {
+        self.shadow_distance = distance;
+    }
+
+    // Set the live shadow cascade count (1..=4). The per-frame split + schedule
+    // read `shadow_cascades` each draw; only the first `count` of the four slots
+    // are rendered + sampled, so a change takes effect on the next frame with no
+    // resize (the shadow-map array stays sized for the 4-cascade capacity).
+    pub fn set_shadow_cascades(&mut self, count: u32) {
+        self.shadow_cascades = count;
+    }
+
+    // Update the live scalar sub-tunables of the SSAO / SSR / SSGI / auto-exposure
+    // passes without rebuilding anything. The draw path rebuilds each pass's
+    // per-frame uniform from these stored `*Settings` structs every frame
+    // (`settings.params(...)`), so mutating the stored struct here is picked up on
+    // the next draw. Only a feature that is currently on has a settings struct to
+    // mutate; the rest are skipped (the value still persists for the next launch).
+    // SSAO / SSR / auto-exposure settings are fully scalar, so they are replaced
+    // wholesale; SSGI keeps its gather resolution / ray / step counts (those size
+    // the gather target or ride `apply_quality_settings`), so only its scalar
+    // intensity / distance are updated.
+    pub fn update_quality_params(&mut self, q: crate::gfx::backend::QualitySettings) {
+        if let (Some(live), Some(cur)) = (q.ssao, self.ssao.settings.as_mut()) {
+            *cur = live;
+        }
+        if let (Some(live), Some(cur)) = (q.ssr, self.ssr.settings.as_mut()) {
+            *cur = live;
+        }
+        if let (Some(live), Some(cur)) = (q.ssgi, self.ssgi.settings.as_mut()) {
+            cur.intensity = live.intensity;
+            cur.max_distance = live.max_distance;
+        }
+        if let (Some(live), Some(cur)) = (q.auto_exposure, self.auto_exposure.settings.as_mut()) {
+            *cur = live;
+        }
+    }
+
     // Snapshot the current input state for this frame.
     // Key booleans reflect what is held right now; mouse deltas are cleared
     // after being read so they don't accumulate across frames.

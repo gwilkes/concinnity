@@ -90,6 +90,7 @@ constant constexpr int RAYMARCH_NUM_SHADOW_CASCADES = 4;
 struct RaymarchShadowUniforms {
     float4x4 light_vps[RAYMARCH_NUM_SHADOW_CASCADES];
     float    cascade_splits[RAYMARCH_NUM_SHADOW_CASCADES];
+    uint     active_cascades;
 };
 
 // Per-point material the user's `shade` returns. The template runs PBR
@@ -320,7 +321,7 @@ inline float sampleSunShadow(
     else if (view_depth < shadow.cascade_splits[1]) cascade = 1;
     else if (view_depth < shadow.cascade_splits[2]) cascade = 2;
     else if (view_depth < shadow.cascade_splits[3]) cascade = 3;
-    if (cascade >= RAYMARCH_NUM_SHADOW_CASCADES) return 1.0;
+    if (cascade >= int(shadow.active_cascades)) return 1.0;
 
     float4 light_clip = shadow.light_vps[cascade] * float4(world_pos, 1.0);
     float3 ndc = light_clip.xyz / max(light_clip.w, 1e-6);

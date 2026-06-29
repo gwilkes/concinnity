@@ -63,6 +63,13 @@ pub(super) struct VkShadow {
     // Cascade re-render policy from GraphicsConfig.shadow_update. Hybrid
     // refreshes the near cascade every frame and the far cascades round-robin.
     pub(super) update: crate::assets::ShadowUpdate,
+    // Shadow distance in world units (GraphicsConfig.shadow_distance), read by the
+    // per-frame cascade-split computation and capped at the camera far plane.
+    pub(super) distance: u32,
+    // Active shadow cascade count, 1..=4 (GraphicsConfig.shadow_cascades). The
+    // per-frame split + schedule read it; only the first `cascades` of the four
+    // slots are rendered + sampled. Stored at init (applies at the next launch).
+    pub(super) cascades: u32,
     // Round-robin clock + primed-set for the cascade schedule; advanced once per
     // frame in draw_frame.
     pub(super) scheduler: crate::gfx::shadow_schedule::ShadowCascadeScheduler,
@@ -1819,6 +1826,56 @@ impl VkContext {
         }
     }
 
+    // Set the live shadow cascade re-render cadence. The per-frame cascade split
+    // reads `shadow.update` at the start of each draw (see draw.rs), so a change
+    // takes effect on the next frame with no rebuild or allocation.
+    pub fn set_shadow_update(&mut self, update: crate::assets::ShadowUpdate) {
+        self.shadow.update = update;
+    }
+
+    // Set the live shadow distance (world units). The per-frame cascade-split
+    // computation reads `shadow.distance` each draw (capped at the camera far
+    // plane), so a change takes effect on the next frame with no allocation (it
+    // sizes no GPU resource).
+    pub fn set_shadow_distance(&mut self, distance: u32) {
+        self.shadow.distance = distance;
+    }
+
+    // Set the live shadow cascade count (1..=4). The per-frame split + schedule
+    // read `shadow.cascades` each draw; only the first `count` of the four slots
+    // are rendered + sampled, so a change takes effect on the next frame with no
+    // resize (the shadow-map array stays sized for the 4-cascade capacity).
+    pub fn set_shadow_cascades(&mut self, count: u32) {
+        self.shadow.cascades = count;
+    }
+
+    // Update the live scalar sub-tunables of the SSAO / SSR / SSGI / auto-exposure
+    // passes without rebuilding anything. Each pass rebuilds its per-frame uniform
+    // from these stored `*Settings` every draw (`settings.params(...)`), so
+    // mutating the stored struct here is picked up on the next frame. Only a
+    // feature whose resources are currently live has settings to mutate; the rest
+    // are skipped (the value still persists for the next launch). SSAO / SSR /
+    // auto-exposure are fully scalar, so they are replaced wholesale; SSGI keeps
+    // its gather resolution / ray / step counts (those size the gather target or
+    // ride `apply_quality_settings`), so only its scalar intensity / distance are
+    // updated. Auto-exposure settings live flat on the context here
+    // (`auto_exposure_settings`), not inside a resources struct as on Metal.
+    pub fn update_quality_params(&mut self, q: crate::gfx::backend::QualitySettings) {
+        if let (Some(live), Some(cur)) = (q.ssao, self.ssao.as_mut().map(|s| &mut s.settings)) {
+            *cur = live;
+        }
+        if let (Some(live), Some(cur)) = (q.ssr, self.ssr.as_mut().map(|s| &mut s.settings)) {
+            *cur = live;
+        }
+        if let (Some(live), Some(cur)) = (q.ssgi, self.ssgi.as_mut().map(|s| &mut s.settings)) {
+            cur.intensity = live.intensity;
+            cur.max_distance = live.max_distance;
+        }
+        if let (Some(live), Some(cur)) = (q.auto_exposure, self.auto_exposure_settings.as_mut()) {
+            *cur = live;
+        }
+    }
+
     // Public accessor for the shared shader-reload flag. Cloning the `Arc`
     // lets the debug WebSocket server flip it from a non-render thread.
     // `None` outside `cn debug`. Mirrors `DxContext::shader_reload_pending`.
@@ -1879,6 +1936,52 @@ impl VkContext {
     pub fn capabilities(&self) -> crate::gfx::backend::DeviceCapabilities {
         crate::gfx::backend::DeviceCapabilities {
             ray_tracing: self.rt_capable,
+        }
+    }
+
+    // Coarse GPU performance profile for default-quality selection, read live
+    // from the physical device: vendor id, discrete / integrated device type,
+    // and the summed DEVICE_LOCAL heap size as the VRAM budget (the true heap
+    // size, unlike the residency chip which sums live usage).
+    pub fn gpu_profile(&self) -> crate::gfx::backend::GpuProfile {
+        use crate::gfx::backend::{GpuClassInput, GpuProfile, GpuVendor, classify_tier};
+        let props = unsafe {
+            self.instance
+                .get_physical_device_properties(self.physical_device)
+        };
+        let vendor = match props.vendor_id {
+            0x10DE => GpuVendor::Nvidia,
+            0x1002 => GpuVendor::Amd,
+            0x8086 => GpuVendor::Intel,
+            0x106B => GpuVendor::Apple, // Apple / MoltenVK
+            _ => GpuVendor::Other,
+        };
+        let discrete = props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU;
+        let unified = props.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU;
+        let mem = unsafe {
+            self.instance
+                .get_physical_device_memory_properties(self.physical_device)
+        };
+        let budget: u64 = (0..mem.memory_heap_count as usize)
+            .filter(|&i| {
+                mem.memory_heaps[i]
+                    .flags
+                    .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
+            })
+            .map(|i| mem.memory_heaps[i].size)
+            .sum();
+        let tier = classify_tier(&GpuClassInput {
+            vendor,
+            memory_budget_bytes: budget,
+            discrete,
+            apple_family: 0,
+        });
+        GpuProfile {
+            vendor,
+            tier,
+            memory_budget_bytes: budget,
+            unified_memory: unified,
+            discrete,
         }
     }
 }

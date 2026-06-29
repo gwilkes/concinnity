@@ -10,6 +10,7 @@ mod draw;
 mod fog;
 mod frame_pacing;
 mod glass;
+mod gpu_profile;
 mod graph_exec;
 mod hiz;
 mod hot_reload;
@@ -44,3 +45,4 @@ mod water;
 mod window_delegate;
 
 pub use context::{MtlContext, set_embedded_pump_events, set_preview_view};
+pub(crate) use gpu_profile::probe_gpu_profile;

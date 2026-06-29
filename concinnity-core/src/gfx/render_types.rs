@@ -211,8 +211,21 @@ pub struct ShadowUniforms {
     // One light-space VP matrix per cascade, column-major.
     pub light_vps: [[[f32; 4]; 4]; NUM_SHADOW_CASCADES],
     // View-space depth at the FAR end of each cascade. Stored as a vec4 to
-    // keep MSL std140-like alignment trivial across backends.
+    // keep MSL std140-like alignment trivial across backends. Slots
+    // `[active_cascades..]` hold a negative sentinel so the fragment shader's
+    // split comparison never selects an unrendered cascade.
     pub cascade_splits: [f32; NUM_SHADOW_CASCADES],
+    // How many of the `NUM_SHADOW_CASCADES` slots are live this frame (1..=4,
+    // from `GraphicsConfig.shadow_cascades`). The array capacity stays 4; only
+    // the first `active_cascades` are split, rendered, and sampled. The fragment
+    // shader bounds both its cascade fallback and its cross-cascade blend by this
+    // so it never reads a slot the CPU did not render.
+    pub active_cascades: u32,
+    // Pads the struct to 288 bytes (a multiple of 16). The Rust `[[f32; 4]; 4]`
+    // matrices are only 4-byte aligned, so Rust would otherwise leave this at 276;
+    // the MSL `float4x4`-aligned struct and the GLSL std140 block both round up to
+    // 288, so the upload size must match for the bound buffer range to cover them.
+    pub _pad: [u32; 3],
 }
 
 // Per-shadow-pass push constant identifying which cascade is being rendered.
@@ -258,7 +271,7 @@ pub struct TextUniforms {
 // Post-process tunables resolved from the `PostProcessConfig` asset (or its
 // defaults) and threaded into each backend at init. Pushed verbatim to the
 // bloom prefilter and composite fragment shaders, so the layout must stay in
-// sync with the `PostUniforms` struct in those shaders. 32 bytes.
+// sync with the `PostUniforms` struct in those shaders. 36 bytes.
 #[derive(Copy, Clone, Debug)]
 #[repr(C)]
 pub struct PostProcessParams {
@@ -292,6 +305,12 @@ pub struct PostProcessParams {
     // PQ-encoded values directly to an HDR10 panel. Only read when
     // `hdr_output > 0.5`; always 0.0 on the SDR path.
     pub pq_output: f32,
+    // FXAA edge-filter flag on the SDR path. `1.0` runs the composite's
+    // FXAA pass; `0.0` skips it (the `Off` anti-aliasing mode). Resolved
+    // from `PostProcessConfig.aa_mode`: on for `Fxaa` and `Taa`, off for
+    // `Off`. Always ignored on the HDR path, which never runs FXAA. Stored
+    // as a float so the shader branches on `> 0.5` without a cast.
+    pub fxaa: f32,
 }
 
 impl PostProcessParams {
@@ -305,6 +324,7 @@ impl PostProcessParams {
         lut_strength: 1.0,
         hdr_output: 0.0,
         pq_output: 0.0,
+        fxaa: 1.0,
     };
 }
 
@@ -1404,12 +1424,15 @@ mod tests {
     fn shadow_uniforms_layout_matches_msl() {
         // MSL `ShadowUniforms` in default.metal / shadow_map.metal (and
         // `RaymarchShadowUniforms` in raymarch_helpers.metal, bound from this
-        // same struct): NUM_SHADOW_CASCADES float4x4s then the splits. The MSL
-        // declares the splits as `float4` (default/shadow) or `float[4]`
-        // (raymarch); both occupy the same 16 bytes as the Rust `[f32; 4]`.
-        assert_eq!(size_of::<ShadowUniforms>(), 272);
+        // same struct): NUM_SHADOW_CASCADES float4x4s, then the splits, then the
+        // active-cascade count. The MSL declares the splits as `float4`
+        // (default/shadow) or `float[4]` (raymarch); both occupy the same 16
+        // bytes as the Rust `[f32; 4]`. `active_cascades` is a `uint` at offset
+        // 272; the struct rounds up to 288 for the 16-byte (float4x4) alignment.
+        assert_eq!(size_of::<ShadowUniforms>(), 288);
         assert_eq!(offset_of!(ShadowUniforms, light_vps), 0);
         assert_eq!(offset_of!(ShadowUniforms, cascade_splits), 256);
+        assert_eq!(offset_of!(ShadowUniforms, active_cascades), 272);
         // 16-aligned size keeps the float4x4 array head aligned in MSL.
         assert_eq!(size_of::<ShadowUniforms>() % 16, 0);
     }
@@ -1446,8 +1469,8 @@ mod tests {
 
     #[test]
     fn post_process_params_layout_matches_msl() {
-        // MSL `PostUniforms` in post.metal / bloom.metal: eight floats.
-        assert_eq!(size_of::<PostProcessParams>(), 32);
+        // MSL `PostUniforms` in post.metal / bloom.metal: nine floats.
+        assert_eq!(size_of::<PostProcessParams>(), 36);
         assert_eq!(offset_of!(PostProcessParams, bloom_intensity), 0);
         assert_eq!(offset_of!(PostProcessParams, bloom_threshold), 4);
         assert_eq!(offset_of!(PostProcessParams, bloom_knee), 8);
@@ -1456,6 +1479,7 @@ mod tests {
         assert_eq!(offset_of!(PostProcessParams, lut_strength), 20);
         assert_eq!(offset_of!(PostProcessParams, hdr_output), 24);
         assert_eq!(offset_of!(PostProcessParams, pq_output), 28);
+        assert_eq!(offset_of!(PostProcessParams, fxaa), 32);
     }
 
     #[test]

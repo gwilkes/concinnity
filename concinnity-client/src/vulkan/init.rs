@@ -63,6 +63,15 @@ impl VkContext {
         // Shadow-cascade re-render policy: hybrid amortizes the far cascades
         // across frames, every_frame refreshes all cascades every frame.
         shadow_update: crate::assets::ShadowUpdate,
+        // Shadow distance (GraphicsConfig.shadow_distance, world units). The
+        // per-frame cascade split reads it, capped at the camera far plane.
+        shadow_distance: u32,
+        // Shadow cascade count (GraphicsConfig.shadow_cascades, 1..=4). The
+        // per-frame split + schedule read it; applies at the next launch.
+        shadow_cascades: u32,
+        // Scene-sampler max anisotropy (GraphicsConfig.anisotropy), clamped to the
+        // device limit where the sampler is built below.
+        anisotropy: u32,
         text_atlases: Vec<(u32, u32, Vec<u8>)>,
         // Serialised `EnvironmentMap` payload; `None` binds 1×1 grey fallback
         // cubes and disables IBL via `prefilter_mip_count = 0`.
@@ -75,7 +84,7 @@ impl VkContext {
         // composite pass. `None` binds a 2x2x2 identity LUT, so the grade is a
         // no-op at any `lut_strength`.
         color_lut_bytes: Option<&[u8]>,
-        // Temporal anti-aliasing toggle, resolved from `PostProcessConfig.taa`.
+        // Temporal anti-aliasing toggle, resolved from `PostProcessConfig.aa_mode`.
         // When set, a velocity pre-pass + history-resolve pass run and the
         // projection is sub-pixel jittered; when false all of that is skipped.
         taa_enabled: bool,
@@ -685,14 +694,15 @@ impl VkContext {
         //  Samplers
         // Anisotropic degree for the scene sampler: enabled only when the device
         // supports `samplerAnisotropy` (the matching feature is turned on in
-        // `device.rs`). Clamp the requested 8x to the device limit.
+        // `device.rs`). Clamp the requested degree (GraphicsConfig.anisotropy) to
+        // the GPU's 1..16 range and then to the device limit.
         let scene_aniso = {
             let feats = unsafe { instance.get_physical_device_features(physical_device) };
             if feats.sampler_anisotropy != 0 {
                 let limit = unsafe { instance.get_physical_device_properties(physical_device) }
                     .limits
                     .max_sampler_anisotropy;
-                8.0_f32.min(limit)
+                (anisotropy.clamp(1, 16) as f32).min(limit)
             } else {
                 1.0
             }
@@ -3324,6 +3334,8 @@ impl VkContext {
                 uniforms: shadow_uniforms,
                 light_dir: shadow_light_dir,
                 update: shadow_update,
+                distance: shadow_distance,
+                cascades: shadow_cascades,
                 scheduler: Default::default(),
                 render_mask: 0,
             },

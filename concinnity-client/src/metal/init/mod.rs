@@ -101,6 +101,15 @@ impl MtlContext {
         light_uniforms: LightUniforms,
         shadow_map_size: u32,
         shadow_update: crate::assets::ShadowUpdate,
+        // Shadow distance (GraphicsConfig.shadow_distance, world units). The
+        // per-frame cascade split reads it; live via set_shadow_distance.
+        shadow_distance: u32,
+        // Shadow cascade count (GraphicsConfig.shadow_cascades, 1..=4). The
+        // per-frame split + schedule read it; live via set_shadow_cascades.
+        shadow_cascades: u32,
+        // Scene-sampler max anisotropy (GraphicsConfig.anisotropy), clamped to
+        // Metal's guaranteed 1..16 range where it is used below.
+        anisotropy: u32,
         text_atlases: Vec<(u32, u32, Vec<u8>)>,
         // serialised EnvironmentMap payload (irradiance + prefilter cubemaps).
         // None → IBL disabled; the runtime binds 1x1 grey fallback cubes and
@@ -112,7 +121,7 @@ impl MtlContext {
         mut post_process: crate::gfx::render_types::PostProcessParams,
         // serialised ColorLut payload (3D grading LUT). None → identity LUT.
         color_lut_bytes: Option<&[u8]>,
-        // temporal anti-aliasing toggle resolved from PostProcessConfig.taa.
+        // temporal anti-aliasing toggle resolved from PostProcessConfig.aa_mode.
         taa_enabled: bool,
         // SSAO tunables resolved from PostProcessConfig; None → SSAO disabled.
         ssao_settings: Option<SsaoSettings>,
@@ -337,7 +346,8 @@ impl MtlContext {
         // linear filter, repeat wrap -- matches the room shader expectations.
         // Mipmap linear + anisotropy let minified scene textures trilinear-select
         // down the mip chain now that uploads carry one, instead of aliasing from
-        // mip 0. 8x is within Metal's guaranteed maximum of 16.
+        // mip 0. The degree comes from GraphicsConfig.anisotropy (default 8),
+        // clamped to Metal's guaranteed 1..16 range.
         let sampler = {
             let desc = MTLSamplerDescriptor::new();
             desc.setMinFilter(MTLSamplerMinMagFilter::Linear);
@@ -345,7 +355,7 @@ impl MtlContext {
             desc.setMipFilter(objc2_metal::MTLSamplerMipFilter::Linear);
             desc.setSAddressMode(MTLSamplerAddressMode::Repeat);
             desc.setTAddressMode(MTLSamplerAddressMode::Repeat);
-            desc.setMaxAnisotropy(8);
+            desc.setMaxAnisotropy(anisotropy.clamp(1, 16) as usize);
             device
                 .newSamplerStateWithDescriptor(&desc)
                 .ok_or("failed to create sampler state")?
@@ -1071,6 +1081,8 @@ impl MtlContext {
             shadow_map,
             shadow_map_size: effective_shadow_size,
             shadow_update,
+            shadow_distance,
+            shadow_cascades,
             shadow_scheduler: Default::default(),
             shadow_render_mask: 0,
             shadow_sampler,

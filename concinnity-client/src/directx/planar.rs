@@ -44,7 +44,7 @@ use super::texture::{
 // frame. Each plane is a full scene re-render, so this caps the per-frame cost;
 // panes past the budget fall back to the box-projected probe cube. Matches
 // `metal::planar::MAX_PLANAR_PLANES`.
-pub(in crate::directx) const MAX_PLANAR_PLANES: usize = 2;
+pub(in crate::directx) const MAX_PLANAR_PLANES: usize = 4;
 
 // Clip the reflection a hair toward the kept (camera) side of the plane so
 // geometry exactly on the surface is not lost to near-plane precision. Matches
@@ -568,9 +568,10 @@ mod tests {
     }
 
     #[test]
-    fn planar_budget_is_two() {
+    fn planar_budget_matches_backends() {
         // The reserved planar-resolve heap block + the per-frame mirror-render cost
-        // are sized off this; keep it in lockstep with `metal::planar`.
-        assert_eq!(MAX_PLANAR_PLANES, 2);
+        // are sized off this; keep it in lockstep with `metal::planar` /
+        // `vulkan::planar` so the three backends pick the same reflectors.
+        assert_eq!(MAX_PLANAR_PLANES, 4);
     }
 }

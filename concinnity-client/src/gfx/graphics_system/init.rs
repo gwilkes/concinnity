@@ -337,6 +337,10 @@ impl GraphicsSystem {
         // key (persisted or default). Like the slider sync, before UiInputSystem
         // drains the HitRegions.
         self.init_rebind_rows(ctx);
+        // Capture each cycle row's value-label id, so a preset change can relabel
+        // its dependent rows (and a quality-row change the master row) at runtime,
+        // when the HitRegions are gone. Also before UiInputSystem drains them.
+        self.init_cycle_value_labels(ctx);
         // Capture each ScrollPanel's per-element clip bands for the draw path,
         // before UiInputSystem drains the panels (init order: graphics first).
         self.init_clip_rects(ctx);
@@ -2026,7 +2030,7 @@ impl GraphicsSystem {
 // of that setting. `current_index` maps a setting key to the index of its
 // active option (None for an unknown key). Runs once at init, before any
 // system drains the HitRegions.
-pub(super) fn sync_setting_value_labels(
+fn sync_setting_value_labels(
     ctx: &mut PipelineContext,
     current_index: impl Fn(&str) -> Option<usize>,
 ) {
@@ -2059,7 +2063,7 @@ pub(super) fn sync_setting_value_labels(
 // Set the value label of the settings row bound to `key` to `text` directly,
 // for a label that is not one of the row's static `options` (the master preset
 // row's "Auto (High)", or the live "Custom" flip when a quality row changes).
-pub(super) fn set_setting_row_label(ctx: &mut PipelineContext, key: &str, text: &str) {
+fn set_setting_row_label(ctx: &mut PipelineContext, key: &str, text: &str) {
     let label_id = ctx.query::<HitRegion>().find_map(|r| {
         let row_key = r.action.strip_prefix("setting:")?.split(':').next()?;
         (row_key == key).then_some(r.label).flatten()

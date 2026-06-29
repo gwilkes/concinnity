@@ -166,6 +166,12 @@ pub struct GraphicsSystem {
     // handle Sprites. Drives the handle position + value-label update when a
     // slider changes, and the one-time sync of both to the live value at init.
     sliders: Vec<SliderViz>,
+    // Cycle rows' setting key -> value-label id, captured at init from their
+    // `setting:<key>:next` HitRegions (drained by UiInputSystem afterwards). Lets
+    // a runtime change relabel a row other than the one clicked: the master
+    // "Graphics Quality" preset relabels the quality toggles + render scale it
+    // re-derives, and an individual quality-row change relabels the master row.
+    cycle_value_labels: std::collections::HashMap<String, AssetId>,
     // Per-element clip bands (reference space) captured at init from the world's
     // ScrollPanels: each scroll-content element id maps to its panel's content
     // band, so the draw path scissors it and off-band rows do not bleed over the
@@ -346,6 +352,7 @@ impl GraphicsSystem {
             // Default until init resolves the world's config + persisted toggles.
             post_config: crate::assets::PostProcessConfig::default(),
             sliders: Vec::new(),
+            cycle_value_labels: std::collections::HashMap::new(),
             clip_rects: std::collections::HashMap::new(),
             keymap: crate::gfx::keymap::KeyMap::default(),
             rebind_rows: Vec::new(),

@@ -86,6 +86,22 @@ fn set_label_content(ctx: &mut PipelineContext, id: AssetId, text: &str) {
     }
 }
 
+// Set a cycle row's value label from its init-captured id. Used to update a
+// row other than the one that was clicked (the master preset relabels the
+// quality toggles + render scale; a quality-toggle change relabels the master
+// row). The menu's HitRegions are drained after init, so the row -> label map
+// is captured once (`init_cycle_value_labels`) rather than re-queried here.
+fn set_cached_row_label(
+    labels: &std::collections::HashMap<String, AssetId>,
+    ctx: &mut PipelineContext,
+    key: &str,
+    text: &str,
+) {
+    if let Some(&id) = labels.get(key) {
+        set_label_content(ctx, id, text);
+    }
+}
+
 // Move the Sprite with the given id to `x` (its left edge), if present. Used to
 // slide a slider's handle along its track.
 fn set_sprite_x(ctx: &mut PipelineContext, id: AssetId, x: f32) {
@@ -110,6 +126,16 @@ fn rebind_key_of(action: &str) -> Option<&str> {
     action
         .strip_prefix("setting:")?
         .strip_suffix(":rebind")
+        .filter(|k| !k.is_empty())
+}
+
+// The setting key of a cycle row's forward stepper (`setting:<key>:next`), or
+// `None`. A cycle row emits a matching `:prev` region with the same value label,
+// so capturing the `:next` region alone maps each cycle key once.
+fn cycle_next_key_of(action: &str) -> Option<&str> {
+    action
+        .strip_prefix("setting:")?
+        .strip_suffix(":next")
         .filter(|k| !k.is_empty())
 }
 
@@ -668,18 +694,35 @@ impl GraphicsSystem {
                         }
 
                         // Refresh the dependent rows (quality toggles + render
-                        // scale) and the master row's own Auto(tier) label.
-                        let post_snapshot = self.post_config.clone();
-                        let render_scale = self.render_scale;
-                        super::init::sync_setting_value_labels(ctx, |key| match key {
-                            "render_scale" => Some(settings::render_scale_index(render_scale)),
-                            k if settings::is_quality_toggle(k) => {
-                                super::quality_toggle_on(&post_snapshot, k).map(|on| on as usize)
+                        // scale) from the init-captured value-label ids -- the
+                        // menu's HitRegions are drained by UiInputSystem after
+                        // init, so they cannot be re-queried here.
+                        for key in settings::QUALITY_TOGGLE_KEYS {
+                            let on =
+                                super::quality_toggle_on(&self.post_config, key).unwrap_or(false);
+                            if let Some(text) =
+                                settings::options(key).and_then(|o| o.get(on as usize).copied())
+                            {
+                                set_cached_row_label(&self.cycle_value_labels, ctx, key, text);
                             }
-                            _ => None,
-                        });
+                        }
+                        if let Some(text) = settings::options("render_scale").and_then(|o| {
+                            o.get(settings::render_scale_index(self.render_scale))
+                                .copied()
+                        }) {
+                            set_cached_row_label(
+                                &self.cycle_value_labels,
+                                ctx,
+                                "render_scale",
+                                text,
+                            );
+                        }
+                        // The master row's own label carries the Auto(tier) suffix
+                        // and is updated through the event-carried value-label id.
                         let label = quality_preset::preset_label(preset, &self.gpu_profile);
-                        super::init::set_setting_row_label(ctx, "graphics_quality", &label);
+                        if let Some(id) = cmd.value_label {
+                            set_label_content(ctx, id, &label);
+                        }
                         continue;
                     }
                     let Some(opts) = settings::options(&cmd.setting) else {
@@ -745,7 +788,8 @@ impl GraphicsSystem {
                             // choice opts the master preset out to Custom.
                             self.quality_preset = crate::gfx::quality_preset::QualityPreset::Custom;
                             cfg.graphics.quality_preset = Some(self.quality_preset);
-                            super::init::set_setting_row_label(
+                            set_cached_row_label(
+                                &self.cycle_value_labels,
                                 ctx,
                                 "graphics_quality",
                                 self.quality_preset.name(),
@@ -800,7 +844,8 @@ impl GraphicsSystem {
                             // choice), and updates the master row's label to match.
                             self.quality_preset = crate::gfx::quality_preset::QualityPreset::Custom;
                             cfg.graphics.quality_preset = Some(self.quality_preset);
-                            super::init::set_setting_row_label(
+                            set_cached_row_label(
+                                &self.cycle_value_labels,
                                 ctx,
                                 "graphics_quality",
                                 self.quality_preset.name(),
@@ -1194,6 +1239,21 @@ impl GraphicsSystem {
             set_label_content(ctx, row.value_id, name);
         }
         self.rebind_rows = rows;
+    }
+
+    // Capture each cycle row's setting key -> value-label id, so a runtime change
+    // can relabel a row other than the one clicked (the master preset relabels
+    // its dependents; a quality-toggle change relabels the master row). Runs at
+    // init, before UiInputSystem drains the HitRegions (GraphicsSystem.init runs
+    // first), since they cannot be re-queried once drained.
+    pub(super) fn init_cycle_value_labels(&mut self, ctx: &mut PipelineContext) {
+        let mut labels = std::collections::HashMap::new();
+        for r in ctx.query::<HitRegion>() {
+            if let (Some(key), Some(value_id)) = (cycle_next_key_of(&r.action), r.label) {
+                labels.insert(key.to_string(), value_id);
+            }
+        }
+        self.cycle_value_labels = labels;
     }
 
     // Capture each ScrollPanel's per-element clip band (reference space) so the

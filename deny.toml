@@ -8,6 +8,12 @@ ignore = [
     # (glfw -> image -> ravif -> rav1e, and rapier3d -> simba); there is no
     # direct dependency and no fix until those upstreams drop it.
     "RUSTSEC-2024-0436",
+    # ttf-parser is unmaintained. Pulled in only transitively (fontdue ->
+    # ttf-parser, fontdue being the cook-time glyph rasterizer); the advisory
+    # lists no safe upgrade. The maintained alternative (skrifa) would require
+    # fontdue to switch or replacing fontdue outright. Revisit if fontdue moves
+    # off ttf-parser.
+    "RUSTSEC-2026-0192",
 ]
 
 [licenses]

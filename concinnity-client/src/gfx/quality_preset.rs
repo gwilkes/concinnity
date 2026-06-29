@@ -12,7 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::assets::{SsgiResolution, UpscaleQuality};
+use crate::assets::{ReflectionBlurResolution, SsgiResolution, UpscaleQuality};
 use crate::gfx::backend::{GpuProfile, GpuTier};
 
 // Persisted master graphics-quality choice. `Auto` resolves from the detected
@@ -56,12 +56,30 @@ pub(crate) struct QualityCeiling {
     pub ssgi_resolution: SsgiResolution,
     pub ssgi_rays: u32,
     pub ssgi_steps: u32,
+    // Cap on the roughness-aware reflection blur resolution (only bites where
+    // `ssr` or `ray_traced_reflections` is permitted): the finest blur the tier
+    // allows, clamping the world's choice coarser. The no-ceiling value is `Full`
+    // (finest), so a world's authored value always stands under it.
+    pub reflection_blur_resolution: ReflectionBlurResolution,
 }
 
 // The coarser (higher render-resolution divisor) of two SSGI resolutions, the
 // resolution analogue of `more_aggressive_upscale`. Used to clamp a world's
 // gather resolution under a ceiling without ever making it finer.
 pub(crate) fn coarser_ssgi_resolution(a: SsgiResolution, b: SsgiResolution) -> SsgiResolution {
+    if a.scale_divisor() >= b.scale_divisor() {
+        a
+    } else {
+        b
+    }
+}
+
+// The coarser of two reflection-blur resolutions (the SSGI helper's sibling for
+// the reflection blur enum).
+pub(crate) fn coarser_reflection_blur(
+    a: ReflectionBlurResolution,
+    b: ReflectionBlurResolution,
+) -> ReflectionBlurResolution {
     if a.scale_divisor() >= b.scale_divisor() {
         a
     } else {
@@ -80,6 +98,9 @@ pub(crate) fn coarser_ssgi_resolution(a: SsgiResolution, b: SsgiResolution) -> S
 const SSGI_RES_MAX: SsgiResolution = SsgiResolution::Full;
 const SSGI_RAYS_MAX: u32 = 32;
 const SSGI_STEPS_MAX: u32 = 64;
+// `Full` (finest) is the no-cap reflection-blur resolution: a world's choice
+// always stands coarser-or-equal under it.
+const REFLECTION_BLUR_MAX: ReflectionBlurResolution = ReflectionBlurResolution::Full;
 
 const NONE: QualityCeiling = QualityCeiling {
     taa: true,
@@ -92,6 +113,7 @@ const NONE: QualityCeiling = QualityCeiling {
     ssgi_resolution: SSGI_RES_MAX,
     ssgi_rays: SSGI_RAYS_MAX,
     ssgi_steps: SSGI_STEPS_MAX,
+    reflection_blur_resolution: REFLECTION_BLUR_MAX,
 };
 const LOW: QualityCeiling = QualityCeiling {
     taa: true,
@@ -104,6 +126,7 @@ const LOW: QualityCeiling = QualityCeiling {
     ssgi_resolution: SsgiResolution::Quarter,
     ssgi_rays: 4,
     ssgi_steps: 8,
+    reflection_blur_resolution: ReflectionBlurResolution::Quarter,
 };
 const MEDIUM: QualityCeiling = QualityCeiling {
     taa: true,
@@ -116,6 +139,7 @@ const MEDIUM: QualityCeiling = QualityCeiling {
     ssgi_resolution: SsgiResolution::Half,
     ssgi_rays: 8,
     ssgi_steps: 12,
+    reflection_blur_resolution: ReflectionBlurResolution::Half,
 };
 const HIGH: QualityCeiling = QualityCeiling {
     taa: true,
@@ -128,6 +152,7 @@ const HIGH: QualityCeiling = QualityCeiling {
     ssgi_resolution: SsgiResolution::Half,
     ssgi_rays: 8,
     ssgi_steps: 12,
+    reflection_blur_resolution: ReflectionBlurResolution::Half,
 };
 const ULTRA: QualityCeiling = QualityCeiling {
     taa: true,
@@ -140,6 +165,7 @@ const ULTRA: QualityCeiling = QualityCeiling {
     ssgi_resolution: SSGI_RES_MAX,
     ssgi_rays: SSGI_RAYS_MAX,
     ssgi_steps: SSGI_STEPS_MAX,
+    reflection_blur_resolution: REFLECTION_BLUR_MAX,
 };
 
 // The active ceiling for the persisted preset and detected GPU. `Auto` maps the
@@ -354,6 +380,14 @@ mod tests {
                 coarser_ssgi_resolution(lo.ssgi_resolution, hi.ssgi_resolution),
                 lo.ssgi_resolution,
                 "a higher tier permitted a coarser SSGI gather"
+            );
+            assert_eq!(
+                coarser_reflection_blur(
+                    lo.reflection_blur_resolution,
+                    hi.reflection_blur_resolution
+                ),
+                lo.reflection_blur_resolution,
+                "a higher tier permitted a coarser reflection blur"
             );
         }
     }

@@ -7,7 +7,9 @@
 // by the same string. Keeping the option list here (not in world data) means a
 // row can only target a setting the engine actually knows how to apply.
 
-use crate::assets::{SettingOp, SsgiResolution, UpscaleQuality, WindowMode};
+use crate::assets::{
+    ReflectionBlurResolution, SettingOp, SsgiResolution, UpscaleQuality, WindowMode,
+};
 
 // Ordered option labels for `vsync`: index 0 is off, index 1 is on.
 const VSYNC_OPTIONS: [&str; 2] = ["Off", "On"];
@@ -68,6 +70,20 @@ const SSGI_RAYS_OPTIONS: [&str; 4] = ["4", "8", "16", "32"];
 const SSGI_RAYS_COUNTS: [u32; 4] = [4, 8, 16, 32];
 const SSGI_STEPS_OPTIONS: [&str; 4] = ["8", "12", "24", "48"];
 const SSGI_STEPS_COUNTS: [u32; 4] = [8, 12, 24, 48];
+// Reflection blur resolution options, finest-first (matches the enum).
+const REFLECTION_BLUR_OPTIONS: [&str; 3] = ["Full", "Half", "Quarter"];
+
+// The cycle (dropdown) quality knobs governed by the preset ceiling like the
+// boolean QUALITY_TOGGLE_KEYS. Each rides the feature's live-reinit rebuild
+// (`apply_quality_settings`) -- the sub-tunable travels in its settings payload,
+// so no new backend method is needed. `GraphicsSystem` maps each key to the
+// `PostProcessConfig` field it cycles.
+pub(crate) const QUALITY_CYCLE_KEYS: [&str; 4] = [
+    "ssgi_resolution",
+    "ssgi_rays",
+    "ssgi_steps",
+    "reflection_blur_resolution",
+];
 
 // Master "Graphics Quality" preset options, in cycle order. The labels mirror
 // `QualityPreset::ALL`'s order (locked by `graphics_quality_options_match_preset_order`);
@@ -109,6 +125,9 @@ pub(crate) fn options(key: &str) -> Option<&'static [&'static str]> {
         "ssgi_resolution" => Some(&SSGI_RESOLUTION_OPTIONS),
         "ssgi_rays" => Some(&SSGI_RAYS_OPTIONS),
         "ssgi_steps" => Some(&SSGI_STEPS_OPTIONS),
+        "reflection_blur_resolution" => Some(&REFLECTION_BLUR_OPTIONS),
+        // Display-output / upscaling preference toggles (Off/On).
+        "temporal_upscaling" | "hdr_display" | "hdr_pq" => Some(&OFF_ON_OPTIONS),
         key if is_quality_toggle(key) => Some(&OFF_ON_OPTIONS),
         _ => None,
     }
@@ -200,6 +219,23 @@ fn nearest_count_index(levels: &[u32], count: u32) -> usize {
         .min_by_key(|&(_, &v)| v.abs_diff(count))
         .map(|(i, _)| i)
         .unwrap_or(0)
+}
+
+// Reflection blur resolution for an option index, and the index for a
+// resolution. Order matches REFLECTION_BLUR_OPTIONS (finest first).
+pub(crate) fn reflection_blur_at(index: usize) -> ReflectionBlurResolution {
+    match index {
+        0 => ReflectionBlurResolution::Full,
+        2 => ReflectionBlurResolution::Quarter,
+        _ => ReflectionBlurResolution::Half,
+    }
+}
+pub(crate) fn reflection_blur_index(res: ReflectionBlurResolution) -> usize {
+    match res {
+        ReflectionBlurResolution::Full => 0,
+        ReflectionBlurResolution::Half => 1,
+        ReflectionBlurResolution::Quarter => 2,
+    }
 }
 
 // Window (width, height) for a preset index.
@@ -538,6 +574,38 @@ mod tests {
         for key in ["ssgi_resolution", "ssgi_rays", "ssgi_steps"] {
             assert!(options(key).is_some(), "{key} should be a cycle row");
             assert!(slider_range(key).is_none(), "{key} should not be a slider");
+        }
+    }
+
+    #[test]
+    fn reflection_blur_round_trips() {
+        for r in [
+            ReflectionBlurResolution::Full,
+            ReflectionBlurResolution::Half,
+            ReflectionBlurResolution::Quarter,
+        ] {
+            assert_eq!(reflection_blur_at(reflection_blur_index(r)), r);
+        }
+        // It is registered as a cycle row + a governed cycle quality knob.
+        assert_eq!(
+            options("reflection_blur_resolution").map(|o| o.len()),
+            Some(3)
+        );
+        assert!(QUALITY_CYCLE_KEYS.contains(&"reflection_blur_resolution"));
+    }
+
+    #[test]
+    fn display_toggles_are_off_on_cycle_rows() {
+        // The display-output / upscaling preferences are Off/On cycle rows, and
+        // are NOT quality knobs (independent of the preset ceiling).
+        for key in ["temporal_upscaling", "hdr_display", "hdr_pq"] {
+            assert_eq!(options(key), Some(&["Off", "On"][..]), "{key} options");
+            assert!(slider_range(key).is_none(), "{key} should not be a slider");
+            assert!(!is_quality_toggle(key), "{key} is not a quality toggle");
+            assert!(
+                !QUALITY_CYCLE_KEYS.contains(&key),
+                "{key} is not a quality cycle knob"
+            );
         }
     }
 

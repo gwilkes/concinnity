@@ -205,6 +205,15 @@ pub struct GraphicsSystem {
     // baseline a live preset change re-clamps from, so up-shifting a preset
     // restores the world's features and down-shifting clamps them off.
     authored_post_config: crate::assets::PostProcessConfig,
+    // Display-output / upscaling preferences (the Display settings rows). Resolved
+    // at init from the world's `PostProcessConfig` overridden by any persisted
+    // choice, passed to the backend ctor, and held here so the rows display +
+    // cycle them. Restart-required (swapchain format / render targets are sized
+    // once at init), so a runtime change only persists + relabels; independent of
+    // the quality preset.
+    temporal_upscaling: bool,
+    hdr_display: bool,
+    hdr_pq: bool,
 }
 
 // One key-rebind row's runtime bookkeeping: the action it rebinds and the value
@@ -364,6 +373,10 @@ impl GraphicsSystem {
             quality_preset: crate::gfx::quality_preset::QualityPreset::Auto,
             // Defaulted until init captures the world's authored config.
             authored_post_config: crate::assets::PostProcessConfig::default(),
+            // Resolved at init from the world's config + persisted overrides.
+            temporal_upscaling: false,
+            hdr_display: false,
+            hdr_pq: false,
         }
     }
 }
@@ -473,12 +486,11 @@ pub(super) fn set_quality_toggle(cfg: &mut crate::assets::PostProcessConfig, key
     }
 }
 
-// The cycle quality knobs (non-boolean, dropdown-valued): the SSGI gather
-// sub-quality. Governed by the preset ceiling like the boolean toggles, and a
-// manual change flips the preset to Custom. Paired with `settings::options(key)`
-// for their value labels.
+// Whether `key` is one of the cycle (dropdown) quality knobs governed by the
+// preset ceiling like the boolean toggles (a manual change flips the preset to
+// Custom). The set lives in `settings::QUALITY_CYCLE_KEYS`.
 pub(super) fn is_quality_cycle(key: &str) -> bool {
-    matches!(key, "ssgi_resolution" | "ssgi_rays" | "ssgi_steps")
+    crate::gfx::settings::QUALITY_CYCLE_KEYS.contains(&key)
 }
 
 // The current menu option index of cycle quality knob `key` in `cfg`, or `None`
@@ -492,6 +504,9 @@ pub(super) fn quality_cycle_index(
         "ssgi_resolution" => Some(settings::ssgi_resolution_index(cfg.ssgi_resolution)),
         "ssgi_rays" => Some(settings::ssgi_rays_index(cfg.ssgi_rays)),
         "ssgi_steps" => Some(settings::ssgi_steps_index(cfg.ssgi_steps)),
+        "reflection_blur_resolution" => Some(settings::reflection_blur_index(
+            cfg.reflection_blur_resolution,
+        )),
         _ => None,
     }
 }
@@ -508,30 +523,41 @@ pub(super) fn set_quality_cycle(
         "ssgi_resolution" => cfg.ssgi_resolution = settings::ssgi_resolution_at(index),
         "ssgi_rays" => cfg.ssgi_rays = settings::ssgi_rays_at(index),
         "ssgi_steps" => cfg.ssgi_steps = settings::ssgi_steps_at(index),
+        "reflection_blur_resolution" => {
+            cfg.reflection_blur_resolution = settings::reflection_blur_at(index)
+        }
         _ => {}
     }
 }
 
-// Clamp the SSGI gather sub-quality in `cfg` DOWN under the ceiling (coarser
-// resolution / smaller counts; never raises), skipping any field the user has
-// explicitly overridden. Shared by the init clamp and the live preset re-derive
-// so both produce the same result.
-pub(super) fn clamp_ssgi_sub_quality(
+// Clamp cycle quality knob `key` in `cfg` DOWN under the ceiling (coarser
+// resolution / smaller count; never raises), a no-op when the user explicitly
+// overrode it. Shared by the init clamp and the live preset re-derive so both
+// produce the same result.
+pub(super) fn clamp_quality_cycle(
     cfg: &mut crate::assets::PostProcessConfig,
+    key: &str,
     ceiling: &crate::gfx::quality_preset::QualityCeiling,
-    res_overridden: bool,
-    rays_overridden: bool,
-    steps_overridden: bool,
+    overridden: bool,
 ) {
-    use crate::gfx::quality_preset::coarser_ssgi_resolution;
-    if !res_overridden {
-        cfg.ssgi_resolution = coarser_ssgi_resolution(cfg.ssgi_resolution, ceiling.ssgi_resolution);
+    if overridden {
+        return;
     }
-    if !rays_overridden {
-        cfg.ssgi_rays = cfg.ssgi_rays.min(ceiling.ssgi_rays);
-    }
-    if !steps_overridden {
-        cfg.ssgi_steps = cfg.ssgi_steps.min(ceiling.ssgi_steps);
+    use crate::gfx::quality_preset::{coarser_reflection_blur, coarser_ssgi_resolution};
+    match key {
+        "ssgi_resolution" => {
+            cfg.ssgi_resolution =
+                coarser_ssgi_resolution(cfg.ssgi_resolution, ceiling.ssgi_resolution)
+        }
+        "ssgi_rays" => cfg.ssgi_rays = cfg.ssgi_rays.min(ceiling.ssgi_rays),
+        "ssgi_steps" => cfg.ssgi_steps = cfg.ssgi_steps.min(ceiling.ssgi_steps),
+        "reflection_blur_resolution" => {
+            cfg.reflection_blur_resolution = coarser_reflection_blur(
+                cfg.reflection_blur_resolution,
+                ceiling.reflection_blur_resolution,
+            )
+        }
+        _ => {}
     }
 }
 

@@ -662,15 +662,12 @@ impl GraphicsSystem {
                                 super::set_quality_toggle(&mut self.post_config, key, false);
                             }
                         }
-                        // And clamp the SSGI gather sub-quality under the ceiling
-                        // (overrides cleared, so clamp all three).
-                        super::clamp_ssgi_sub_quality(
-                            &mut self.post_config,
-                            &ceiling,
-                            false,
-                            false,
-                            false,
-                        );
+                        // And clamp the cycle quality knobs (SSGI gather +
+                        // reflection blur) under the ceiling (overrides cleared,
+                        // so clamp every one).
+                        for key in settings::QUALITY_CYCLE_KEYS {
+                            super::clamp_quality_cycle(&mut self.post_config, key, &ceiling, false);
+                        }
                         backend.apply_quality_settings(super::derive_quality_settings(
                             &self.post_config,
                         ));
@@ -700,6 +697,7 @@ impl GraphicsSystem {
                         cfg.graphics.ssgi_resolution = None;
                         cfg.graphics.ssgi_rays = None;
                         cfg.graphics.ssgi_steps = None;
+                        cfg.graphics.reflection_blur_resolution = None;
                         cfg.graphics.render_scale = None;
                         if let Err(e) = cfg.save() {
                             tracing::warn!("GraphicsSystem: persist preset: {e}");
@@ -729,7 +727,7 @@ impl GraphicsSystem {
                                 text,
                             );
                         }
-                        for key in ["ssgi_resolution", "ssgi_rays", "ssgi_steps"] {
+                        for key in settings::QUALITY_CYCLE_KEYS {
                             if let Some(text) = super::quality_cycle_index(&self.post_config, key)
                                 .and_then(|idx| {
                                     settings::options(key).and_then(|o| o.get(idx).copied())
@@ -910,6 +908,10 @@ impl GraphicsSystem {
                                 "ssgi_steps" => {
                                     cfg.graphics.ssgi_steps = Some(self.post_config.ssgi_steps)
                                 }
+                                "reflection_blur_resolution" => {
+                                    cfg.graphics.reflection_blur_resolution =
+                                        Some(self.post_config.reflection_blur_resolution)
+                                }
                                 _ => {}
                             }
                             self.quality_preset = crate::gfx::quality_preset::QualityPreset::Custom;
@@ -923,6 +925,35 @@ impl GraphicsSystem {
                             backend.apply_quality_settings(super::derive_quality_settings(
                                 &self.post_config,
                             ));
+                            Some(opts[next])
+                        }
+                        // Display-output / upscaling preference toggles. Restart-
+                        // required: persist + display only (the swapchain format /
+                        // render targets are sized once at init, so it applies at
+                        // the next launch). Independent of the quality preset, so
+                        // no Custom-flip and no live backend call.
+                        key @ ("temporal_upscaling" | "hdr_display" | "hdr_pq") => {
+                            let cur = match key {
+                                "temporal_upscaling" => self.temporal_upscaling,
+                                "hdr_display" => self.hdr_display,
+                                _ => self.hdr_pq,
+                            };
+                            let next = settings::cycle(cur as usize, opts.len(), cmd.op);
+                            let on = next == 1;
+                            match key {
+                                "temporal_upscaling" => {
+                                    self.temporal_upscaling = on;
+                                    cfg.graphics.temporal_upscaling = Some(on);
+                                }
+                                "hdr_display" => {
+                                    self.hdr_display = on;
+                                    cfg.graphics.hdr_display = Some(on);
+                                }
+                                _ => {
+                                    self.hdr_pq = on;
+                                    cfg.graphics.hdr_pq = Some(on);
+                                }
+                            }
                             Some(opts[next])
                         }
                         _ => None,

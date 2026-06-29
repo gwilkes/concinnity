@@ -38,7 +38,14 @@ const VIDEO_ROWS: [(&str, &str); 3] = [
 // Rows tucked under the Video "Advanced" collapsible group (collapsed by
 // default), so the top of the Video tab stays uncrowded. More live
 // post-process sliders join these later. Cycle rows then slider rows.
-const VIDEO_ADVANCED_ROWS: [(&str, &str); 1] = [("render_scale", "Render Scale")];
+const VIDEO_ADVANCED_ROWS: [(&str, &str); 4] = [
+    ("render_scale", "Render Scale"),
+    // Display-output / upscaling preferences (Off/On + render-scale cycle).
+    // Restart-required and independent of the quality preset.
+    ("temporal_upscaling", "Temporal Upscaling"),
+    ("hdr_display", "HDR Display"),
+    ("hdr_pq", "HDR10 (PQ)"),
+];
 // Live post-process sliders in the Advanced group. Each key's value range,
 // display format, and apply path live in the client (`concinnity_client::gfx::settings` +
 // `graphics_system`); a row here only chooses which sliders appear. All but
@@ -58,11 +65,14 @@ const VIDEO_ADVANCED_SLIDERS: [(&str, &str); 6] = [
 // client (`concinnity_client::gfx::settings` + `graphics_system`) knows each key's options and
 // applies it live by rebuilding the affected render resources; on backends
 // without a live path the choice persists and applies at the next launch.
-const VIDEO_QUALITY_ROWS: [(&str, &str); 9] = [
+const VIDEO_QUALITY_ROWS: [(&str, &str); 10] = [
     ("taa", "Anti-Aliasing"),
     ("ssao", "Ambient Occlusion"),
     ("ssr", "Screen-Space Reflections"),
     ("ray_traced_reflections", "Ray-Traced Reflections"),
+    // Reflection blur resolution dropdown, grouped under the reflection toggles
+    // it governs (SSR + ray-traced).
+    ("reflection_blur_resolution", "Reflection Blur"),
     ("ssgi", "Global Illumination"),
     // SSGI gather sub-quality (multi-option dropdowns), grouped under the GI
     // toggle. The runtime knows each key's options and applies them live.
@@ -1565,6 +1575,14 @@ mod tests {
                 "{key} should be in the Advanced group"
             );
         }
+        // The display-output / upscaling preference rows also live in Advanced.
+        for key in ["opt_temporal_upscaling", "opt_hdr_display", "opt_hdr_pq"] {
+            assert_eq!(
+                in_advanced(key),
+                Some(1),
+                "{key} should be in the Advanced group"
+            );
+        }
     }
 
     // The Video "Quality" group (gid 0): a header row that toggles group 0 and
@@ -1608,6 +1626,7 @@ mod tests {
             "opt_ssao",
             "opt_ssr",
             "opt_ray_traced_reflections",
+            "opt_reflection_blur_resolution",
             "opt_ssgi",
             "opt_ssgi_resolution",
             "opt_ssgi_rays",

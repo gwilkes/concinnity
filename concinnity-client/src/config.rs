@@ -139,6 +139,23 @@ pub struct GraphicsSettings {
     pub ssgi_rays: Option<u32>,
     #[serde(default)]
     pub ssgi_steps: Option<u32>,
+    // Roughness-aware reflection blur resolution
+    // (`PostProcessConfig.reflection_blur_resolution`). `None` uses the world's
+    // value. Applied live on Metal; governed by the quality preset ceiling like
+    // the SSGI sub-quality above (only bites when a reflection feature is on).
+    #[serde(default)]
+    pub reflection_blur_resolution: Option<crate::assets::ReflectionBlurResolution>,
+    // Display-output / upscaling preferences. Unlike the quality knobs above,
+    // these are independent of the master preset (a user choice, not a tier), and
+    // each is restart-required: the swapchain format / render targets are sized
+    // once at backend init, so a change persists and applies at the next launch.
+    // `None` uses the world's `PostProcessConfig` value.
+    #[serde(default)]
+    pub temporal_upscaling: Option<bool>,
+    #[serde(default)]
+    pub hdr_display: Option<bool>,
+    #[serde(default)]
+    pub hdr_pq: Option<bool>,
 }
 
 // Persisted overrides for audio settings.
@@ -359,6 +376,10 @@ mod tests {
                 ssgi_resolution: Some(crate::assets::SsgiResolution::Quarter),
                 ssgi_rays: Some(16),
                 ssgi_steps: Some(24),
+                reflection_blur_resolution: Some(crate::assets::ReflectionBlurResolution::Full),
+                temporal_upscaling: Some(true),
+                hdr_display: Some(true),
+                hdr_pq: Some(false),
                 ..Default::default()
             },
             audio: AudioSettings {

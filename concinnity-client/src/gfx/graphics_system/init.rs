@@ -176,8 +176,8 @@ impl GraphicsSystem {
             if let Some(v) = user_graphics.auto_exposure {
                 super::set_quality_toggle(&mut self.post_config, "auto_exposure", v);
             }
-            // SSGI gather sub-quality overrides (cycle dropdowns), alongside the
-            // boolean toggles above.
+            // SSGI gather + reflection blur sub-quality overrides (cycle
+            // dropdowns), alongside the boolean toggles above.
             if let Some(v) = user_graphics.ssgi_resolution {
                 self.post_config.ssgi_resolution = v;
             }
@@ -186,6 +186,9 @@ impl GraphicsSystem {
             }
             if let Some(v) = user_graphics.ssgi_steps {
                 self.post_config.ssgi_steps = v;
+            }
+            if let Some(v) = user_graphics.reflection_blur_resolution {
+                self.post_config.reflection_blur_resolution = v;
             }
         }
         // Apply the active quality preset as a performance ceiling over the
@@ -240,16 +243,24 @@ impl GraphicsSystem {
                 user_graphics.auto_exposure.is_some(),
                 quality_ceiling.auto_exposure,
             );
-            // Clamp the SSGI gather sub-quality under the ceiling too (coarser
-            // resolution / fewer rays / fewer steps), skipping any the user
-            // explicitly overrode.
-            super::clamp_ssgi_sub_quality(
-                &mut self.post_config,
-                &quality_ceiling,
-                user_graphics.ssgi_resolution.is_some(),
-                user_graphics.ssgi_rays.is_some(),
-                user_graphics.ssgi_steps.is_some(),
-            );
+            // Clamp the cycle quality knobs (SSGI gather + reflection blur) under
+            // the ceiling too (coarser resolution / fewer rays / steps), skipping
+            // any the user explicitly overrode.
+            let cycle_overridden = |key: &str| match key {
+                "ssgi_resolution" => user_graphics.ssgi_resolution.is_some(),
+                "ssgi_rays" => user_graphics.ssgi_rays.is_some(),
+                "ssgi_steps" => user_graphics.ssgi_steps.is_some(),
+                "reflection_blur_resolution" => user_graphics.reflection_blur_resolution.is_some(),
+                _ => false,
+            };
+            for key in crate::gfx::settings::QUALITY_CYCLE_KEYS {
+                super::clamp_quality_cycle(
+                    &mut self.post_config,
+                    key,
+                    &quality_ceiling,
+                    cycle_overridden(key),
+                );
+            }
         }
         // Per-feature settings, derived from the overlaid config. Each is the
         // init-time gate the backend builds against; the same derivation feeds a
@@ -269,17 +280,29 @@ impl GraphicsSystem {
         // `post_process.exposure` (resolve()) and the bias here is unused.
         let auto_exposure_settings = self.post_config.auto_exposure_settings();
         let auto_exposure_bias_ev = self.post_config.exposure_ev;
-        // HDR display output toggle, gated on the platform advertising an
-        // HDR-capable surface (else it warns and falls back to the SDR composite
-        // path).
-        let hdr_display = post_config.as_ref().map(|c| c.hdr_display).unwrap_or(false);
-        let hdr_pq = post_config.as_ref().map(|c| c.hdr_pq).unwrap_or(false);
-        // Temporal upscaling toggle + per-axis render scale, resolved from
-        // `PostProcessConfig.upscale_quality`.
-        let temporal_upscaling = post_config
-            .as_ref()
-            .map(|c| c.temporal_upscaling)
-            .unwrap_or(false);
+        // Display-output / upscaling preferences: the world's value overridden by
+        // any persisted settings-menu choice. Restart-required (the swapchain
+        // format + render targets are sized once at init), so they are read here,
+        // passed to the backend ctor below, and held on self for the settings rows
+        // to display + cycle. Independent of the quality preset (a user choice,
+        // not a tier), so they never clamp under the ceiling or flip it to Custom.
+        // HDR display output is additionally gated on the platform advertising an
+        // HDR-capable surface (else it warns and falls back to the SDR composite).
+        self.hdr_display = user_graphics
+            .hdr_display
+            .unwrap_or_else(|| post_config.as_ref().map(|c| c.hdr_display).unwrap_or(false));
+        self.hdr_pq = user_graphics
+            .hdr_pq
+            .unwrap_or_else(|| post_config.as_ref().map(|c| c.hdr_pq).unwrap_or(false));
+        self.temporal_upscaling = user_graphics.temporal_upscaling.unwrap_or_else(|| {
+            post_config
+                .as_ref()
+                .map(|c| c.temporal_upscaling)
+                .unwrap_or(false)
+        });
+        let hdr_display = self.hdr_display;
+        let hdr_pq = self.hdr_pq;
+        let temporal_upscaling = self.temporal_upscaling;
         // Render-scale (upscaling quality): the world's choice overridden by any
         // persisted settings-menu choice. Restart-required -- the upscaler and
         // render targets are sized from this once, here. `self.render_scale` is
@@ -315,6 +338,10 @@ impl GraphicsSystem {
             self.window_args.height,
             self.render_scale,
         );
+        // Display-group toggle states for the value-label sync (copies, so the
+        // closure below does not borrow self while ctx is borrowed mutably).
+        let (display_upscaling, display_hdr, display_pq) =
+            (self.temporal_upscaling, self.hdr_display, self.hdr_pq);
         // Audio / controls value labels read from the persisted settings store
         // (with the baseline default when unset); their owning systems apply the
         // value at their own init.
@@ -337,6 +364,10 @@ impl GraphicsSystem {
             "window_size" => Some(crate::gfx::settings::window_size_index(win_w, win_h)),
             "render_scale" => Some(crate::gfx::settings::render_scale_index(scale)),
             "master_volume" => Some(crate::gfx::settings::master_volume_index(master_volume)),
+            // Display-output / upscaling toggles (Off/On), held on self.
+            "temporal_upscaling" => Some(display_upscaling as usize),
+            "hdr_display" => Some(display_hdr as usize),
+            "hdr_pq" => Some(display_pq as usize),
             // mouse_sensitivity is a slider now, synced by `init_sliders`.
             // Quality toggles: index 0 = Off, 1 = On, matching OFF_ON_OPTIONS.
             key if crate::gfx::settings::is_quality_toggle(key) => {

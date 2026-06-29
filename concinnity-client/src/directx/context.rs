@@ -468,6 +468,9 @@ pub(super) struct ShadowState {
     // Cascade re-render policy from GraphicsConfig.shadow_update. Hybrid
     // refreshes the near cascade every frame and the far cascades round-robin.
     pub update: crate::assets::ShadowUpdate,
+    // Shadow distance in world units (GraphicsConfig.shadow_distance), read by the
+    // per-frame cascade-split computation and capped at the camera far plane.
+    pub distance: u32,
     // Round-robin clock + primed-set for the cascade schedule; advanced once per
     // frame in record_frame.
     pub scheduler: crate::gfx::shadow_schedule::ShadowCascadeScheduler,
@@ -1404,7 +1407,7 @@ impl DxContext {
                 fov_y_radians,
                 aspect,
                 near,
-                crate::gfx::csm::DEFAULT_SHADOW_DISTANCE.min(far),
+                (self.shadow.distance as f32).min(far),
                 self.shadow.light_dir,
                 self.shadow.map_size,
             );

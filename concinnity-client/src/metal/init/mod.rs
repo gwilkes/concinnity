@@ -101,6 +101,9 @@ impl MtlContext {
         light_uniforms: LightUniforms,
         shadow_map_size: u32,
         shadow_update: crate::assets::ShadowUpdate,
+        // Shadow distance (GraphicsConfig.shadow_distance, world units). The
+        // per-frame cascade split reads it; live via set_shadow_distance.
+        shadow_distance: u32,
         // Scene-sampler max anisotropy (GraphicsConfig.anisotropy), clamped to
         // Metal's guaranteed 1..16 range where it is used below.
         anisotropy: u32,
@@ -1075,6 +1078,7 @@ impl MtlContext {
             shadow_map,
             shadow_map_size: effective_shadow_size,
             shadow_update,
+            shadow_distance,
             shadow_scheduler: Default::default(),
             shadow_render_mask: 0,
             shadow_sampler,

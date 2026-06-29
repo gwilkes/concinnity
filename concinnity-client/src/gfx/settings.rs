@@ -85,6 +85,14 @@ const SHADOW_RESOLUTION_SIZES: [u32; 4] = [0, 1024, 2048, 4096];
 // Applied live (the cascade scheduler reads the policy each frame).
 const SHADOW_UPDATE_OPTIONS: [&str; 2] = ["Every Frame", "Hybrid"];
 
+// Shadow-distance options (world units the cascades cover), in cycle order. A
+// larger distance shadows more of the scene but spreads the same resolution over
+// more area. Indices map via the `shadow_distance_*` helpers below (an authored
+// distance off the discrete levels snaps to the nearest). Applied live (the
+// per-frame cascade-split computation reads the distance each draw).
+const SHADOW_DISTANCE_OPTIONS: [&str; 4] = ["40 m", "80 m", "160 m", "320 m"];
+const SHADOW_DISTANCE_VALUES: [u32; 4] = [40, 80, 160, 320];
+
 // Anisotropic-filtering degree options for the scene sampler, in cycle order.
 // "Off" is 1x (plain trilinear); the rest are the max anisotropy degree. Indices
 // map via the `anisotropy_*` helpers below (an authored degree off the discrete
@@ -162,6 +170,7 @@ pub(crate) fn options(key: &str) -> Option<&'static [&'static str]> {
         "reflection_blur_resolution" => Some(&REFLECTION_BLUR_OPTIONS),
         "shadow_map_size" => Some(&SHADOW_RESOLUTION_OPTIONS),
         "shadow_update" => Some(&SHADOW_UPDATE_OPTIONS),
+        "shadow_distance" => Some(&SHADOW_DISTANCE_OPTIONS),
         "anisotropy" => Some(&ANISOTROPY_OPTIONS),
         "frames_in_flight" => Some(&FRAME_BUFFERING_OPTIONS),
         "texture_quality" => Some(&TEXTURE_QUALITY_OPTIONS),
@@ -304,6 +313,19 @@ pub(crate) fn shadow_update_index(update: ShadowUpdate) -> usize {
         ShadowUpdate::EveryFrame => 0,
         ShadowUpdate::Hybrid => 1,
     }
+}
+
+// Shadow distance (world units) for an option index, and the menu index nearest
+// an authored distance (the world may author a distance off the discrete levels;
+// the row then shows the closest one). The default fallback is the world default
+// (80).
+pub(crate) fn shadow_distance_at(index: usize) -> u32 {
+    *SHADOW_DISTANCE_VALUES
+        .get(index)
+        .unwrap_or(&SHADOW_DISTANCE_VALUES[1])
+}
+pub(crate) fn shadow_distance_index(distance: u32) -> usize {
+    nearest_count_index(&SHADOW_DISTANCE_VALUES, distance)
 }
 
 // Anisotropic-filtering degree for an option index, and the menu index nearest an
@@ -848,6 +870,24 @@ mod tests {
         // It is a cycle row, not a slider.
         assert!(options("anisotropy").is_some());
         assert!(slider_range("anisotropy").is_none());
+    }
+
+    #[test]
+    fn shadow_distance_round_trips_and_snaps() {
+        // Each discrete level round-trips through its index.
+        for i in 0..SHADOW_DISTANCE_VALUES.len() {
+            assert_eq!(shadow_distance_index(shadow_distance_at(i)), i);
+        }
+        // The world default 80 is index 1.
+        assert_eq!(shadow_distance_at(1), 80);
+        assert_eq!(shadow_distance_index(80), 1);
+        // An authored distance off the discrete levels snaps to the nearest, and
+        // one above the top level snaps down to it.
+        assert_eq!(shadow_distance_index(50), 0); // 50 -> 40
+        assert_eq!(shadow_distance_index(1000), 3); // 1000 -> 320
+        // It is a cycle row, not a slider.
+        assert!(options("shadow_distance").is_some());
+        assert!(slider_range("shadow_distance").is_none());
     }
 
     #[test]

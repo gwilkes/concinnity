@@ -749,6 +749,14 @@ impl GraphicsSystem {
                             &ceiling,
                         );
                         backend.set_shadow_update(self.shadow_update);
+                        // Shadow distance: live (the cascade-split math reads it
+                        // each frame), so re-derive from the authored baseline and
+                        // push it to the backend.
+                        self.shadow_distance = quality_preset::clamp_shadow_distance(
+                            self.authored_shadow_distance,
+                            &ceiling,
+                        );
+                        backend.set_shadow_distance(self.shadow_distance);
                         // Anisotropy: restart-required, so re-derive from the
                         // authored baseline for the row label only (the sampler is
                         // built at init; the new degree takes effect next launch).
@@ -772,6 +780,7 @@ impl GraphicsSystem {
                         cfg.graphics.reflection_blur_resolution = None;
                         cfg.graphics.shadow_map_size = None;
                         cfg.graphics.shadow_update = None;
+                        cfg.graphics.shadow_distance = None;
                         cfg.graphics.anisotropy = None;
                         cfg.graphics.render_scale = None;
                         if let Err(e) = cfg.save() {
@@ -814,10 +823,18 @@ impl GraphicsSystem {
                         // And the shadow + anisotropy rows (their state lives on
                         // self, not the post_config, so they relabel from the live
                         // fields).
-                        for key in ["shadow_map_size", "shadow_update", "anisotropy"] {
+                        for key in [
+                            "shadow_map_size",
+                            "shadow_update",
+                            "shadow_distance",
+                            "anisotropy",
+                        ] {
                             let idx = match key {
                                 "shadow_map_size" => {
                                     settings::shadow_resolution_index(self.shadow_map_size)
+                                }
+                                "shadow_distance" => {
+                                    settings::shadow_distance_index(self.shadow_distance)
                                 }
                                 "anisotropy" => settings::anisotropy_index(self.anisotropy),
                                 _ => settings::shadow_update_index(self.shadow_update),
@@ -1097,6 +1114,25 @@ impl GraphicsSystem {
                             self.shadow_update = settings::shadow_update_at(next);
                             backend.set_shadow_update(self.shadow_update);
                             cfg.graphics.shadow_update = Some(self.shadow_update);
+                            self.quality_preset = crate::gfx::quality_preset::QualityPreset::Custom;
+                            cfg.graphics.quality_preset = Some(self.quality_preset);
+                            set_cached_row_label(
+                                &self.cycle_value_labels,
+                                ctx,
+                                "graphics_quality",
+                                self.quality_preset.name(),
+                            );
+                            Some(opts[next])
+                        }
+                        // Shadow distance: live -- the per-frame cascade-split math
+                        // reads it, so it applies on the next draw. Preset-governed,
+                        // so an explicit choice flips the master preset to Custom.
+                        "shadow_distance" => {
+                            let cur = settings::shadow_distance_index(self.shadow_distance);
+                            let next = settings::cycle(cur, opts.len(), cmd.op);
+                            self.shadow_distance = settings::shadow_distance_at(next);
+                            backend.set_shadow_distance(self.shadow_distance);
+                            cfg.graphics.shadow_distance = Some(self.shadow_distance);
                             self.quality_preset = crate::gfx::quality_preset::QualityPreset::Custom;
                             cfg.graphics.quality_preset = Some(self.quality_preset);
                             set_cached_row_label(

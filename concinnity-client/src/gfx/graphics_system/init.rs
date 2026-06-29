@@ -83,6 +83,7 @@ impl GraphicsSystem {
             self.max_frames = args.max_frames;
             self.shadow_map_size = args.shadow_map_size;
             self.shadow_update = args.shadow_update;
+            self.shadow_distance = args.shadow_distance;
             self.anisotropy = args.anisotropy;
         }
         // A persisted vsync choice overrides the world's value. Applied outside
@@ -115,6 +116,19 @@ impl GraphicsSystem {
             None => {
                 self.shadow_update = crate::gfx::quality_preset::clamp_shadow_update(
                     self.shadow_update,
+                    &quality_ceiling,
+                )
+            }
+        }
+        // Shadow distance (GraphicsConfig-sourced, live -- the per-frame cascade
+        // split reads it). Same baseline / override / ceiling-clamp shape as the
+        // shadow knobs above.
+        self.authored_shadow_distance = self.shadow_distance;
+        match user_graphics.shadow_distance {
+            Some(v) => self.shadow_distance = v,
+            None => {
+                self.shadow_distance = crate::gfx::quality_preset::clamp_shadow_distance(
+                    self.shadow_distance,
                     &quality_ceiling,
                 )
             }
@@ -458,6 +472,7 @@ impl GraphicsSystem {
             (self.temporal_upscaling, self.hdr_display, self.hdr_pq);
         // Shadow knob states for the value-label sync (copies, same reason).
         let (shadow_size, shadow_update_val) = (self.shadow_map_size, self.shadow_update);
+        let shadow_distance_val = self.shadow_distance;
         let anisotropy_val = self.anisotropy;
         // System / streaming restart-row states for the value-label sync (copies).
         // `occlusion_two_pass` is already a local above.
@@ -491,6 +506,9 @@ impl GraphicsSystem {
             // Shadow quality knobs (resolution restart-required, cadence live).
             "shadow_map_size" => Some(crate::gfx::settings::shadow_resolution_index(shadow_size)),
             "shadow_update" => Some(crate::gfx::settings::shadow_update_index(shadow_update_val)),
+            "shadow_distance" => Some(crate::gfx::settings::shadow_distance_index(
+                shadow_distance_val,
+            )),
             "anisotropy" => Some(crate::gfx::settings::anisotropy_index(anisotropy_val)),
             // System / streaming restart rows.
             "frames_in_flight" => Some(crate::gfx::settings::frames_in_flight_index(
@@ -1950,6 +1968,7 @@ impl GraphicsSystem {
             light_uniforms,
             self.shadow_map_size,
             self.shadow_update,
+            self.shadow_distance,
             self.anisotropy,
             text_atlas_data,
             env_map_bytes.as_deref(),

@@ -63,6 +63,9 @@ pub(super) struct VkShadow {
     // Cascade re-render policy from GraphicsConfig.shadow_update. Hybrid
     // refreshes the near cascade every frame and the far cascades round-robin.
     pub(super) update: crate::assets::ShadowUpdate,
+    // Shadow distance in world units (GraphicsConfig.shadow_distance), read by the
+    // per-frame cascade-split computation and capped at the camera far plane.
+    pub(super) distance: u32,
     // Round-robin clock + primed-set for the cascade schedule; advanced once per
     // frame in draw_frame.
     pub(super) scheduler: crate::gfx::shadow_schedule::ShadowCascadeScheduler,

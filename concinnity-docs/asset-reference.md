@@ -27,6 +27,7 @@ is not user-configurable.
 - `rotation_speed`: A float. Rotation speed of the demo object in radians per second. Only used when no camera is present. Defaults to `1.0`.
 - `shadow_map_size`: An integer. Shadow map resolution in texels (e.g. 2048). Set to 0 to disable shadows. Defaults to `2048`.
 - `shadow_update`: A string (one of `every_frame` or `hybrid`). How often shadow cascades are re-rendered. `hybrid` (default) amortizes the far cascades across frames; `every_frame` refreshes them all every frame. See [ShadowUpdate].
+- `shadow_distance`: An integer. How far from the camera shadows are cast, in world units (e.g. 80). The cascades cover from the near plane out to this distance; a larger value shadows more of the scene but spreads the same shadow-map resolution over more area (softer, blockier shadows). Capped at the camera far plane. Defaults to `80`.
 - `anisotropy`: An integer. Maximum anisotropic-filtering degree for the scene texture sampler (albedo + normal maps), e.g. 8. Higher keeps textures viewed at a grazing angle (floors, walls receding into the distance) sharp instead of blurring along the minor axis, at a small sampling cost. `1` disables anisotropy (plain trilinear). Clamped to the GPU's supported range (1..16) at init. Defaults to `8`.
 
 ### ShaderStage

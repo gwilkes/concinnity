@@ -63,6 +63,9 @@ impl VkContext {
         // Shadow-cascade re-render policy: hybrid amortizes the far cascades
         // across frames, every_frame refreshes all cascades every frame.
         shadow_update: crate::assets::ShadowUpdate,
+        // Shadow distance (GraphicsConfig.shadow_distance, world units). The
+        // per-frame cascade split reads it, capped at the camera far plane.
+        shadow_distance: u32,
         // Scene-sampler max anisotropy (GraphicsConfig.anisotropy), clamped to the
         // device limit where the sampler is built below.
         anisotropy: u32,
@@ -3328,6 +3331,7 @@ impl VkContext {
                 uniforms: shadow_uniforms,
                 light_dir: shadow_light_dir,
                 update: shadow_update,
+                distance: shadow_distance,
                 scheduler: Default::default(),
                 render_mask: 0,
             },

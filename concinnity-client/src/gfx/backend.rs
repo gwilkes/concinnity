@@ -540,6 +540,17 @@ pub trait RenderBackend: SceneControl + Send {
         let _ = update;
     }
 
+    // Set the shadow distance (world units the cascades cover, capped at the
+    // camera far plane) live. The per-frame cascade-split computation reads it
+    // each draw, so a change takes effect on the next frame with no allocation or
+    // rebuild (it sizes no GPU resource, unlike the shadow map resolution).
+    // Default no-op: a backend that only reads the distance at init keeps the
+    // init-time value (DirectX / Vulkan today), so the choice persists and takes
+    // effect at the next launch there.
+    fn set_shadow_distance(&mut self, distance: u32) {
+        let _ = distance;
+    }
+
     // Update the live scalar sub-tunables of the SSAO / SSR / SSGI / auto-exposure
     // passes (radius, intensity, distance, EV bounds, adaptation speed). Unlike
     // `apply_quality_settings`, this rebuilds nothing: each backend re-reads these

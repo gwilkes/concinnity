@@ -372,7 +372,7 @@ impl VkContext {
                 fov_y_radians,
                 cascade_aspect,
                 near,
-                crate::gfx::csm::DEFAULT_SHADOW_DISTANCE.min(far),
+                (self.shadow.distance as f32).min(far),
                 self.shadow.light_dir,
                 self.shadow.map_size,
             );

@@ -244,7 +244,7 @@ impl MtlContext {
                 fov_y_radians,
                 cascade_aspect,
                 near,
-                crate::gfx::csm::DEFAULT_SHADOW_DISTANCE.min(far),
+                (self.shadow_distance as f32).min(far),
                 self.shadow_light_dir,
                 self.shadow_map_size,
             );

@@ -74,6 +74,11 @@ pub(crate) struct QualityCeiling {
     // choice and this cap. The no-ceiling value is `ANISO_MAX` (16, the GPU
     // maximum), so a world's authored degree always stands.
     pub anisotropy: u32,
+    // Cap on the shadow distance in world units (live): the effective distance is
+    // the smaller of the world's choice and this cap. The no-ceiling value is
+    // `u32::MAX`, so a world's authored distance always stands. A lower tier
+    // shadows a shorter distance (cheaper, and sharper per texel).
+    pub shadow_distance: u32,
 }
 
 // The coarser (higher render-resolution divisor) of two SSGI resolutions, the
@@ -121,6 +126,9 @@ const SHADOW_SIZE_MAX: u32 = u32::MAX;
 // guarantees -- so a world's authored degree always stands smaller-or-equal
 // under it.
 const ANISO_MAX: u32 = 16;
+// `u32::MAX` is the no-cap shadow distance: a world's authored distance always
+// stands smaller-or-equal under it.
+const SHADOW_DIST_MAX: u32 = u32::MAX;
 
 // The coarser (smaller) of two shadow-map resolutions, the shadow analogue of
 // the SSGI / reflection-blur clamp helpers. Used to clamp a world's authored
@@ -151,6 +159,12 @@ pub(crate) fn clamp_anisotropy(authored: u32, ceiling: &QualityCeiling) -> u32 {
     authored.min(ceiling.anisotropy)
 }
 
+// The world's shadow distance clamped under the ceiling: the smaller of the
+// authored distance and the cap. Never raises.
+pub(crate) fn clamp_shadow_distance(authored: u32, ceiling: &QualityCeiling) -> u32 {
+    authored.min(ceiling.shadow_distance)
+}
+
 const NONE: QualityCeiling = QualityCeiling {
     taa: true,
     ssao: true,
@@ -166,6 +180,7 @@ const NONE: QualityCeiling = QualityCeiling {
     shadow_map_size: SHADOW_SIZE_MAX,
     allow_every_frame_shadows: true,
     anisotropy: ANISO_MAX,
+    shadow_distance: SHADOW_DIST_MAX,
 };
 const LOW: QualityCeiling = QualityCeiling {
     taa: true,
@@ -182,6 +197,7 @@ const LOW: QualityCeiling = QualityCeiling {
     shadow_map_size: 1024,
     allow_every_frame_shadows: false,
     anisotropy: 4,
+    shadow_distance: 40,
 };
 const MEDIUM: QualityCeiling = QualityCeiling {
     taa: true,
@@ -198,6 +214,7 @@ const MEDIUM: QualityCeiling = QualityCeiling {
     shadow_map_size: 2048,
     allow_every_frame_shadows: false,
     anisotropy: 8,
+    shadow_distance: 80,
 };
 const HIGH: QualityCeiling = QualityCeiling {
     taa: true,
@@ -214,6 +231,7 @@ const HIGH: QualityCeiling = QualityCeiling {
     shadow_map_size: 4096,
     allow_every_frame_shadows: false,
     anisotropy: 16,
+    shadow_distance: 160,
 };
 const ULTRA: QualityCeiling = QualityCeiling {
     taa: true,
@@ -230,6 +248,7 @@ const ULTRA: QualityCeiling = QualityCeiling {
     shadow_map_size: SHADOW_SIZE_MAX,
     allow_every_frame_shadows: true,
     anisotropy: ANISO_MAX,
+    shadow_distance: SHADOW_DIST_MAX,
 };
 
 // The active ceiling for the persisted preset and detected GPU. `Auto` maps the
@@ -466,6 +485,11 @@ mod tests {
             );
             // The anisotropy cap rises (or holds) with the tier too.
             assert!(lo.anisotropy <= hi.anisotropy, "anisotropy cap dropped");
+            // The shadow-distance cap rises (or holds) with the tier too.
+            assert!(
+                lo.shadow_distance <= hi.shadow_distance,
+                "shadow_distance cap dropped"
+            );
         }
     }
 
@@ -510,6 +534,18 @@ mod tests {
         let low = resolve_ceiling(QualityPreset::Low, &GpuProfile::UNKNOWN);
         assert_eq!(clamp_anisotropy(16, &low), 4);
         assert_eq!(clamp_anisotropy(2, &low), 2);
+    }
+
+    #[test]
+    fn shadow_distance_clamps_down_only() {
+        // No ceiling (Custom / Ultra) leaves the world's authored distance alone.
+        let none = resolve_ceiling(QualityPreset::Custom, &GpuProfile::UNKNOWN);
+        assert_eq!(none.shadow_distance, SHADOW_DIST_MAX);
+        assert_eq!(clamp_shadow_distance(320, &none), 320);
+        // Low caps the distance hard; the clamp never raises a shorter authored one.
+        let low = resolve_ceiling(QualityPreset::Low, &GpuProfile::UNKNOWN);
+        assert_eq!(clamp_shadow_distance(320, &low), 40);
+        assert_eq!(clamp_shadow_distance(30, &low), 30);
     }
 
     #[test]

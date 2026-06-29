@@ -54,6 +54,10 @@ pub struct GraphicsSystem {
     max_frames: Option<u64>,
     shadow_map_size: u32,
     shadow_update: crate::assets::ShadowUpdate,
+    // Shadow distance in world units (GraphicsConfig.shadow_distance). Applied
+    // live via set_shadow_distance (the per-frame cascade-split math reads it);
+    // preset-governed (a manual change flips the master preset to Custom).
+    shadow_distance: u32,
     // Scene-sampler max anisotropy. Restart-required (the sampler is built once at
     // backend init from this), so this is display/persist state; the value reaches
     // the backend through the ctor. Preset-governed (a manual change flips the
@@ -225,6 +229,9 @@ pub struct GraphicsSystem {
     // values are `shadow_map_size` / `shadow_update` above.
     authored_shadow_map_size: u32,
     authored_shadow_update: crate::assets::ShadowUpdate,
+    // The world's authored shadow distance, the baseline a live preset change
+    // re-clamps from. The live value is `shadow_distance` above.
+    authored_shadow_distance: u32,
     // The world's authored anisotropy degree before the user override + preset
     // ceiling, the baseline a live preset change re-clamps from (like
     // `authored_shadow_map_size`). The live value is `anisotropy` above.
@@ -354,6 +361,7 @@ impl GraphicsSystem {
             max_frames: None,
             shadow_map_size: 2048,
             shadow_update: crate::assets::ShadowUpdate::default(),
+            shadow_distance: 80,
             anisotropy: 8,
             failed: false,
             start_time: None,
@@ -403,6 +411,7 @@ impl GraphicsSystem {
             hdr_pq: false,
             authored_shadow_map_size: 2048,
             authored_shadow_update: crate::assets::ShadowUpdate::default(),
+            authored_shadow_distance: 80,
             authored_anisotropy: 8,
             occlusion_two_pass: false,
             texture_cap: 96,

@@ -224,6 +224,10 @@ pub(super) fn init_backend(
     // shadow-cascade update policy from GraphicsConfig.shadow_update. The shared
     // `ShadowCascadeScheduler` staggers which cascades re-render each frame.
     shadow_update: crate::assets::ShadowUpdate,
+    // Shadow distance (world units) from GraphicsConfig.shadow_distance. Each
+    // backend's per-frame cascade-split computation reads it (capped at the camera
+    // far plane); live on Metal via set_shadow_distance.
+    shadow_distance: u32,
     // Scene-sampler max anisotropy from GraphicsConfig.anisotropy. Each backend
     // builds its albedo / normal-map sampler with this (clamped to the GPU's
     // 1..16 range) at init; restart-required.
@@ -367,6 +371,7 @@ pub(super) fn init_backend(
             light_uniforms,
             shadow_map_size,
             shadow_update,
+            shadow_distance,
             anisotropy,
             text_atlases,
             env_map_bytes,
@@ -428,6 +433,7 @@ pub(super) fn init_backend(
             light_uniforms,
             shadow_map_size,
             shadow_update,
+            shadow_distance,
             anisotropy,
             text_atlases,
             env_map_bytes,
@@ -488,6 +494,7 @@ pub(super) fn init_backend(
             light_uniforms,
             shadow_map_size,
             shadow_update,
+            shadow_distance,
             anisotropy,
             text_atlases,
             env_map_bytes,

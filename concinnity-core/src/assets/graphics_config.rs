@@ -59,6 +59,11 @@ pub struct GraphicsConfig {
     /// the far cascades across frames; `every_frame` refreshes them all every
     /// frame. See [ShadowUpdate].
     pub shadow_update: ShadowUpdate,
+    /// How far from the camera shadows are cast, in world units (e.g. 80). The
+    /// cascades cover from the near plane out to this distance; a larger value
+    /// shadows more of the scene but spreads the same shadow-map resolution over
+    /// more area (softer, blockier shadows). Capped at the camera far plane.
+    pub shadow_distance: u32,
     /// Maximum anisotropic-filtering degree for the scene texture sampler
     /// (albedo + normal maps), e.g. 8. Higher keeps textures viewed at a grazing
     /// angle (floors, walls receding into the distance) sharp instead of blurring
@@ -77,6 +82,7 @@ impl Default for GraphicsConfig {
             rotation_speed: 1.0,
             shadow_map_size: 2048,
             shadow_update: ShadowUpdate::default(),
+            shadow_distance: 80,
             anisotropy: 8,
         }
     }
@@ -190,6 +196,17 @@ mod tests {
         // Explicit true is honoured.
         let cfg: GraphicsConfig = serde_json::from_str(r#"{"vsync":true}"#).expect("parse");
         assert!(cfg.vsync);
+    }
+
+    #[test]
+    fn shadow_distance_defaults_to_80_and_round_trips() {
+        assert_eq!(GraphicsConfig::default().shadow_distance, 80);
+        let cfg: GraphicsConfig =
+            serde_json::from_str(r#"{"shadow_distance":160}"#).expect("parse");
+        assert_eq!(cfg.shadow_distance, 160);
+        let cfg: GraphicsConfig =
+            serde_json::from_str(r#"{"shadow_map_size":1024}"#).expect("parse");
+        assert_eq!(cfg.shadow_distance, 80);
     }
 
     #[test]

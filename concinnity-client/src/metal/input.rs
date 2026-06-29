@@ -313,6 +313,13 @@ impl MtlContext {
         self.shadow_update = update;
     }
 
+    // Set the live shadow distance (world units). The per-frame cascade-split
+    // computation reads `shadow_distance` each draw, so a change takes effect on
+    // the next frame with no allocation (it sizes no GPU resource).
+    pub fn set_shadow_distance(&mut self, distance: u32) {
+        self.shadow_distance = distance;
+    }
+
     // Update the live scalar sub-tunables of the SSAO / SSR / SSGI / auto-exposure
     // passes without rebuilding anything. The draw path rebuilds each pass's
     // per-frame uniform from these stored `*Settings` structs every frame

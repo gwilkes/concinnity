@@ -28,10 +28,6 @@ use crate::gfx::render_types::{NUM_SHADOW_CASCADES, ShadowUniforms};
 
 const SPLIT_LAMBDA: f32 = 0.5;
 
-// Default shadow distance when none is supplied. The cascades cover from the
-// camera near plane out to this distance.
-pub const DEFAULT_SHADOW_DISTANCE: f32 = 80.0;
-
 const IDENTITY4: [[f32; 4]; 4] = [
     [1.0, 0.0, 0.0, 0.0],
     [0.0, 1.0, 0.0, 0.0],

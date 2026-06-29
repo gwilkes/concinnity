@@ -231,6 +231,10 @@ pub struct MtlContext {
     // Cascade re-render policy from GraphicsConfig.shadow_update. Hybrid
     // refreshes the near cascade every frame and the far cascades round-robin.
     pub(super) shadow_update: crate::assets::ShadowUpdate,
+    // Shadow distance in world units (GraphicsConfig.shadow_distance), read by the
+    // per-frame cascade-split computation and capped at the camera far plane.
+    // Mutable so set_shadow_distance can change it live.
+    pub(super) shadow_distance: u32,
     // Round-robin clock + primed-set for the cascade schedule; advanced once per
     // frame by `next_shadow_cascade_mask`.
     pub(super) shadow_scheduler: crate::gfx::shadow_schedule::ShadowCascadeScheduler,

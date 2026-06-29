@@ -62,7 +62,7 @@ pub struct GraphicsConfig {
     pub shadow_map_size: u32,
     /// How often shadow cascades are re-rendered. `hybrid` (default) amortizes
     /// the far cascades across frames; `every_frame` refreshes them all every
-    /// frame. See [ShadowUpdate].
+    /// frame.
     pub shadow_update: ShadowUpdate,
     /// How far from the camera shadows are cast, in world units (e.g. 80). The
     /// cascades cover from the near plane out to this distance; a larger value

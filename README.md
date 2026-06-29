@@ -12,7 +12,7 @@ composition.
 ## Installation
 
 This project is in **early development** and no releases are available yet.
-For now, you'll need to [build it manually](concinnity-docs/development/building.md).
+For now, you'll need to [build it manually](concinnity-docs/public/development/building.md).
 
 After a successful build, you may optionally install the `concinnity` executable:
 
@@ -27,7 +27,7 @@ Since this project is in early development and CLI commands are bound to change,
 there currently isn't any CLI documentation. Run `concinnity help` for a list of
 supported commands.
 
-Check out the [asset documentation](concinnity-docs/asset-reference.md) for all
+Check out the [asset documentation](concinnity-docs/public/assets/index.md) for all
 supported asset types and fields.
 
 This project currently has one example, which uses the

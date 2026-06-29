@@ -1,27 +1,19 @@
-// Renders the asset reference document from the per-asset docs extracted at
-// build time. The body of each entry is the same `full_doc` string surfaced by
-// the describe_asset_type tool, so the generated docs/asset-reference.md matches
-// what the server serves per type.
+// Renders the per-asset reference pages from the docs extracted at build time.
+// Each page's body is the same `full_doc` string surfaced by the
+// describe_asset_type tool, so a generated public/assets/<Name>.md matches what
+// the server serves for that type.
 //
 // Shared by two compilation units:
-//   - build.rs includes it via #[path] to write docs/asset-reference.md.
+//   - build.rs includes it via #[path] to write the public/assets/*.md pages.
 //   - the crate compiles it normally, so the lib tests can re-render from
-//     ASSET_DOCS and assert the committed file is in sync.
+//     ASSET_DOCS and assert the committed pages are in sync.
 // Kept std-only so the build script can include it without extra dependencies.
 
-// One asset's rendered entry: its category, type name, and full doc body
-// (struct rustdoc followed by the generated parameter list).
-pub struct RefEntry<'a> {
-    pub category: &'a str,
-    pub type_name: &'a str,
-    pub full_doc: &'a str,
-}
+use std::collections::HashMap;
 
-// Category heading the synthetic value-type entries are grouped under. These
-// document the nested objects that asset fields embed (e.g. a Prop's collider)
-// rather than user-declarable top-level assets, so they sort after every real
-// category and are excluded from the chat-start declarable summary.
-pub const VALUE_TYPES_CATEGORY: &str = "Value types";
+// Leading marker on every generated page. The browser pipeline strips it before
+// rendering, but it warns a human (or an AI) editing the file by hand.
+pub const AUTOGEN_MARKER: &str = "<!-- Auto-generated - do not edit. -->";
 
 // Field type rendering
 //
@@ -31,8 +23,8 @@ pub const VALUE_TYPES_CATEGORY: &str = "Value types";
 // build, away from the build script.
 
 // A JSON-shaped description of a field's type. `Enum` carries the accepted
-// string values; `Named` carries a documented nested object's type name (which
-// is also its in-page anchor).
+// string values; `Named`/`NamedEnum` carry a documented type's name, which is
+// also its relative `Name.md` link target.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FieldType {
     Bool,
@@ -40,13 +32,19 @@ pub enum FieldType {
     Integer,
     Str,
     // A string restricted to a closed set of values (a Rust enum that
-    // serializes to a string). Holds the serialized variant strings in order.
+    // serializes to a string) with no per-value documentation. Holds the
+    // serialized variant strings in order, rendered inline.
     Enum(Vec<String>),
     // A free-form JSON object: `serde_json::Value`, a map, or an unrecognised
     // type with no documented shape.
     Object,
-    // A documented nested object, by value-type name (also its anchor).
+    // A documented value-type struct that has its own page, by name (also its
+    // route). Rendered as a JSON object.
     Named(String),
+    // A documented string enum that has its own page (its values carry their
+    // own docs there), by name. Rendered as a string that links to its page,
+    // not as an object.
+    NamedEnum(String),
     // `Some(n)` for a fixed-size `[T; n]` array, `None` for a variable `Vec<T>`.
     Array {
         elem: Box<FieldType>,
@@ -66,14 +64,34 @@ pub struct FieldEntry {
     pub doc: String,
 }
 
-// In-page anchor for a value-type name, matching the React docNav `slugify`
-// for the single-token PascalCase names used here (lowercase, alphanumerics
-// and hyphens only).
+// One value of a documented enum: its serialized string and its own doc line.
+pub struct EnumValue {
+    pub value: String,
+    pub doc: String,
+}
+
+// An entry in the index table of contents: a type's name (and route) plus its
+// one-line summary.
+pub struct IndexEntry {
+    pub name: String,
+    pub summary: String,
+}
+
+// In-page-safe slug for a type name (lowercase, alphanumerics and hyphens).
+// Used to resolve hand-written `](#slug)` cross-references back to a type name.
 pub fn slug(name: &str) -> String {
     name.chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
         .collect::<String>()
         .to_lowercase()
+}
+
+// The link target for a documented type: a sibling `.md` file. Keeping the
+// links relative and self-contained means the generated docs cross-link
+// correctly when browsed as plain markdown (e.g. on GitHub); a docs viewer is
+// free to rewrite the `.md` suffix to its own routes at render time.
+fn doc_link(name: &str) -> String {
+    format!("{name}.md")
 }
 
 // `a` / `a` or `b` / `a`, `b`, or `c` (each value in code ticks).
@@ -88,7 +106,7 @@ fn one_of(values: &[String]) -> String {
 }
 
 // The pluralised noun phrase for an array element, e.g. `floats`, `strings`,
-// `[WaterWave](#waterwave) objects`.
+// `[WaterWave](WaterWave.md) objects`.
 fn elem_plural(t: &FieldType) -> String {
     match t {
         FieldType::Bool => "booleans".to_string(),
@@ -97,7 +115,8 @@ fn elem_plural(t: &FieldType) -> String {
         FieldType::Str => "strings".to_string(),
         FieldType::Enum(values) => format!("strings (each one of {})", one_of(values)),
         FieldType::Object => "objects".to_string(),
-        FieldType::Named(name) => format!("[{name}](#{}) objects", slug(name)),
+        FieldType::Named(name) => format!("[{name}]({}) objects", doc_link(name)),
+        FieldType::NamedEnum(name) => format!("strings (see [{name}]({}))", doc_link(name)),
         FieldType::Array { elem, len } => match len {
             Some(n) => format!("arrays of {n} {}", elem_plural(elem)),
             None => format!("arrays of {}", elem_plural(elem)),
@@ -106,7 +125,7 @@ fn elem_plural(t: &FieldType) -> String {
 }
 
 // The capitalised, sentence-leading phrase for a field type, e.g. `A string`,
-// `An array of 4 floats`, `A [PropCollider](#propcollider) object`.
+// `An array of 4 floats`, `A [PropCollider](PropCollider.md) object`.
 pub fn type_phrase(t: &FieldType) -> String {
     match t {
         FieldType::Bool => "A boolean".to_string(),
@@ -115,7 +134,8 @@ pub fn type_phrase(t: &FieldType) -> String {
         FieldType::Str => "A string".to_string(),
         FieldType::Enum(values) => format!("A string (one of {})", one_of(values)),
         FieldType::Object => "An object".to_string(),
-        FieldType::Named(name) => format!("A [{name}](#{}) object", slug(name)),
+        FieldType::Named(name) => format!("A [{name}]({}) object", doc_link(name)),
+        FieldType::NamedEnum(name) => format!("A string (see [{name}]({}))", doc_link(name)),
         FieldType::Array { elem, len } => match len {
             Some(n) => format!("An array of {n} {}", elem_plural(elem)),
             None => format!("An array of {}", elem_plural(elem)),
@@ -174,13 +194,13 @@ pub fn render_field_bullet(f: &FieldEntry) -> String {
     s
 }
 
-// Render the `#### Parameters` section for a set of fields, or an empty string
+// Render the `## Parameters` section for a set of fields, or an empty string
 // when the type has no documented fields.
 pub fn render_parameters(fields: &[FieldEntry]) -> String {
     if fields.is_empty() {
         return String::new();
     }
-    let mut s = String::from("#### Parameters\n\n");
+    let mut s = String::from("## Parameters\n\n");
     for f in fields {
         s.push_str(&render_field_bullet(f));
         s.push('\n');
@@ -188,39 +208,155 @@ pub fn render_parameters(fields: &[FieldEntry]) -> String {
     s
 }
 
-// const INTRO: &str = "Every asset type the world build understands, grouped by category. Each \
-//     entry gives the asset's purpose and its `args` fields with types and defaults. Generated \
-//     from the rustdoc on each asset struct in the concinnity-core crate.";
-
-// Render the full asset reference markdown. `entries` must already be ordered
-// so that all entries sharing a category are contiguous; a `## category`
-// heading is emitted each time the category changes.
-pub fn render_reference_md(entries: &[RefEntry]) -> String {
-    let mut out = String::new();
-    out.push_str("<!-- Auto-generated by concinnity-docs/build.rs - do not edit. -->\n\n");
-    out.push_str("# Asset Reference\n\n");
-
-    let mut current_cat: Option<&str> = None;
-    for e in entries {
-        if current_cat != Some(e.category) {
-            out.push_str("## ");
-            out.push_str(e.category);
-            out.push_str("\n\n");
-            current_cat = Some(e.category);
-        }
-        out.push_str("### ");
-        out.push_str(e.type_name);
-        out.push_str("\n\n");
-        out.push_str(e.full_doc.trim());
-        out.push_str("\n\n");
+// Render the `## Values` section for a documented enum, one bullet per
+// serialized value with its own doc line. Empty when the enum has no values.
+pub fn render_values(values: &[EnumValue]) -> String {
+    if values.is_empty() {
+        return String::new();
     }
+    let mut s = String::from("## Values\n\n");
+    for v in values {
+        s.push_str(&format!("- `{}`", v.value));
+        let doc = v.doc.trim();
+        if !doc.is_empty() {
+            s.push_str(": ");
+            s.push_str(doc);
+            if !doc.ends_with(['.', '!', '?', ':']) {
+                s.push('.');
+            }
+        }
+        s.push('\n');
+    }
+    s
+}
 
-    // Normalise to a single trailing newline.
+// Rewrite a doc body's cross-references to documented types into the relative
+// `](Name.md)` form, so they cross-link when browsed as plain markdown. Two
+// source forms are recognised, resolving through `name_for_slug`:
+//   - a hand-written `[Text](#slug)` anchor (the single-page workaround), and
+//   - an idiomatic rustdoc shortcut link `[Type]` (no target), where `Type` is
+//     a documented name.
+// Anything that does not resolve to a documented type is left untouched.
+pub fn rewrite_doc_links(doc: &str, name_for_slug: &HashMap<String, String>) -> String {
+    let names: std::collections::HashSet<&str> =
+        name_for_slug.values().map(String::as_str).collect();
+    rewrite_shortcut_links(&rewrite_anchor_links(doc, name_for_slug), &names)
+}
+
+// `[Text](#slug)` -> `[Text](Name.md)` for a known slug.
+fn rewrite_anchor_links(doc: &str, name_for_slug: &HashMap<String, String>) -> String {
+    const NEEDLE: &str = "](#";
+    let mut out = String::with_capacity(doc.len());
+    let mut rest = doc;
+    while let Some(pos) = rest.find(NEEDLE) {
+        let after = &rest[pos + NEEDLE.len()..];
+        if let Some(end) = after.find(')') {
+            let anchor = &after[..end];
+            if let Some(name) = name_for_slug.get(anchor) {
+                out.push_str(&rest[..pos]);
+                out.push_str("](");
+                out.push_str(&doc_link(name));
+                out.push(')');
+                rest = &after[end + 1..];
+                continue;
+            }
+        }
+        // No closing paren or unknown anchor: emit through the needle and move on.
+        out.push_str(&rest[..pos + NEEDLE.len()]);
+        rest = &rest[pos + NEEDLE.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
+// `[Type]` -> `[Type](Type.md)` when `Type` is a documented name and the
+// brackets are a bare shortcut link: not already a link (`[Type](...)`), not a
+// reference label (`[text][Type]` or `[Type]: …`).
+fn rewrite_shortcut_links(doc: &str, names: &std::collections::HashSet<&str>) -> String {
+    let mut out = String::with_capacity(doc.len());
+    let mut rest = doc;
+    let mut prev = '\0';
+    while let Some(pos) = rest.find('[') {
+        out.push_str(&rest[..pos]);
+        if pos > 0 {
+            prev = rest[..pos].chars().next_back().unwrap();
+        }
+        let after_open = &rest[pos + 1..];
+        let handled = match after_open.find(']') {
+            Some(end) => {
+                let inner = &after_open[..end];
+                let next = after_open[end + 1..].chars().next().unwrap_or(' ');
+                if names.contains(inner) && prev != ']' && next != '(' && next != '[' && next != ':'
+                {
+                    out.push('[');
+                    out.push_str(inner);
+                    out.push_str("](");
+                    out.push_str(&doc_link(inner));
+                    out.push(')');
+                    prev = ')';
+                    rest = &after_open[end + 1..];
+                    true
+                } else {
+                    false
+                }
+            }
+            None => false,
+        };
+        if !handled {
+            out.push('[');
+            prev = '[';
+            rest = after_open;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+// Assemble a full page: the auto-generated marker, the `# Name` heading, then
+// the body (description plus the generated Parameters/Values section).
+pub fn render_page(name: &str, body: &str) -> String {
+    let mut out = String::new();
+    out.push_str(AUTOGEN_MARKER);
+    out.push_str("\n\n# ");
+    out.push_str(name);
+    out.push_str("\n\n");
+    out.push_str(body.trim());
     while out.ends_with('\n') {
         out.pop();
     }
     out.push('\n');
     out
+}
+
+// Render the index page: an alphabetical list of every asset, then a list of
+// the referenced value types and enums, each linking to its own page.
+pub fn render_index(assets: &[IndexEntry], ref_types: &[IndexEntry]) -> String {
+    let mut out = String::new();
+    out.push_str(AUTOGEN_MARKER);
+    out.push_str("\n\n# Assets\n\n");
+    for a in assets {
+        out.push_str(&index_line(a));
+    }
+    if !ref_types.is_empty() {
+        out.push_str("\n## Reference types\n\n");
+        for t in ref_types {
+            out.push_str(&index_line(t));
+        }
+    }
+    while out.ends_with('\n') {
+        out.pop();
+    }
+    out.push('\n');
+    out
+}
+
+fn index_line(e: &IndexEntry) -> String {
+    let summary = e.summary.trim();
+    if summary.is_empty() {
+        format!("- [{}]({})\n", e.name, doc_link(&e.name))
+    } else {
+        format!("- [{}]({}) - {}\n", e.name, doc_link(&e.name), summary)
+    }
 }
 
 #[cfg(test)]
@@ -289,11 +425,15 @@ mod tests {
         };
         assert_eq!(
             type_phrase(&vec_named),
-            "An array of [WaterWave](#waterwave) objects"
+            "An array of [WaterWave](WaterWave.md) objects"
         );
         assert_eq!(
             type_phrase(&FieldType::Named("PropCollider".into())),
-            "A [PropCollider](#propcollider) object"
+            "A [PropCollider](PropCollider.md) object"
+        );
+        assert_eq!(
+            type_phrase(&FieldType::NamedEnum("ShaderKind".into())),
+            "A string (see [ShaderKind](ShaderKind.md))"
         );
         let nested = FieldType::Array {
             elem: Box::new(FieldType::Array {
@@ -353,7 +493,7 @@ mod tests {
         ));
         assert_eq!(
             b,
-            "- `collider`: A [PropCollider](#propcollider) object. Collision volume. Optional."
+            "- `collider`: A [PropCollider](PropCollider.md) object. Collision volume. Optional."
         );
     }
 
@@ -362,81 +502,113 @@ mod tests {
         assert_eq!(render_parameters(&[]), "");
     }
 
-    fn sample() -> Vec<RefEntry<'static>> {
-        vec![
-            RefEntry {
-                category: "Geometry",
-                type_name: "Mesh",
-                full_doc: "A mesh.\n\n#### Parameters\n\n- `foo`: A string.",
+    #[test]
+    fn values_section_renders_each_value() {
+        let vals = vec![
+            EnumValue {
+                value: "left".into(),
+                doc: "Pack against the left edge".into(),
             },
-            RefEntry {
-                category: "Geometry",
-                type_name: "Model",
-                full_doc: "A model.",
+            EnumValue {
+                value: "center".into(),
+                doc: String::new(),
             },
-            RefEntry {
-                category: "Lighting",
-                type_name: "PointLight",
-                full_doc: "A point light.",
-            },
-        ]
+        ];
+        let s = render_values(&vals);
+        assert!(s.starts_with("## Values\n\n"));
+        assert!(s.contains("- `left`: Pack against the left edge."));
+        assert!(s.contains("- `center`\n"));
     }
 
     #[test]
-    fn emits_each_category_heading_once() {
-        let md = render_reference_md(&sample());
-        assert_eq!(md.matches("## Geometry").count(), 1);
-        assert_eq!(md.matches("## Lighting").count(), 1);
+    fn values_section_empty_for_no_values() {
+        assert_eq!(render_values(&[]), "");
     }
 
     #[test]
-    fn emits_each_type_with_its_full_doc() {
-        let md = render_reference_md(&sample());
-        assert!(md.contains("### Mesh"));
-        assert!(md.contains("### Model"));
-        assert!(md.contains("### PointLight"));
-        assert!(md.contains("A mesh."));
-        assert!(md.contains("#### Parameters"));
+    fn rewrite_doc_links_resolves_known_anchors_only() {
+        let mut map = HashMap::new();
+        map.insert("audioemitter".to_string(), "AudioEmitter".to_string());
+        map.insert("camera3d".to_string(), "Camera3D".to_string());
+        let doc = "Played by an [AudioEmitter](#audioemitter); see [Camera3D](#camera3d) \
+                   and an [Unknown](#unknown) anchor.";
+        let out = rewrite_doc_links(doc, &map);
+        assert!(out.contains("[AudioEmitter](AudioEmitter.md)"));
+        assert!(out.contains("[Camera3D](Camera3D.md)"));
+        // Unknown anchors are left untouched.
+        assert!(out.contains("[Unknown](#unknown)"));
     }
 
     #[test]
-    fn category_heading_precedes_its_types() {
-        let md = render_reference_md(&sample());
-        let geometry = md.find("## Geometry").unwrap();
-        let mesh = md.find("### Mesh").unwrap();
-        let lighting = md.find("## Lighting").unwrap();
-        let point = md.find("### PointLight").unwrap();
-        assert!(geometry < mesh);
-        assert!(mesh < lighting);
-        assert!(lighting < point);
+    fn rewrite_doc_links_leaves_relative_links_alone() {
+        let map = HashMap::new();
+        let doc = "A [PropCollider](PropCollider.md) object.";
+        assert_eq!(rewrite_doc_links(doc, &map), doc);
     }
 
     #[test]
-    fn ends_with_single_newline() {
-        let md = render_reference_md(&sample());
-        assert!(md.ends_with('\n'));
-        assert!(!md.ends_with("\n\n"));
+    fn rewrite_doc_links_rewrites_shortcut_type_links() {
+        let mut map = HashMap::new();
+        map.insert("shadowupdate".to_string(), "ShadowUpdate".to_string());
+        let doc = "How often. See [ShadowUpdate]. Also [ShadowUpdate](ShadowUpdate.md) stays.";
+        let out = rewrite_doc_links(doc, &map);
+        assert!(out.contains("See [ShadowUpdate](ShadowUpdate.md)."));
+        // The already-linked occurrence is not double-wrapped.
+        assert!(!out.contains(".md.md"));
+        assert!(!out.contains(".md)](ShadowUpdate.md)"));
     }
 
     #[test]
-    fn starts_with_autogen_tag_then_title() {
-        let md = render_reference_md(&sample());
-        let mut lines = md.lines();
-        assert_eq!(
-            lines.next(),
-            Some("<!-- Auto-generated by concinnity-docs/build.rs - do not edit. -->")
-        );
-        // The `# Asset Reference` title precedes the first category heading.
-        let title = md.find("# Asset Reference").unwrap();
-        let first_cat = md.find("## ").unwrap();
-        assert!(title < first_cat);
+    fn rewrite_doc_links_skips_non_type_brackets() {
+        let mut map = HashMap::new();
+        map.insert("prop".to_string(), "Prop".to_string());
+        let doc = "An array [0, 1] and a [Prop] and a label [text][Prop].";
+        let out = rewrite_doc_links(doc, &map);
+        assert!(out.contains("and a [Prop](Prop.md) and"));
+        assert!(out.contains("[0, 1]")); // not a documented type
+        assert!(out.contains("[text][Prop]")); // collapsed-reference label left alone
     }
 
     #[test]
-    fn empty_input_still_has_title() {
-        let md = render_reference_md(&[]);
-        assert!(md.starts_with("<!-- Auto-generated"));
-        assert!(md.contains("# Asset Reference"));
+    fn render_page_has_marker_then_h1_then_body() {
+        let page = render_page("Prop", "A prop.\n\n## Parameters\n\n- `x`: A float.");
+        let mut lines = page.lines();
+        assert_eq!(lines.next(), Some(AUTOGEN_MARKER));
+        assert_eq!(lines.next(), Some(""));
+        assert_eq!(lines.next(), Some("# Prop"));
+        assert!(page.contains("A prop."));
+        assert!(page.contains("## Parameters"));
+        assert!(page.ends_with('\n'));
+        assert!(!page.ends_with("\n\n"));
+    }
+
+    fn idx(name: &str, summary: &str) -> IndexEntry {
+        IndexEntry {
+            name: name.to_string(),
+            summary: summary.to_string(),
+        }
+    }
+
+    #[test]
+    fn render_index_lists_assets_then_reference_types() {
+        let assets = vec![idx("Camera3D", "A camera."), idx("Prop", "A prop.")];
+        let refs = vec![idx("PropCollider", "A collision volume.")];
+        let md = render_index(&assets, &refs);
+        assert!(md.starts_with(AUTOGEN_MARKER));
+        assert!(md.contains("# Assets"));
+        assert!(md.contains("- [Camera3D](Camera3D.md) - A camera."));
+        assert!(md.contains("- [Prop](Prop.md) - A prop."));
+        assert!(md.contains("## Reference types"));
+        assert!(md.contains("- [PropCollider](PropCollider.md) - A collision volume."));
+        let assets_pos = md.find("# Assets").unwrap();
+        let refs_pos = md.find("## Reference types").unwrap();
+        assert!(assets_pos < refs_pos);
+    }
+
+    #[test]
+    fn render_index_omits_reference_section_when_empty() {
+        let md = render_index(&[idx("Prop", "A prop.")], &[]);
+        assert!(!md.contains("Reference types"));
         assert!(md.ends_with('\n'));
     }
 }

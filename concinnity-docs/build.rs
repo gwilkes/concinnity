@@ -1,132 +1,64 @@
 // Walks the concinnity-core asset source files at ../concinnity-core/src/assets/*.rs
-// and emits a static table at
-// $OUT_DIR/assets_doc.rs. For each asset struct that implements Component the
-// emitted AssetDoc contains:
+// and emits two things:
+//   - $OUT_DIR/assets_doc.rs: a static `ASSET_DOCS` table embedded in the crate
+//     for the Rust consumers (the describe_asset_type tool and the new-chat
+//     asset summary).
+//   - ../concinnity-docs/public/assets/<Name>.md: one page per documented type,
+//     plus an index.md table of contents.
+//
+// For each asset (and each nested value type) the emitted entry contains:
 //   - summary:  first paragraph of the struct-level rustdoc
 //   - full_doc: struct-level rustdoc (hand-written table lines stripped)
-//               followed by a `#### Parameters` bullet list generated from the
+//               followed by a `## Parameters` bullet list generated from the
 //               asset's `args` fields. Each bullet states the field's JSON type
 //               in prose (so no Rust type name, enum, struct, or otherwise,
 //               ever reaches the user), folds in the field's own rustdoc, and
 //               appends the default unless the prose already covers it.
 //
-// Nested objects a field embeds (a Prop's collider, a Camera's controller, the
-// element type of an array, …) are documented once under a trailing "Value
-// types" category and linked from the fields that use them, the way a JSON
-// schema separates `$defs` from the objects that reference them.
+// Which types get a page is discovered, not listed: every Component whose
+// `ORIGIN` is anything other than RuntimeOnly is an authorable asset and gets a
+// page. Nested objects a field embeds (a Prop's collider, the element type of
+// an array) and documented string enums a field uses (ShaderKind, AaMode, ...)
+// each get their own page too and are linked from the fields that use them, the
+// way a JSON schema separates `$defs` from the objects that reference them.
 //
-// The categorisation list below controls which assets appear in the LLM-facing
-// reference and in what order. Assets discovered in the source tree but not
-// listed here are silently ignored; assets listed here but missing from the
-// source (or lacking rustdoc) cause a compile-time panic.
+// A documented page links cross-references as relative markdown:
+// `[ShaderKind](ShaderKind.md)`, so the docs cross-link correctly when browsed
+// as plain markdown. Hand-written `](#anchor)` links in the source rustdoc are
+// rewritten to the same relative form. A docs viewer rewrites the `.md` suffix
+// to its own routes at render time.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::fs;
 use std::path::Path;
 
-// Shared with the crate; renders type phrases, field bullets, and the markdown
-// document written to docs/asset-reference.md.
+// Shared with the crate; renders type phrases, field bullets, enum value lists,
+// the per-page markdown, and the index.
 #[path = "src/render.rs"]
 mod render;
-use render::{FieldEntry, FieldType, RefEntry, VALUE_TYPES_CATEGORY, render_parameters};
+use render::{
+    EnumValue, FieldEntry, FieldType, IndexEntry, render_index, render_page, render_parameters,
+    render_values, rewrite_doc_links, slug,
+};
 
 const ASSETS_DIR: &str = "../concinnity-core/src/assets";
 
-// Markdown reference written into the source tree, relative to this crate.
-const REFERENCE_DOC: &str = "../concinnity-docs/asset-reference.md";
-
-const CATEGORIES: &[(&str, &[&str])] = &[
-    (
-        "World setup",
-        &[
-            "GraphicsConfig",
-            "ShaderStage",
-            "Window",
-            "PhysicsConfig",
-            "StreamingConfig",
-        ],
-    ),
-    ("Scene organization", &["Scene", "SceneReel"]),
-    (
-        "Geometry",
-        &[
-            "SceneImport",
-            "BlockType",
-            "Mesh",
-            "Model",
-            "ProceduralMesh",
-            "Room",
-            "VoxelChunk",
-            "VoxelWorld",
-        ],
-    ),
-    (
-        "Materials and textures",
-        &["Material", "MaterialPalette", "Texture", "CubemapTexture"],
-    ),
-    (
-        "Lighting",
-        &[
-            "DirectionalLight",
-            "LightRig",
-            "PointLight",
-            "EnvironmentMap",
-        ],
-    ),
-    ("Camera", &["Camera3D", "CameraShot"]),
-    (
-        "Objects",
-        &[
-            "Prop",
-            "InstancedProp",
-            "Prefab",
-            "RigidBody",
-            "PropBody",
-            "Spawner",
-        ],
-    ),
-    ("Animation", &["Animation", "Joint", "SkinnedMesh"]),
-    ("Audio", &["AudioClip", "AudioEmitter"]),
-    (
-        "Effects and atmosphere",
-        &[
-            "Decal",
-            "GlassPanel",
-            "WaterSurface",
-            "VolumetricFog",
-            "ParticleEmitter",
-            "SdfVolume",
-        ],
-    ),
-    ("Post-processing", &["PostProcessConfig", "ColorLut"]),
-    (
-        "UI",
-        &[
-            "Font",
-            "TextLabel",
-            "Sprite",
-            "FpsCounter",
-            "StatHud",
-            "HitRegion",
-            "KeyBinding",
-            "View",
-            "LayoutContainer",
-        ],
-    ),
-    ("Utilities", &["FrameInput", "File"]),
-];
+// Per-type markdown pages written into the source tree, relative to this crate.
+const PAGES_DIR: &str = "../concinnity-docs/public/assets";
 
 // Cross-file indices over the parsed asset sources. Enums, value-type structs,
 // and `impl Default` blocks can each live in a different file from the asset
 // that references them, so every lookup goes through these.
 struct Ctx<'a> {
     files: &'a [syn::File],
-    // Enum ident -> its serialized string variants (string-valued enums only).
-    enums: &'a HashMap<String, Vec<String>>,
+    // Enum ident -> its serialized variants and docs (string-valued enums only).
+    enums: &'a HashMap<String, EnumInfo>,
     // Named-field struct ident -> index of the file it is defined in.
     struct_file_idx: &'a HashMap<String, usize>,
-    // Component struct ident -> its declarable NAME (for linking to assets).
+    // Documented Component struct ident -> its declarable NAME (for linking to
+    // an asset's page). Only authorable components are listed, so links never
+    // point at a page that was not generated.
     comp_by_struct: &'a HashMap<String, String>,
 }
 
@@ -134,9 +66,37 @@ struct ComponentMeta {
     name: String,
     struct_ident: String,
     args_struct: String,
+    // "External" | "RuntimeOnly" | "BuildOnly" (RuntimeOnly when unspecified).
+    origin: String,
 }
 
-struct Rendered {
+// A string-valued enum (all unit variants): its serialized values, the doc on
+// each value, and the enum-level doc. A documented enum gets its own page; an
+// undocumented one is rendered inline as a closed set of string values.
+struct EnumInfo {
+    variants: Vec<String>,
+    variant_docs: Vec<String>,
+    enum_doc: String,
+}
+
+impl EnumInfo {
+    fn documented(&self) -> bool {
+        !self.enum_doc.trim().is_empty() || self.variant_docs.iter().any(|d| !d.trim().is_empty())
+    }
+}
+
+// Value-type structs and documented enums a render pass discovered as reachable
+// from a field. Each gets its own page.
+#[derive(Default)]
+struct Refs {
+    value_types: BTreeSet<String>,
+    enums: BTreeSet<String>,
+}
+
+// One rendered type: its name, one-line summary, and full doc body (the
+// description followed by the generated Parameters/Values section).
+struct Entry {
+    name: String,
     summary: String,
     full_doc: String,
 }
@@ -149,8 +109,15 @@ fn main() {
     let files = parse_asset_files();
     let enums = collect_enums(&files);
     let struct_file_idx = collect_structs(&files);
-    let components = collect_components(&files, &struct_file_idx);
-    let comp_by_struct: HashMap<String, String> = components
+    let all_components = collect_components(&files, &struct_file_idx);
+
+    // Authorable assets only: a RuntimeOnly component is engine-internal, never
+    // declared in a world, so it gets no page.
+    let documented: Vec<&ComponentMeta> = all_components
+        .iter()
+        .filter(|c| c.origin != "RuntimeOnly")
+        .collect();
+    let comp_by_struct: HashMap<String, String> = documented
         .iter()
         .map(|c| (c.struct_ident.clone(), c.name.clone()))
         .collect();
@@ -162,104 +129,190 @@ fn main() {
         comp_by_struct: &comp_by_struct,
     };
 
-    // Render every component, collecting the nested value types its fields use.
-    let mut by_name: BTreeMap<String, Rendered> = BTreeMap::new();
-    let mut value_types: BTreeSet<String> = BTreeSet::new();
-    for c in &components {
+    // Render every asset, collecting the value types and documented enums its
+    // fields reach.
+    let mut refs = Refs::default();
+    let mut assets: Vec<Entry> = Vec::new();
+    for c in &documented {
         let (summary, full_doc) =
-            render_doc_entry(&c.struct_ident, &c.args_struct, &ctx, &mut value_types);
-        by_name.insert(c.name.clone(), Rendered { summary, full_doc });
+            render_doc_entry(&c.struct_ident, &c.args_struct, &ctx, &mut refs);
+        assets.push(Entry {
+            name: c.name.clone(),
+            summary,
+            full_doc,
+        });
     }
 
-    // Render value types to a fixpoint (one may embed another).
-    let value_type_docs = render_value_types(value_types, &ctx);
+    // Reference types: value-type structs to a fixpoint (one may embed another
+    // or reference an enum), then the documented enums those passes reached.
+    let mut ref_types: Vec<Entry> = Vec::new();
+    let mut done_vt: BTreeSet<String> = BTreeSet::new();
+    loop {
+        let pending: Vec<String> = refs
+            .value_types
+            .iter()
+            .filter(|n| !done_vt.contains(*n) && ctx.struct_file_idx.contains_key(*n))
+            .cloned()
+            .collect();
+        if pending.is_empty() {
+            break;
+        }
+        for name in pending {
+            done_vt.insert(name.clone());
+            let (summary, full_doc) = render_doc_entry(&name, &name, &ctx, &mut refs);
+            let summary = if summary.is_empty() {
+                "Nested object embedded by other assets.".to_string()
+            } else {
+                summary
+            };
+            ref_types.push(Entry {
+                name,
+                summary,
+                full_doc,
+            });
+        }
+    }
+    for name in &refs.enums {
+        let (summary, full_doc) = render_enum_doc(name, &ctx);
+        let summary = if summary.is_empty() {
+            "A set of named string values.".to_string()
+        } else {
+            summary
+        };
+        ref_types.push(Entry {
+            name: name.clone(),
+            summary,
+            full_doc,
+        });
+    }
 
+    // Rewrite hand-written `](#anchor)` cross-references in every doc body to
+    // the relative `.md` form, resolving anchors through the set of all
+    // documented names.
+    let mut name_for_slug: HashMap<String, String> = HashMap::new();
+    for e in assets.iter().chain(ref_types.iter()) {
+        name_for_slug.insert(slug(&e.name), e.name.clone());
+    }
+    for e in assets.iter_mut().chain(ref_types.iter_mut()) {
+        e.summary = rewrite_doc_links(&e.summary, &name_for_slug);
+        e.full_doc = rewrite_doc_links(&e.full_doc, &name_for_slug);
+    }
+
+    assets.sort_by(|a, b| a.name.cmp(&b.name));
+    ref_types.sort_by(|a, b| a.name.cmp(&b.name));
+
+    write_assets_doc(&assets, &ref_types);
+    write_pages(&assets, &ref_types);
+}
+
+// Embedded table for the Rust consumers (describe_asset_type, asset summary).
+fn write_assets_doc(assets: &[Entry], ref_types: &[Entry]) {
     let mut out = String::new();
     out.push_str("// Auto-generated by concinnity-docs/build.rs - do not edit.\n\n");
     out.push_str("pub struct AssetDoc {\n");
     out.push_str("    pub type_name: &'static str,\n");
-    out.push_str("    pub category:  &'static str,\n");
     out.push_str("    pub summary:   &'static str,\n");
     out.push_str("    pub full_doc:  &'static str,\n");
+    out.push_str("    pub is_reference_type: bool,\n");
     out.push_str("}\n\n");
     out.push_str("pub static ASSET_DOCS: &[AssetDoc] = &[\n");
-
-    // Collected in document order so the markdown reference and the embedded
-    // table stay in the same order.
-    let mut ref_entries: Vec<RefEntry> = Vec::new();
-
-    for (cat, names) in CATEGORIES {
-        for name in *names {
-            let entry = by_name.get(*name).unwrap_or_else(|| {
-                panic!(
-                    "build.rs: no rustdoc found for asset `{name}` (category `{cat}`). \
-                     Either the rustdoc on its struct is empty or its NAME constant \
-                     differs from the string in CATEGORIES."
-                );
-            });
-            push_doc(&mut out, name, cat, &entry.summary, &entry.full_doc);
-            ref_entries.push(RefEntry {
-                category: cat,
-                type_name: name,
-                full_doc: entry.full_doc.as_str(),
-            });
-        }
+    for e in assets {
+        push_doc(&mut out, e, false);
     }
-
-    // Value types last, alphabetically (BTreeMap order).
-    for (name, entry) in &value_type_docs {
-        push_doc(
-            &mut out,
-            name,
-            VALUE_TYPES_CATEGORY,
-            &entry.summary,
-            &entry.full_doc,
-        );
-        ref_entries.push(RefEntry {
-            category: VALUE_TYPES_CATEGORY,
-            type_name: name,
-            full_doc: entry.full_doc.as_str(),
-        });
+    for e in ref_types {
+        push_doc(&mut out, e, true);
     }
     out.push_str("];\n");
 
     let out_dir = env::var("OUT_DIR").expect("OUT_DIR not set");
     let dest = Path::new(&out_dir).join("assets_doc.rs");
     fs::write(&dest, out).expect("write assets_doc.rs");
-
-    let markdown = render::render_reference_md(&ref_entries);
-    write_reference_doc(&markdown);
 }
 
-fn push_doc(out: &mut String, type_name: &str, category: &str, summary: &str, full_doc: &str) {
+fn push_doc(out: &mut String, e: &Entry, is_reference_type: bool) {
     out.push_str("    AssetDoc {\n");
-    out.push_str(&format!("        type_name: {type_name:?},\n"));
-    out.push_str(&format!("        category:  {category:?},\n"));
-    out.push_str(&format!("        summary:   {summary:?},\n"));
-    out.push_str(&format!("        full_doc:  {full_doc:?},\n"));
+    out.push_str(&format!("        type_name: {:?},\n", e.name));
+    out.push_str(&format!("        summary:   {:?},\n", e.summary));
+    out.push_str(&format!("        full_doc:  {:?},\n", e.full_doc));
+    out.push_str(&format!(
+        "        is_reference_type: {is_reference_type},\n"
+    ));
     out.push_str("    },\n");
 }
 
-// Write the rendered reference into the source tree. The markdown is an
-// auxiliary artifact (the embedded ASSET_DOCS table is the build's real
-// output), so an unwritable docs/ warns rather than failing the whole build.
-// Skips the write when the content is unchanged to avoid churning the file's
-// mtime (and the git working tree) on every build.
-fn write_reference_doc(content: &str) {
+// Write each type's page and the index into the source tree, then prune stale
+// auto-generated pages. The pages are an auxiliary artifact (the embedded
+// ASSET_DOCS table is the build's real output), so an unwritable directory
+// warns rather than failing the whole build. Unchanged files are left alone to
+// avoid churning mtimes (and the git working tree) on every build.
+fn write_pages(assets: &[Entry], ref_types: &[Entry]) {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
-    let path = Path::new(&manifest_dir).join(REFERENCE_DOC);
+    let dir = Path::new(&manifest_dir).join(PAGES_DIR);
+    if let Err(e) = fs::create_dir_all(&dir) {
+        println!("cargo:warning=asset pages: {}: {e}", dir.display());
+        return;
+    }
 
-    if fs::read_to_string(&path).ok().as_deref() == Some(content) {
+    let mut written: BTreeSet<String> = BTreeSet::new();
+    for e in assets.iter().chain(ref_types.iter()) {
+        let file = format!("{}.md", e.name);
+        write_if_changed(&dir.join(&file), &render_page(&e.name, &e.full_doc));
+        written.insert(file);
+    }
+
+    let to_index = |entries: &[Entry]| -> Vec<IndexEntry> {
+        entries
+            .iter()
+            .map(|e| IndexEntry {
+                name: e.name.clone(),
+                summary: e.summary.clone(),
+            })
+            .collect()
+    };
+    write_if_changed(
+        &dir.join("index.md"),
+        &render_index(&to_index(assets), &to_index(ref_types)),
+    );
+    written.insert("index.md".to_string());
+
+    remove_stale_pages(&dir, &written);
+}
+
+fn write_if_changed(path: &Path, content: &str) {
+    if fs::read_to_string(path).ok().as_deref() == Some(content) {
         return;
     }
-    if let Some(parent) = path.parent()
-        && let Err(e) = fs::create_dir_all(parent)
-    {
-        println!("cargo:warning=asset reference: {}: {e}", parent.display());
-        return;
+    if let Err(e) = fs::write(path, content) {
+        println!("cargo:warning=asset pages: {}: {e}", path.display());
     }
-    if let Err(e) = fs::write(&path, content) {
-        println!("cargo:warning=asset reference: {}: {e}", path.display());
+}
+
+// Remove generated `.md` pages no longer in the current set (a renamed or
+// deleted asset). Only files that carry our auto-generated marker are removed,
+// so a hand-authored markdown dropped in the directory is left untouched.
+fn remove_stale_pages(dir: &Path, keep: &BTreeSet<String>) {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        if keep.contains(&name) {
+            continue;
+        }
+        let is_generated = fs::read_to_string(&path)
+            .map(|s| s.starts_with(render::AUTOGEN_MARKER))
+            .unwrap_or(false);
+        if is_generated && let Err(e) = fs::remove_file(&path) {
+            println!("cargo:warning=asset pages: {}: {e}", path.display());
+        }
     }
 }
 
@@ -295,10 +348,10 @@ fn push_parsed(path: &Path, out: &mut Vec<syn::File>) {
     out.push(file);
 }
 
-// Enum ident -> serialized variants, for enums that serialize to a plain string
-// (all variants are unit). Data-carrying enums become JSON objects, so they are
-// left out here and fall through to the generic object rendering.
-fn collect_enums(files: &[syn::File]) -> HashMap<String, Vec<String>> {
+// Enum ident -> serialized variants and docs, for enums that serialize to a
+// plain string (all variants are unit). Data-carrying enums become JSON
+// objects, so they are left out here and fall through to generic rendering.
+fn collect_enums(files: &[syn::File]) -> HashMap<String, EnumInfo> {
     let mut out = HashMap::new();
     for file in files {
         for item in &file.items {
@@ -313,15 +366,23 @@ fn collect_enums(files: &[syn::File]) -> HashMap<String, Vec<String>> {
                 continue;
             }
             let rule = serde_kv(&e.attrs, "rename_all");
-            let variants = e
-                .variants
-                .iter()
-                .map(|v| {
+            let mut variants = Vec::new();
+            let mut variant_docs = Vec::new();
+            for v in &e.variants {
+                variants.push(
                     serde_kv(&v.attrs, "rename")
-                        .unwrap_or_else(|| apply_case(&v.ident.to_string(), rule.as_deref()))
-                })
-                .collect();
-            out.insert(e.ident.to_string(), variants);
+                        .unwrap_or_else(|| apply_case(&v.ident.to_string(), rule.as_deref())),
+                );
+                variant_docs.push(collapse_doc(&extract_doc(&v.attrs)));
+            }
+            out.insert(
+                e.ident.to_string(),
+                EnumInfo {
+                    variants,
+                    variant_docs,
+                    enum_doc: extract_doc(&e.attrs),
+                },
+            );
         }
     }
     out
@@ -388,6 +449,8 @@ fn collect_components(
                 name,
                 struct_ident,
                 args_struct,
+                // RuntimeOnly is the trait default, used when `ORIGIN` is unset.
+                origin: component_origin(imp).unwrap_or_else(|| "RuntimeOnly".to_string()),
             });
         }
     }
@@ -403,49 +466,48 @@ fn render_doc_entry(
     doc_ident: &str,
     args_ident: &str,
     ctx: &Ctx,
-    value_types: &mut BTreeSet<String>,
+    refs: &mut Refs,
 ) -> (String, String) {
     let doc = struct_doc(doc_ident, ctx);
     let cleaned = strip_table_lines(&doc);
-    let fields = build_fields(args_ident, ctx, value_types);
+    let fields = build_fields(args_ident, ctx, refs);
     let params = render_parameters(&fields);
-    let full_doc = match (cleaned.is_empty(), params.is_empty()) {
-        (_, true) => cleaned,
-        (true, false) => params,
-        (false, false) => format!("{}\n\n{}", cleaned, params.trim_end()),
-    };
+    let full_doc = combine(&cleaned, &params);
     (first_paragraph(&doc), full_doc)
 }
 
-fn render_value_types(seed: BTreeSet<String>, ctx: &Ctx) -> BTreeMap<String, Rendered> {
-    let mut done: BTreeMap<String, Rendered> = BTreeMap::new();
-    let mut queue: Vec<String> = seed.into_iter().collect();
-    while let Some(name) = queue.pop() {
-        if done.contains_key(&name) || !ctx.struct_file_idx.contains_key(&name) {
-            continue;
-        }
-        let mut more = BTreeSet::new();
-        let (summary, full_doc) = render_doc_entry(&name, &name, ctx, &mut more);
-        let summary = if summary.is_empty() {
-            "Nested object embedded by other assets.".to_string()
-        } else {
-            summary
-        };
-        done.insert(name, Rendered { summary, full_doc });
-        for m in more {
-            if !done.contains_key(&m) {
-                queue.push(m);
-            }
-        }
-    }
-    done
+// Render a documented enum's page body: its enum-level rustdoc followed by a
+// `## Values` list, one bullet per serialized value with its own doc.
+fn render_enum_doc(name: &str, ctx: &Ctx) -> (String, String) {
+    let info = match ctx.enums.get(name) {
+        Some(i) => i,
+        None => return (String::new(), String::new()),
+    };
+    let cleaned = strip_table_lines(&info.enum_doc);
+    let values: Vec<EnumValue> = info
+        .variants
+        .iter()
+        .zip(info.variant_docs.iter())
+        .map(|(v, d)| EnumValue {
+            value: v.clone(),
+            doc: d.clone(),
+        })
+        .collect();
+    let vals = render_values(&values);
+    (first_paragraph(&info.enum_doc), combine(&cleaned, &vals))
 }
 
-fn build_fields(
-    args_ident: &str,
-    ctx: &Ctx,
-    value_types: &mut BTreeSet<String>,
-) -> Vec<FieldEntry> {
+// Join a cleaned description with a generated section, dropping whichever is
+// empty.
+fn combine(description: &str, section: &str) -> String {
+    match (description.is_empty(), section.is_empty()) {
+        (_, true) => description.to_string(),
+        (true, false) => section.to_string(),
+        (false, false) => format!("{}\n\n{}", description, section.trim_end()),
+    }
+}
+
+fn build_fields(args_ident: &str, ctx: &Ctx, refs: &mut Refs) -> Vec<FieldEntry> {
     let file = match ctx.struct_file_idx.get(args_ident) {
         Some(i) => &ctx.files[*i],
         None => return Vec::new(),
@@ -470,8 +532,8 @@ fn build_fields(
         };
         let key = get_serde_rename(&field.attrs).unwrap_or_else(|| ident.clone());
         let (ty, optional) = match option_inner(&field.ty) {
-            Some(inner) => (map_type(inner, ctx, value_types), true),
-            None => (map_type(&field.ty, ctx, value_types), false),
+            Some(inner) => (map_type(inner, ctx, refs), true),
+            None => (map_type(&field.ty, ctx, refs), false),
         };
         let doc = collapse_doc(&extract_doc(&field.attrs));
         // An em-dash means no default was discoverable (derived Default, or a
@@ -492,8 +554,9 @@ fn build_fields(
 }
 
 // Translate a Rust field type to a JSON-shaped FieldType. Records any nested
-// non-asset struct it links to in `value_types` so it gets its own entry.
-fn map_type(ty: &syn::Type, ctx: &Ctx, value_types: &mut BTreeSet<String>) -> FieldType {
+// non-asset struct, or any documented enum, it links to in `refs` so it gets
+// its own page.
+fn map_type(ty: &syn::Type, ctx: &Ctx, refs: &mut Refs) -> FieldType {
     match ty {
         syn::Type::Path(tp) => {
             let seg = match tp.path.segments.last() {
@@ -511,11 +574,11 @@ fn map_type(ty: &syn::Type, ctx: &Ctx, value_types: &mut BTreeSet<String>) -> Fi
                 // serde_json::Value and maps are open-ended JSON objects.
                 "Value" | "HashMap" | "BTreeMap" => FieldType::Object,
                 "Option" | "Box" => first_generic(seg)
-                    .map(|inner| map_type(inner, ctx, value_types))
+                    .map(|inner| map_type(inner, ctx, refs))
                     .unwrap_or(FieldType::Object),
                 "Vec" => {
                     let elem = first_generic(seg)
-                        .map(|inner| map_type(inner, ctx, value_types))
+                        .map(|inner| map_type(inner, ctx, refs))
                         .unwrap_or(FieldType::Object);
                     FieldType::Array {
                         elem: Box::new(elem),
@@ -523,14 +586,22 @@ fn map_type(ty: &syn::Type, ctx: &Ctx, value_types: &mut BTreeSet<String>) -> Fi
                     }
                 }
                 _ => {
-                    if let Some(variants) = ctx.enums.get(&id) {
-                        FieldType::Enum(variants.clone())
+                    if let Some(info) = ctx.enums.get(&id) {
+                        // A documented enum gets its own page (its values carry
+                        // their docs there); an undocumented one is inlined as a
+                        // closed set of string values.
+                        if info.documented() {
+                            refs.enums.insert(id.clone());
+                            FieldType::NamedEnum(id)
+                        } else {
+                            FieldType::Enum(info.variants.clone())
+                        }
                     } else if let Some(name) = ctx.comp_by_struct.get(&id) {
                         // A field embedding another asset's struct links to that
-                        // asset; it is documented in its own category already.
+                        // asset's own page.
                         FieldType::Named(name.clone())
                     } else if ctx.struct_file_idx.contains_key(&id) {
-                        value_types.insert(id.clone());
+                        refs.value_types.insert(id.clone());
                         FieldType::Named(id)
                     } else {
                         FieldType::Object
@@ -539,13 +610,13 @@ fn map_type(ty: &syn::Type, ctx: &Ctx, value_types: &mut BTreeSet<String>) -> Fi
             }
         }
         syn::Type::Array(arr) => {
-            let elem = map_type(&arr.elem, ctx, value_types);
+            let elem = map_type(&arr.elem, ctx, refs);
             FieldType::Array {
                 elem: Box::new(elem),
                 len: array_len(&arr.len),
             }
         }
-        syn::Type::Reference(r) => map_type(&r.elem, ctx, value_types),
+        syn::Type::Reference(r) => map_type(&r.elem, ctx, refs),
         _ => FieldType::Object,
     }
 }
@@ -609,6 +680,21 @@ fn name_const(imp: &syn::ItemImpl) -> Option<String> {
             && let syn::Lit::Str(s) = &lit.lit
         {
             return Some(s.value());
+        }
+        None
+    })
+}
+
+// The `AssetOrigin` variant named by a Component impl's `const ORIGIN`, if set
+// (e.g. "External"). The trait default applies when the impl omits it.
+fn component_origin(imp: &syn::ItemImpl) -> Option<String> {
+    imp.items.iter().find_map(|it| {
+        let c = match it {
+            syn::ImplItem::Const(c) if c.ident == "ORIGIN" => c,
+            _ => return None,
+        };
+        if let syn::Expr::Path(p) = &c.expr {
+            return p.path.segments.last().map(|s| s.ident.to_string());
         }
         None
     })

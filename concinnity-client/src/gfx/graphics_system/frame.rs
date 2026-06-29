@@ -737,6 +737,11 @@ impl GraphicsSystem {
                             &ceiling,
                         );
                         backend.set_shadow_update(self.shadow_update);
+                        // Anisotropy: restart-required, so re-derive from the
+                        // authored baseline for the row label only (the sampler is
+                        // built at init; the new degree takes effect next launch).
+                        self.anisotropy =
+                            quality_preset::clamp_anisotropy(self.authored_anisotropy, &ceiling);
 
                         // Persist the preset and drop the per-row quality overrides,
                         // so the next launch re-resolves them from the world +
@@ -755,6 +760,7 @@ impl GraphicsSystem {
                         cfg.graphics.reflection_blur_resolution = None;
                         cfg.graphics.shadow_map_size = None;
                         cfg.graphics.shadow_update = None;
+                        cfg.graphics.anisotropy = None;
                         cfg.graphics.render_scale = None;
                         if let Err(e) = cfg.save() {
                             tracing::warn!("GraphicsSystem: persist preset: {e}");
@@ -793,13 +799,15 @@ impl GraphicsSystem {
                                 set_cached_row_label(&self.cycle_value_labels, ctx, key, text);
                             }
                         }
-                        // And the shadow rows (their state lives on self, not the
-                        // post_config, so they relabel from the live fields).
-                        for key in ["shadow_map_size", "shadow_update"] {
+                        // And the shadow + anisotropy rows (their state lives on
+                        // self, not the post_config, so they relabel from the live
+                        // fields).
+                        for key in ["shadow_map_size", "shadow_update", "anisotropy"] {
                             let idx = match key {
                                 "shadow_map_size" => {
                                     settings::shadow_resolution_index(self.shadow_map_size)
                                 }
+                                "anisotropy" => settings::anisotropy_index(self.anisotropy),
                                 _ => settings::shadow_update_index(self.shadow_update),
                             };
                             if let Some(text) =
@@ -1037,6 +1045,26 @@ impl GraphicsSystem {
                             let next = settings::cycle(cur, opts.len(), cmd.op);
                             self.shadow_map_size = settings::shadow_resolution_at(next);
                             cfg.graphics.shadow_map_size = Some(self.shadow_map_size);
+                            self.quality_preset = crate::gfx::quality_preset::QualityPreset::Custom;
+                            cfg.graphics.quality_preset = Some(self.quality_preset);
+                            set_cached_row_label(
+                                &self.cycle_value_labels,
+                                ctx,
+                                "graphics_quality",
+                                self.quality_preset.name(),
+                            );
+                            Some(opts[next])
+                        }
+                        // Anisotropic filtering: restart-required (the scene
+                        // sampler is built once at init), so persist + display only;
+                        // the new degree takes effect at the next launch. Preset-
+                        // governed, so an explicit choice opts the master preset out
+                        // to Custom.
+                        "anisotropy" => {
+                            let cur = settings::anisotropy_index(self.anisotropy);
+                            let next = settings::cycle(cur, opts.len(), cmd.op);
+                            self.anisotropy = settings::anisotropy_at(next);
+                            cfg.graphics.anisotropy = Some(self.anisotropy);
                             self.quality_preset = crate::gfx::quality_preset::QualityPreset::Custom;
                             cfg.graphics.quality_preset = Some(self.quality_preset);
                             set_cached_row_label(

@@ -101,6 +101,9 @@ impl MtlContext {
         light_uniforms: LightUniforms,
         shadow_map_size: u32,
         shadow_update: crate::assets::ShadowUpdate,
+        // Scene-sampler max anisotropy (GraphicsConfig.anisotropy), clamped to
+        // Metal's guaranteed 1..16 range where it is used below.
+        anisotropy: u32,
         text_atlases: Vec<(u32, u32, Vec<u8>)>,
         // serialised EnvironmentMap payload (irradiance + prefilter cubemaps).
         // None → IBL disabled; the runtime binds 1x1 grey fallback cubes and
@@ -337,7 +340,8 @@ impl MtlContext {
         // linear filter, repeat wrap -- matches the room shader expectations.
         // Mipmap linear + anisotropy let minified scene textures trilinear-select
         // down the mip chain now that uploads carry one, instead of aliasing from
-        // mip 0. 8x is within Metal's guaranteed maximum of 16.
+        // mip 0. The degree comes from GraphicsConfig.anisotropy (default 8),
+        // clamped to Metal's guaranteed 1..16 range.
         let sampler = {
             let desc = MTLSamplerDescriptor::new();
             desc.setMinFilter(MTLSamplerMinMagFilter::Linear);
@@ -345,7 +349,7 @@ impl MtlContext {
             desc.setMipFilter(objc2_metal::MTLSamplerMipFilter::Linear);
             desc.setSAddressMode(MTLSamplerAddressMode::Repeat);
             desc.setTAddressMode(MTLSamplerAddressMode::Repeat);
-            desc.setMaxAnisotropy(8);
+            desc.setMaxAnisotropy(anisotropy.clamp(1, 16) as usize);
             device
                 .newSamplerStateWithDescriptor(&desc)
                 .ok_or("failed to create sampler state")?

@@ -71,7 +71,7 @@ const VIDEO_ADVANCED_SLIDERS: [(&str, &str); 7] = [
 // client (`concinnity_client::gfx::settings` + `graphics_system`) knows each key's options and
 // applies it live by rebuilding the affected render resources; on backends
 // without a live path the choice persists and applies at the next launch.
-const VIDEO_QUALITY_ROWS: [(&str, &str); 12] = [
+const VIDEO_QUALITY_ROWS: [(&str, &str); 13] = [
     ("taa", "Anti-Aliasing"),
     ("ssao", "Ambient Occlusion"),
     ("ssr", "Screen-Space Reflections"),
@@ -90,6 +90,9 @@ const VIDEO_QUALITY_ROWS: [(&str, &str); 12] = [
     ("shadow_map_size", "Shadow Resolution"),
     ("shadow_update", "Shadow Update"),
     ("auto_exposure", "Auto Exposure"),
+    // Anisotropic texture filtering (restart-required). Preset-governed like the
+    // toggles above.
+    ("anisotropy", "Anisotropic Filtering"),
 ];
 // Per-feature sub-quality sliders in the Video "Quality" group, tuning the
 // features the toggles / dropdowns above enable. Applied live on Metal by
@@ -1673,6 +1676,7 @@ mod tests {
             "opt_shadow_map_size",
             "opt_shadow_update",
             "opt_auto_exposure",
+            "opt_anisotropy",
             // The per-feature sub-quality sliders share the Quality group.
             "sld_ssao_radius",
             "sld_ssao_intensity",

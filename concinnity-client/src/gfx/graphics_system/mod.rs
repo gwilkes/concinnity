@@ -54,6 +54,11 @@ pub struct GraphicsSystem {
     max_frames: Option<u64>,
     shadow_map_size: u32,
     shadow_update: crate::assets::ShadowUpdate,
+    // Scene-sampler max anisotropy. Restart-required (the sampler is built once at
+    // backend init from this), so this is display/persist state; the value reaches
+    // the backend through the ctor. Preset-governed (a manual change flips the
+    // master preset to Custom).
+    anisotropy: u32,
     failed: bool,
     start_time: Option<Instant>,
     frame_count: u64,
@@ -220,6 +225,10 @@ pub struct GraphicsSystem {
     // values are `shadow_map_size` / `shadow_update` above.
     authored_shadow_map_size: u32,
     authored_shadow_update: crate::assets::ShadowUpdate,
+    // The world's authored anisotropy degree before the user override + preset
+    // ceiling, the baseline a live preset change re-clamps from (like
+    // `authored_shadow_map_size`). The live value is `anisotropy` above.
+    authored_anisotropy: u32,
     // System / streaming restart preferences (the Advanced "Frame Buffering",
     // "Occlusion Culling", and "Texture Quality" rows). Resolved at init from the
     // world's config overridden by any persisted choice, passed to the backend
@@ -345,6 +354,7 @@ impl GraphicsSystem {
             max_frames: None,
             shadow_map_size: 2048,
             shadow_update: crate::assets::ShadowUpdate::default(),
+            anisotropy: 8,
             failed: false,
             start_time: None,
             frame_count: 0,
@@ -393,6 +403,7 @@ impl GraphicsSystem {
             hdr_pq: false,
             authored_shadow_map_size: 2048,
             authored_shadow_update: crate::assets::ShadowUpdate::default(),
+            authored_anisotropy: 8,
             occlusion_two_pass: false,
             texture_cap: 96,
             texture_budget: 4,

@@ -86,6 +86,9 @@ impl DxContext {
         // Shadow-cascade re-render policy: hybrid amortizes the far cascades
         // across frames, every_frame refreshes all cascades every frame.
         shadow_update: crate::assets::ShadowUpdate,
+        // Scene-sampler max anisotropy (GraphicsConfig.anisotropy), clamped to the
+        // D3D12 1..16 range where the sampler is built below.
+        anisotropy: u32,
         text_atlases: Vec<(u32, u32, Vec<u8>)>,
         // Serialised EnvironmentMap payload (irradiance + prefilter cubemaps).
         // None disables IBL; the runtime binds 1×1 grey fallback cubes and
@@ -589,7 +592,7 @@ impl DxContext {
         let samp_cpu_base = unsafe { sampler_heap.GetCPUDescriptorHandleForHeapStart() };
         let samp_gpu_base = unsafe { sampler_heap.GetGPUDescriptorHandleForHeapStart() };
 
-        create_samplers(&device, samp_cpu_base, sampler_descriptor_size);
+        create_samplers(&device, samp_cpu_base, sampler_descriptor_size, anisotropy);
 
         let shadow_sampler_gpu = D3D12_GPU_DESCRIPTOR_HANDLE {
             ptr: samp_gpu_base.ptr,
@@ -2218,7 +2221,14 @@ impl DxContext {
     }
 }
 
-fn create_samplers(device: &ID3D12Device, base_cpu: D3D12_CPU_DESCRIPTOR_HANDLE, stride: usize) {
+fn create_samplers(
+    device: &ID3D12Device,
+    base_cpu: D3D12_CPU_DESCRIPTOR_HANDLE,
+    stride: usize,
+    // Scene-sampler max anisotropy from GraphicsConfig.anisotropy, clamped to the
+    // D3D12 1..16 range below.
+    anisotropy: u32,
+) {
     // [0] Shadow comparison sampler (LESS_EQUAL).
     let shadow_samp = D3D12_SAMPLER_DESC {
         Filter: D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT,
@@ -2239,14 +2249,15 @@ fn create_samplers(device: &ID3D12Device, base_cpu: D3D12_CPU_DESCRIPTOR_HANDLE,
 
     // [1] Anisotropic repeat (albedo + normal map). Anisotropic filtering plus
     // the unclamped MaxLOD lets minified scene textures trilinear-select down
-    // their mip chain instead of aliasing from mip 0. 8x is well within the
-    // D3D12 feature-level-11 guaranteed maximum of 16.
+    // their mip chain instead of aliasing from mip 0. The degree comes from
+    // GraphicsConfig.anisotropy (default 8), clamped to the D3D12 feature-level-11
+    // guaranteed 1..16 range.
     let linear_samp = D3D12_SAMPLER_DESC {
         Filter: D3D12_FILTER_ANISOTROPIC,
         AddressU: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
         AddressV: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
         AddressW: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
-        MaxAnisotropy: 8,
+        MaxAnisotropy: anisotropy.clamp(1, 16),
         MinLOD: 0.0,
         MaxLOD: f32::MAX,
         ..Default::default()

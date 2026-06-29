@@ -69,6 +69,11 @@ pub(crate) struct QualityCeiling {
     // When false the cadence is clamped to the cheaper `Hybrid`; the no-ceiling
     // value is `true`, so a world's authored cadence always stands.
     pub allow_every_frame_shadows: bool,
+    // Cap on the scene sampler's max anisotropic-filtering degree
+    // (restart-required): the effective degree is the smaller of the world's
+    // choice and this cap. The no-ceiling value is `ANISO_MAX` (16, the GPU
+    // maximum), so a world's authored degree always stands.
+    pub anisotropy: u32,
 }
 
 // The coarser (higher render-resolution divisor) of two SSGI resolutions, the
@@ -112,6 +117,10 @@ const REFLECTION_BLUR_MAX: ReflectionBlurResolution = ReflectionBlurResolution::
 // `u32::MAX` is the no-cap shadow-map resolution: a world's authored size always
 // stands smaller-or-equal under it.
 const SHADOW_SIZE_MAX: u32 = u32::MAX;
+// `16` is the no-cap anisotropy degree -- the maximum every backend's API
+// guarantees -- so a world's authored degree always stands smaller-or-equal
+// under it.
+const ANISO_MAX: u32 = 16;
 
 // The coarser (smaller) of two shadow-map resolutions, the shadow analogue of
 // the SSGI / reflection-blur clamp helpers. Used to clamp a world's authored
@@ -135,6 +144,13 @@ pub(crate) fn clamp_shadow_update(
     }
 }
 
+// The world's anisotropy degree clamped under the ceiling: the smaller of the
+// authored degree and the cap. Never raises. The shadow / SSGI clamp helpers'
+// anisotropy sibling.
+pub(crate) fn clamp_anisotropy(authored: u32, ceiling: &QualityCeiling) -> u32 {
+    authored.min(ceiling.anisotropy)
+}
+
 const NONE: QualityCeiling = QualityCeiling {
     taa: true,
     ssao: true,
@@ -149,6 +165,7 @@ const NONE: QualityCeiling = QualityCeiling {
     reflection_blur_resolution: REFLECTION_BLUR_MAX,
     shadow_map_size: SHADOW_SIZE_MAX,
     allow_every_frame_shadows: true,
+    anisotropy: ANISO_MAX,
 };
 const LOW: QualityCeiling = QualityCeiling {
     taa: true,
@@ -164,6 +181,7 @@ const LOW: QualityCeiling = QualityCeiling {
     reflection_blur_resolution: ReflectionBlurResolution::Quarter,
     shadow_map_size: 1024,
     allow_every_frame_shadows: false,
+    anisotropy: 4,
 };
 const MEDIUM: QualityCeiling = QualityCeiling {
     taa: true,
@@ -179,6 +197,7 @@ const MEDIUM: QualityCeiling = QualityCeiling {
     reflection_blur_resolution: ReflectionBlurResolution::Half,
     shadow_map_size: 2048,
     allow_every_frame_shadows: false,
+    anisotropy: 8,
 };
 const HIGH: QualityCeiling = QualityCeiling {
     taa: true,
@@ -194,6 +213,7 @@ const HIGH: QualityCeiling = QualityCeiling {
     reflection_blur_resolution: ReflectionBlurResolution::Half,
     shadow_map_size: 4096,
     allow_every_frame_shadows: false,
+    anisotropy: 16,
 };
 const ULTRA: QualityCeiling = QualityCeiling {
     taa: true,
@@ -209,6 +229,7 @@ const ULTRA: QualityCeiling = QualityCeiling {
     reflection_blur_resolution: REFLECTION_BLUR_MAX,
     shadow_map_size: SHADOW_SIZE_MAX,
     allow_every_frame_shadows: true,
+    anisotropy: ANISO_MAX,
 };
 
 // The active ceiling for the persisted preset and detected GPU. `Auto` maps the
@@ -443,6 +464,8 @@ mod tests {
                 !lo.allow_every_frame_shadows || hi.allow_every_frame_shadows,
                 "a higher tier forbade the EveryFrame shadow cadence"
             );
+            // The anisotropy cap rises (or holds) with the tier too.
+            assert!(lo.anisotropy <= hi.anisotropy, "anisotropy cap dropped");
         }
     }
 
@@ -473,6 +496,20 @@ mod tests {
         // Shadows authored off (size 0) stay off under any ceiling.
         assert_eq!(clamp_shadow_map_size(0, &none), 0);
         assert_eq!(clamp_shadow_map_size(0, &low), 0);
+    }
+
+    #[test]
+    fn anisotropy_clamps_down_only() {
+        // No ceiling (Custom / Ultra) leaves the world's authored degree alone,
+        // up to the GPU maximum.
+        let none = resolve_ceiling(QualityPreset::Custom, &GpuProfile::UNKNOWN);
+        assert_eq!(none.anisotropy, ANISO_MAX);
+        assert_eq!(clamp_anisotropy(16, &none), 16);
+        assert_eq!(clamp_anisotropy(8, &none), 8);
+        // Low caps the degree hard; the clamp never raises a smaller authored one.
+        let low = resolve_ceiling(QualityPreset::Low, &GpuProfile::UNKNOWN);
+        assert_eq!(clamp_anisotropy(16, &low), 4);
+        assert_eq!(clamp_anisotropy(2, &low), 2);
     }
 
     #[test]

@@ -85,6 +85,14 @@ const SHADOW_RESOLUTION_SIZES: [u32; 4] = [0, 1024, 2048, 4096];
 // Applied live (the cascade scheduler reads the policy each frame).
 const SHADOW_UPDATE_OPTIONS: [&str; 2] = ["Every Frame", "Hybrid"];
 
+// Anisotropic-filtering degree options for the scene sampler, in cycle order.
+// "Off" is 1x (plain trilinear); the rest are the max anisotropy degree. Indices
+// map via the `anisotropy_*` helpers below (an authored degree off the discrete
+// levels snaps to the nearest). Restart-required (the sampler is built once at
+// backend init).
+const ANISOTROPY_OPTIONS: [&str; 5] = ["Off", "2x", "4x", "8x", "16x"];
+const ANISOTROPY_LEVELS: [u32; 5] = [1, 2, 4, 8, 16];
+
 // Frame-buffering (ring-buffer depth / frames-in-flight) options, in cycle order.
 // Lower is less latency, higher is smoother pacing. Restart-required (the ring
 // buffers are sized once at init). Indices map via `frames_in_flight_at/_index`.
@@ -154,6 +162,7 @@ pub(crate) fn options(key: &str) -> Option<&'static [&'static str]> {
         "reflection_blur_resolution" => Some(&REFLECTION_BLUR_OPTIONS),
         "shadow_map_size" => Some(&SHADOW_RESOLUTION_OPTIONS),
         "shadow_update" => Some(&SHADOW_UPDATE_OPTIONS),
+        "anisotropy" => Some(&ANISOTROPY_OPTIONS),
         "frames_in_flight" => Some(&FRAME_BUFFERING_OPTIONS),
         "texture_quality" => Some(&TEXTURE_QUALITY_OPTIONS),
         // Display-output / upscaling preference + occlusion toggles (Off/On).
@@ -295,6 +304,18 @@ pub(crate) fn shadow_update_index(update: ShadowUpdate) -> usize {
         ShadowUpdate::EveryFrame => 0,
         ShadowUpdate::Hybrid => 1,
     }
+}
+
+// Anisotropic-filtering degree for an option index, and the menu index nearest an
+// authored degree (the world may author a degree off the discrete levels; the row
+// then shows the closest one). The default fallback is the world default (8x).
+pub(crate) fn anisotropy_at(index: usize) -> u32 {
+    *ANISOTROPY_LEVELS
+        .get(index)
+        .unwrap_or(&ANISOTROPY_LEVELS[3])
+}
+pub(crate) fn anisotropy_index(level: u32) -> usize {
+    nearest_count_index(&ANISOTROPY_LEVELS, level)
 }
 
 // Frames-in-flight (ring-buffer depth) for an option index, and the index for a
@@ -776,6 +797,24 @@ mod tests {
         // It is a cycle row, not a slider.
         assert!(options("shadow_map_size").is_some());
         assert!(slider_range("shadow_map_size").is_none());
+    }
+
+    #[test]
+    fn anisotropy_round_trips_and_snaps() {
+        // Each discrete level round-trips through its index.
+        for i in 0..ANISOTROPY_LEVELS.len() {
+            assert_eq!(anisotropy_index(anisotropy_at(i)), i);
+        }
+        // "Off" is 1x at index 0; the world default 8x is index 3.
+        assert_eq!(anisotropy_at(0), 1);
+        assert_eq!(anisotropy_index(8), 3);
+        // An authored degree off the discrete levels snaps to the nearest, and a
+        // degree above the top level snaps down to it.
+        assert_eq!(anisotropy_index(3), 1); // 3 -> 2x
+        assert_eq!(anisotropy_index(32), 4); // 32 -> 16x
+        // It is a cycle row, not a slider.
+        assert!(options("anisotropy").is_some());
+        assert!(slider_range("anisotropy").is_none());
     }
 
     #[test]

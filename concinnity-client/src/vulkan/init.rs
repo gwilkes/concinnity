@@ -63,6 +63,9 @@ impl VkContext {
         // Shadow-cascade re-render policy: hybrid amortizes the far cascades
         // across frames, every_frame refreshes all cascades every frame.
         shadow_update: crate::assets::ShadowUpdate,
+        // Scene-sampler max anisotropy (GraphicsConfig.anisotropy), clamped to the
+        // device limit where the sampler is built below.
+        anisotropy: u32,
         text_atlases: Vec<(u32, u32, Vec<u8>)>,
         // Serialised `EnvironmentMap` payload; `None` binds 1×1 grey fallback
         // cubes and disables IBL via `prefilter_mip_count = 0`.
@@ -685,14 +688,15 @@ impl VkContext {
         //  Samplers
         // Anisotropic degree for the scene sampler: enabled only when the device
         // supports `samplerAnisotropy` (the matching feature is turned on in
-        // `device.rs`). Clamp the requested 8x to the device limit.
+        // `device.rs`). Clamp the requested degree (GraphicsConfig.anisotropy) to
+        // the GPU's 1..16 range and then to the device limit.
         let scene_aniso = {
             let feats = unsafe { instance.get_physical_device_features(physical_device) };
             if feats.sampler_anisotropy != 0 {
                 let limit = unsafe { instance.get_physical_device_properties(physical_device) }
                     .limits
                     .max_sampler_anisotropy;
-                8.0_f32.min(limit)
+                (anisotropy.clamp(1, 16) as f32).min(limit)
             } else {
                 1.0
             }

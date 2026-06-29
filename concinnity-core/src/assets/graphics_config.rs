@@ -59,6 +59,12 @@ pub struct GraphicsConfig {
     /// the far cascades across frames; `every_frame` refreshes them all every
     /// frame. See [ShadowUpdate].
     pub shadow_update: ShadowUpdate,
+    /// Maximum anisotropic-filtering degree for the scene texture sampler
+    /// (albedo + normal maps), e.g. 8. Higher keeps textures viewed at a grazing
+    /// angle (floors, walls receding into the distance) sharp instead of blurring
+    /// along the minor axis, at a small sampling cost. `1` disables anisotropy
+    /// (plain trilinear). Clamped to the GPU's supported range (1..16) at init.
+    pub anisotropy: u32,
 }
 
 impl Default for GraphicsConfig {
@@ -71,6 +77,7 @@ impl Default for GraphicsConfig {
             rotation_speed: 1.0,
             shadow_map_size: 2048,
             shadow_update: ShadowUpdate::default(),
+            anisotropy: 8,
         }
     }
 }
@@ -183,6 +190,18 @@ mod tests {
         // Explicit true is honoured.
         let cfg: GraphicsConfig = serde_json::from_str(r#"{"vsync":true}"#).expect("parse");
         assert!(cfg.vsync);
+    }
+
+    #[test]
+    fn anisotropy_defaults_to_8_and_round_trips() {
+        // The default matches the value the backends historically hardcoded.
+        assert_eq!(GraphicsConfig::default().anisotropy, 8);
+        // An authored value is honoured; omitting the field falls back to 8.
+        let cfg: GraphicsConfig = serde_json::from_str(r#"{"anisotropy":16}"#).expect("parse");
+        assert_eq!(cfg.anisotropy, 16);
+        let cfg: GraphicsConfig =
+            serde_json::from_str(r#"{"shadow_map_size":1024}"#).expect("parse");
+        assert_eq!(cfg.anisotropy, 8);
     }
 
     #[test]

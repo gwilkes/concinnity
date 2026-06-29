@@ -224,6 +224,10 @@ pub(super) fn init_backend(
     // shadow-cascade update policy from GraphicsConfig.shadow_update. The shared
     // `ShadowCascadeScheduler` staggers which cascades re-render each frame.
     shadow_update: crate::assets::ShadowUpdate,
+    // Scene-sampler max anisotropy from GraphicsConfig.anisotropy. Each backend
+    // builds its albedo / normal-map sampler with this (clamped to the GPU's
+    // 1..16 range) at init; restart-required.
+    anisotropy: u32,
     // glyph atlas textures for text rendering; empty = no text support
     text_atlases: Vec<(u32, u32, Vec<u8>)>,
     // serialised EnvironmentMap payload (irradiance + prefilter cubemaps).
@@ -363,6 +367,7 @@ pub(super) fn init_backend(
             light_uniforms,
             shadow_map_size,
             shadow_update,
+            anisotropy,
             text_atlases,
             env_map_bytes,
             post_process,
@@ -423,6 +428,7 @@ pub(super) fn init_backend(
             light_uniforms,
             shadow_map_size,
             shadow_update,
+            anisotropy,
             text_atlases,
             env_map_bytes,
             post_process,
@@ -482,6 +488,7 @@ pub(super) fn init_backend(
             light_uniforms,
             shadow_map_size,
             shadow_update,
+            anisotropy,
             text_atlases,
             env_map_bytes,
             post_process,

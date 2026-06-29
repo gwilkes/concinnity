@@ -181,6 +181,12 @@ pub struct GraphicsSettings {
     pub shadow_map_size: Option<u32>,
     #[serde(default)]
     pub shadow_update: Option<crate::assets::ShadowUpdate>,
+    // Anisotropic-filtering degree for the scene sampler
+    // (`GraphicsConfig.anisotropy`). `None` uses the world's value. Restart-
+    // required (the sampler is built once at backend init) and governed by the
+    // quality preset ceiling like the shadow knobs above.
+    #[serde(default)]
+    pub anisotropy: Option<u32>,
     // Display-output / upscaling preferences. Unlike the quality knobs above,
     // these are independent of the master preset (a user choice, not a tier), and
     // each is restart-required: the swapchain format / render targets are sized
@@ -439,6 +445,7 @@ mod tests {
                 auto_exposure_speed: Some(2.0),
                 shadow_map_size: Some(4096),
                 shadow_update: Some(crate::assets::ShadowUpdate::EveryFrame),
+                anisotropy: Some(16),
                 temporal_upscaling: Some(true),
                 hdr_display: Some(true),
                 hdr_pq: Some(false),

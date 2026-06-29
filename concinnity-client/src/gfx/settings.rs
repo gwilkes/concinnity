@@ -9,8 +9,9 @@
 
 use crate::assets::{
     AaMode, ReflectionBlurResolution, SettingOp, ShadowUpdate, SsgiResolution, UpscaleQuality,
-    WindowMode,
+    UpscalerBackend, WindowMode,
 };
+use crate::gfx::backend::GpuVendor;
 
 // Ordered option labels for `vsync`: index 0 is off, index 1 is on.
 const VSYNC_OPTIONS: [&str; 2] = ["Off", "On"];
@@ -43,6 +44,12 @@ pub(crate) fn is_quality_toggle(key: &str) -> bool {
 pub(crate) fn setting_available(key: &str, caps: &crate::gfx::backend::DeviceCapabilities) -> bool {
     match key {
         "ray_traced_reflections" => caps.ray_tracing,
+        // The upscaler-backend selector (FSR3 / DLSS / XeSS) is honoured only by
+        // the DirectX and Vulkan backends; Metal always uses MetalFX, so the row
+        // grays out (clearly disabled) on a Metal build rather than offering a
+        // dead selection. `cfg!` resolves per backend at compile time, so this
+        // needs no per-backend capability flag and no Metal-side code.
+        "upscale_backend" => cfg!(not(backend_metal)),
         _ => true,
     }
 }
@@ -60,6 +67,13 @@ const WINDOW_MODE_OPTIONS: [&str; 3] = ["Windowed", "Borderless", "Fullscreen"];
 // Render-scale (upscaling quality) options, in cycle order. Indices map via
 // `render_scale_at` / `render_scale_index`.
 const RENDER_SCALE_OPTIONS: [&str; 4] = ["Quality", "Balanced", "Performance", "Ultra"];
+// Upscaler-backend options, in cycle order matching the UpscalerBackend enum
+// (Auto / FSR3 / DLSS / XeSS). Indices map via `upscale_backend_at` /
+// `upscale_backend_index`. DirectX / Vulkan only (Metal uses MetalFX); the cycle
+// skips vendor-locked entries the active GPU does not offer (see
+// `upscale_backend_available`), and the backend's `build_upscaler` still falls
+// back gracefully on an unavailable explicit choice. Restart-required.
+const UPSCALE_BACKEND_OPTIONS: [&str; 4] = ["Auto", "FSR 3", "DLSS", "XeSS"];
 
 // Frame-rate cap options (Video Display group), in cycle order. "Unlimited" is 0
 // (no cap); the rest are target FPS. A CPU-side frame pacer in the render loop
@@ -186,6 +200,7 @@ pub(crate) fn options(key: &str) -> Option<&'static [&'static str]> {
         "vsync" => Some(&VSYNC_OPTIONS),
         "window_mode" => Some(&WINDOW_MODE_OPTIONS),
         "render_scale" => Some(&RENDER_SCALE_OPTIONS),
+        "upscale_backend" => Some(&UPSCALE_BACKEND_OPTIONS),
         "fps_cap" => Some(&FPS_CAP_OPTIONS),
         "window_size" => Some(&WINDOW_SIZE_LABELS),
         "master_volume" => Some(&MASTER_VOLUME_OPTIONS),
@@ -251,6 +266,39 @@ pub(crate) fn render_scale_index(quality: UpscaleQuality) -> usize {
         UpscaleQuality::Balanced => 1,
         UpscaleQuality::Performance => 2,
         UpscaleQuality::UltraPerformance => 3,
+    }
+}
+
+// UpscalerBackend for an option index, and the index for a backend. Order matches
+// UPSCALE_BACKEND_OPTIONS (Auto / FSR3 / DLSS / XeSS).
+pub(crate) fn upscale_backend_at(index: usize) -> UpscalerBackend {
+    match index {
+        1 => UpscalerBackend::Fsr3,
+        2 => UpscalerBackend::Dlss,
+        3 => UpscalerBackend::Xess,
+        _ => UpscalerBackend::Auto,
+    }
+}
+pub(crate) fn upscale_backend_index(backend: UpscalerBackend) -> usize {
+    match backend {
+        UpscalerBackend::Auto => 0,
+        UpscalerBackend::Fsr3 => 1,
+        UpscalerBackend::Dlss => 2,
+        UpscalerBackend::Xess => 3,
+    }
+}
+
+// Whether an upscaler backend is offered on the given GPU vendor. Auto and FSR3
+// are vendor-agnostic; DLSS (NVIDIA NGX) is NVIDIA-only and XeSS is offered on
+// Intel. The settings-menu cycle skips the unavailable entries so the user only
+// lands on an upscaler the GPU can actually drive; the backend's `build_upscaler`
+// still resolves + falls back on its own, so an unavailable explicit value is
+// always safe even if it somehow gets set.
+pub(crate) fn upscale_backend_available(backend: UpscalerBackend, vendor: GpuVendor) -> bool {
+    match backend {
+        UpscalerBackend::Auto | UpscalerBackend::Fsr3 => true,
+        UpscalerBackend::Dlss => vendor == GpuVendor::Nvidia,
+        UpscalerBackend::Xess => vendor == GpuVendor::Intel,
     }
 }
 
@@ -1053,6 +1101,64 @@ mod tests {
         ] {
             assert_eq!(render_scale_at(render_scale_index(q)), q);
         }
+    }
+
+    #[test]
+    fn upscale_backend_round_trips_and_vendor_gates() {
+        // Every variant round-trips through its index, and the option table lines
+        // up with the four variants.
+        assert_eq!(UPSCALE_BACKEND_OPTIONS.len(), 4);
+        for b in [
+            UpscalerBackend::Auto,
+            UpscalerBackend::Fsr3,
+            UpscalerBackend::Dlss,
+            UpscalerBackend::Xess,
+        ] {
+            assert_eq!(upscale_backend_at(upscale_backend_index(b)), b);
+        }
+        // It is a cycle row, not a slider.
+        assert!(options("upscale_backend").is_some());
+        assert!(slider_range("upscale_backend").is_none());
+        // Auto / FSR3 are offered on every vendor; DLSS is NVIDIA-only and XeSS
+        // is Intel-only, so the menu cycle skips them elsewhere. Auto / FSR3 stay
+        // available even on an Unknown (Other) GPU, so the skip loop always
+        // terminates.
+        for vendor in [
+            GpuVendor::Apple,
+            GpuVendor::Nvidia,
+            GpuVendor::Amd,
+            GpuVendor::Intel,
+            GpuVendor::Other,
+        ] {
+            assert!(upscale_backend_available(UpscalerBackend::Auto, vendor));
+            assert!(upscale_backend_available(UpscalerBackend::Fsr3, vendor));
+        }
+        assert!(upscale_backend_available(
+            UpscalerBackend::Dlss,
+            GpuVendor::Nvidia
+        ));
+        assert!(!upscale_backend_available(
+            UpscalerBackend::Dlss,
+            GpuVendor::Amd
+        ));
+        assert!(upscale_backend_available(
+            UpscalerBackend::Xess,
+            GpuVendor::Intel
+        ));
+        assert!(!upscale_backend_available(
+            UpscalerBackend::Xess,
+            GpuVendor::Nvidia
+        ));
+        // The whole row is gated to DirectX / Vulkan (Metal uses MetalFX, no
+        // external selector), so `setting_available` grays it out on a Metal
+        // build regardless of device capabilities.
+        assert_eq!(
+            setting_available(
+                "upscale_backend",
+                &crate::gfx::backend::DeviceCapabilities::ALL
+            ),
+            cfg!(not(backend_metal))
+        );
     }
 
     #[test]

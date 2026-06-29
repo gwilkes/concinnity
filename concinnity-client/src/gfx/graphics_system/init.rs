@@ -481,6 +481,17 @@ impl GraphicsSystem {
         } else {
             1.0
         };
+        // Upscaler backend (Auto / FSR3 / DLSS / XeSS): the persisted choice wins,
+        // else the world's value. Restart-required (the upscaler is selected +
+        // built once at init); independent of the quality preset, so no ceiling
+        // clamp. Resolved here (ahead of the value-label sync) so the settings row
+        // shows the live value. DirectX / Vulkan honour it; Metal uses MetalFX.
+        self.upscale_backend = user_graphics.upscale_backend.unwrap_or_else(|| {
+            post_config
+                .as_ref()
+                .map(|c| c.upscale_backend)
+                .unwrap_or_default()
+        });
 
         // Set each settings value label to its live value before the first
         // render, so a persisted/authored choice shows instead of the build's
@@ -498,6 +509,9 @@ impl GraphicsSystem {
         // closure below does not borrow self while ctx is borrowed mutably).
         let (display_upscaling, display_hdr, display_pq) =
             (self.temporal_upscaling, self.hdr_display, self.hdr_pq);
+        // Upscaler-backend selection for the value-label sync (a copy, same
+        // reason as the display tuple above).
+        let upscale_backend_sel = self.upscale_backend;
         // Shadow knob states for the value-label sync (copies, same reason).
         let (shadow_size, shadow_update_val) = (self.shadow_map_size, self.shadow_update);
         let shadow_distance_val = self.shadow_distance;
@@ -528,6 +542,9 @@ impl GraphicsSystem {
             "window_mode" => Some(crate::gfx::settings::window_mode_index(mode)),
             "window_size" => Some(crate::gfx::settings::window_size_index(win_w, win_h)),
             "render_scale" => Some(crate::gfx::settings::render_scale_index(scale)),
+            "upscale_backend" => Some(crate::gfx::settings::upscale_backend_index(
+                upscale_backend_sel,
+            )),
             "master_volume" => Some(crate::gfx::settings::master_volume_index(master_volume)),
             // Display-output / upscaling toggles (Off/On), held on self.
             "temporal_upscaling" => Some(display_upscaling as usize),
@@ -579,13 +596,11 @@ impl GraphicsSystem {
         // Capture each ScrollPanel's per-element clip bands for the draw path,
         // before UiInputSystem drains the panels (init order: graphics first).
         self.init_clip_rects(ctx);
-        // Upscaler backend selector from `PostProcessConfig.upscale_backend`.
-        // Honoured by the DirectX and Vulkan backends (FSR3 / DLSS / XeSS);
-        // Metal always uses MetalFX, so it ignores the selector.
-        let upscale_backend = post_config
-            .as_ref()
-            .map(|c| c.upscale_backend)
-            .unwrap_or_default();
+        // Upscaler backend selector, resolved above (persisted choice over the
+        // world's `PostProcessConfig.upscale_backend`) and held on self for the
+        // settings row. Honoured by the DirectX and Vulkan backends (FSR3 / DLSS /
+        // XeSS); Metal always uses MetalFX, so it ignores the selector.
+        let upscale_backend = self.upscale_backend;
         // Infinite-world chunk streaming. The first declared VoxelWorld wins;
         // with none declared, no chunks stream. BlockTypes are drained here so
         // the runtime can resolve the VoxelWorld palette to chunk-mesh data.

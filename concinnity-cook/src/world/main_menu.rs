@@ -39,8 +39,13 @@ const VIDEO_ROWS: [(&str, &str); 4] = [
 // Rows tucked under the Video "Advanced" collapsible group (collapsed by
 // default), so the top of the Video tab stays uncrowded. More live
 // post-process sliders join these later. Cycle rows then slider rows.
-const VIDEO_ADVANCED_ROWS: [(&str, &str); 7] = [
+const VIDEO_ADVANCED_ROWS: [(&str, &str); 8] = [
     ("render_scale", "Render Scale"),
+    // Upscaler backend (Auto/FSR3/DLSS/XeSS). Restart-required, independent of the
+    // quality preset; DirectX / Vulkan only (Metal uses MetalFX, so the row is
+    // inert there). Sits next to render scale since it only matters with temporal
+    // upscaling on.
+    ("upscale_backend", "Upscaler"),
     // Display-output / upscaling preferences (Off/On + render-scale cycle).
     // Restart-required and independent of the quality preset.
     ("temporal_upscaling", "Temporal Upscaling"),
@@ -1191,6 +1196,7 @@ mod tests {
             ("window_mode", "Window Mode"),
             ("window_size", "Window Size"),
             ("render_scale", "Render Scale"),
+            ("upscale_backend", "Upscaler"),
         ] {
             let opt = by_name(&assets, &format!("m_settings_video_opt_{setting}"));
             assert_eq!(opt["type"], "OptionSelect");
@@ -1620,6 +1626,7 @@ mod tests {
         // The display-output / upscaling preference + system / streaming restart
         // rows also live in Advanced.
         for key in [
+            "opt_upscale_backend",
             "opt_temporal_upscaling",
             "opt_hdr_display",
             "opt_hdr_pq",

@@ -166,17 +166,26 @@ pub(super) fn build_texture_payload_source(
 
 // Probe the active GPU's coarse performance profile before the backend is built,
 // so the auto-config quality ceiling can influence the render targets / effect
-// pipelines the backend sizes at init. Metal creates the cheap default-device
-// handle and classifies it; DirectX / Vulkan return `UNKNOWN` for now (their
-// pre-backend adapter / instance enumeration is wired + GPU-verified on a Windows
-// host), which the resolver treats as "no ceiling" -- so auto-config is a no-op
-// there until that lands, never a wrong clamp.
+// pipelines the backend sizes at init. Each backend creates only the cheap
+// throwaway handle it needs and classifies it: Metal the default-device handle,
+// DirectX the DXGI adapter (no device / swapchain), Vulkan a surface-free
+// instance (destroyed immediately). The three `backend_*` cfgs are mutually
+// exclusive, so exactly one arm compiles; the fallback returns `UNKNOWN` (which
+// the resolver treats as "no ceiling") only when no backend is configured.
 pub(super) fn probe_gpu_profile() -> crate::gfx::backend::GpuProfile {
+    #[cfg(backend_dx)]
+    {
+        crate::directx::probe_gpu_profile()
+    }
+    #[cfg(backend_vk)]
+    {
+        crate::vulkan::probe_gpu_profile()
+    }
     #[cfg(backend_metal)]
     {
         crate::metal::probe_gpu_profile()
     }
-    #[cfg(not(backend_metal))]
+    #[cfg(not(any(backend_dx, backend_vk, backend_metal)))]
     {
         crate::gfx::backend::GpuProfile::UNKNOWN
     }

@@ -91,6 +91,11 @@ pub struct GraphicsSystem {
     // cycles + persists it; it is restart-required, so this is display/persist
     // state only (the upscaler is sized once at init).
     render_scale: crate::assets::UpscaleQuality,
+    // Current upscaler backend (Auto / FSR3 / DLSS / XeSS), seeded at init from
+    // the world's PostProcessConfig overridden by any persisted choice. Like
+    // render_scale this is restart-required display/persist state (the upscaler
+    // is selected + built once at init); DirectX / Vulkan only.
+    upscale_backend: crate::assets::UpscalerBackend,
     // The active render backend, constructed during init() and driven each
     // step. Boxed `dyn RenderBackend` so the per-frame logic in init.rs /
     // frame.rs / streaming.rs / scene.rs runs as one cfg-free path across
@@ -386,6 +391,7 @@ impl GraphicsSystem {
             cursor_pos: (0.0, 0.0),
             menu_mode: false,
             render_scale: crate::assets::UpscaleQuality::default(),
+            upscale_backend: crate::assets::UpscalerBackend::default(),
             backend: None,
             reel: None,
             scene_cmd_cursor: crate::ecs::EventCursor::default(),

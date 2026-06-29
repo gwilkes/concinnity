@@ -85,6 +85,12 @@ pub struct GraphicsSettings {
     // and render targets are sized once at init).
     #[serde(default)]
     pub render_scale: Option<crate::assets::UpscaleQuality>,
+    // Upscaler backend (`PostProcessConfig.upscale_backend`: Auto / FSR3 / DLSS /
+    // XeSS). `None` uses the world's value. Applied at next launch (the upscaler
+    // is selected + built once at init); DirectX / Vulkan only (Metal uses
+    // MetalFX). A user/hardware preference, independent of the quality preset.
+    #[serde(default)]
+    pub upscale_backend: Option<crate::assets::UpscalerBackend>,
     // Exposure offset in photographic stops. `None` uses the world's
     // `PostProcessConfig.exposure_ev`. Applied live (a pure post-process
     // uniform), and re-applied at init for a persisted choice.
@@ -445,6 +451,7 @@ mod tests {
                 vsync: Some(true),
                 fps_cap: Some(144),
                 window_size: Some([1920, 1080]),
+                upscale_backend: Some(crate::assets::UpscalerBackend::Xess),
                 exposure_ev: Some(-1.5),
                 bloom_intensity: Some(0.8),
                 bloom_threshold: Some(1.2),

@@ -1820,6 +1820,58 @@ impl DxContext {
         }
     }
 
+    // Set the live shadow cascade re-render cadence. The per-frame cascade split
+    // reads `shadow.update` at the start of each draw (see draw_frame), so a
+    // change takes effect on the next frame with no rebuild or allocation.
+    pub fn set_shadow_update(&mut self, update: crate::assets::ShadowUpdate) {
+        self.shadow.update = update;
+    }
+
+    // Set the live shadow distance (world units). The per-frame cascade-split
+    // computation reads `shadow.distance` each draw (capped at the camera far
+    // plane), so a change takes effect on the next frame with no allocation (it
+    // sizes no GPU resource).
+    pub fn set_shadow_distance(&mut self, distance: u32) {
+        self.shadow.distance = distance;
+    }
+
+    // Set the live shadow cascade count (1..=4). The per-frame split + schedule
+    // read `shadow.cascades` each draw; only the first `count` of the four slots
+    // are rendered + sampled, so a change takes effect on the next frame with no
+    // resize (the shadow-map array stays sized for the 4-cascade capacity).
+    pub fn set_shadow_cascades(&mut self, count: u32) {
+        self.shadow.cascades = count;
+    }
+
+    // Update the live scalar sub-tunables of the SSAO / SSR / SSGI / auto-exposure
+    // passes without rebuilding anything. Each pass rebuilds its per-frame uniform
+    // from these stored `*Settings` every draw (`settings.params(...)`), so
+    // mutating the stored struct here is picked up on the next frame. Only a
+    // feature whose resources are currently live has settings to mutate; the rest
+    // are skipped (the value still persists for the next launch). SSAO / SSR /
+    // auto-exposure are fully scalar, so they are replaced wholesale; SSGI keeps
+    // its gather resolution / ray / step counts (those size the gather target or
+    // ride `apply_quality_settings`), so only its scalar intensity / distance are
+    // updated. The SSR settings live one level deeper than Metal's (inside the
+    // optional `resolve` half), so a SSGI-only build with no resolve is skipped.
+    pub fn update_quality_params(&mut self, q: crate::gfx::backend::QualitySettings) {
+        if let (Some(live), Some(res)) = (q.ssao, self.ssao.resources.as_mut()) {
+            res.settings = live;
+        }
+        if let (Some(live), Some(res)) = (q.ssr, self.ssr.as_mut())
+            && let Some(r) = res.resolve.as_mut()
+        {
+            r.settings = live;
+        }
+        if let (Some(live), Some(res)) = (q.ssgi, self.ssgi.as_mut()) {
+            res.settings.intensity = live.intensity;
+            res.settings.max_distance = live.max_distance;
+        }
+        if let (Some(live), Some(cur)) = (q.auto_exposure, self.auto_exposure.settings.as_mut()) {
+            *cur = live;
+        }
+    }
+
     // Replace the runtime movement key map. The window message loop decodes
     // key events through it, so a settings-menu rebind takes effect immediately.
     pub fn set_keymap(&mut self, keymap: &crate::gfx::keymap::KeyMap) {

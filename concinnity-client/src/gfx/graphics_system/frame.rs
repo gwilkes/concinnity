@@ -993,6 +993,29 @@ impl GraphicsSystem {
                             );
                             Some(opts[next])
                         }
+                        "upscale_backend" => {
+                            // Restart-required: persist + display only; the
+                            // upscaler is selected + built once at init. Independent
+                            // of the quality preset (a user / hardware preference,
+                            // not a tier), so no Custom-flip and no live backend
+                            // call. The cycle skips upscalers this GPU vendor does
+                            // not offer (DLSS NVIDIA-only, XeSS Intel-only); Auto /
+                            // FSR3 are always available, so the loop terminates.
+                            let mut next = settings::cycle(
+                                settings::upscale_backend_index(self.upscale_backend),
+                                opts.len(),
+                                cmd.op,
+                            );
+                            while !settings::upscale_backend_available(
+                                settings::upscale_backend_at(next),
+                                self.gpu_profile.vendor,
+                            ) {
+                                next = settings::cycle(next, opts.len(), cmd.op);
+                            }
+                            self.upscale_backend = settings::upscale_backend_at(next);
+                            cfg.graphics.upscale_backend = Some(self.upscale_backend);
+                            Some(opts[next])
+                        }
                         "master_volume" => {
                             // Live: cycle the gain, persist it, and hand it to
                             // AudioSystem (which owns the audio engine) as an

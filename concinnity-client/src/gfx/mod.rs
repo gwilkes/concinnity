@@ -74,11 +74,13 @@ pub(crate) mod reflection_probe;
 // Backend-agnostic render graph: types + builder + compile pass with
 // unit tests. Per-backend executors live alongside each backend.
 pub(crate) mod quality_preset;
-// Cross-backend render-graph types: the DirectX / Vulkan barrier + resource-
-// aliasing paths consume the full set, but a Metal-only build compiles those out,
-// leaving a subset unused. Allow dead code on Metal so the build stays clean; the
-// lint stays active on DX / Vulkan, which exercise every item.
-#[cfg_attr(backend_metal, allow(dead_code))]
+// Cross-backend render-graph types + builder + compile/alias passes (the
+// graphs-and-dags effort). Each backend's barrier + resource-aliasing path
+// consumes only a subset today, so a portion stays unused on any given build
+// while the graph is still being wired in. Allow dead code module-wide so the
+// build stays clean on all three backends; drop this once every backend's
+// barrier + aliasing path consumes the full set.
+#[allow(dead_code)]
 pub(crate) mod render_graph;
 pub mod scene_reel;
 pub(crate) mod settings;

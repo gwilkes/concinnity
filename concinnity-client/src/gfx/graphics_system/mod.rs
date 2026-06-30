@@ -58,6 +58,11 @@ pub struct GraphicsSystem {
     // running target for the next frame's start.
     fps_cap: u32,
     next_frame_deadline: Option<Instant>,
+    // Whether a menu view was open last frame. The pacer runs before this
+    // frame's menu state is known, so it reads the previous frame's value to
+    // clamp the frame rate down to `MENU_FPS_CAP` while a menu is up (no need
+    // to render a paused menu at full speed). One frame of lag is invisible.
+    menu_active_prev: bool,
     max_frames: Option<u64>,
     shadow_map_size: u32,
     shadow_update: crate::assets::ShadowUpdate,
@@ -379,6 +384,7 @@ impl GraphicsSystem {
             vsync: false,
             fps_cap: 0,
             next_frame_deadline: None,
+            menu_active_prev: false,
             max_frames: None,
             shadow_map_size: 2048,
             shadow_update: crate::assets::ShadowUpdate::default(),

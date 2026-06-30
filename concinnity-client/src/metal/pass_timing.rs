@@ -65,6 +65,13 @@ pub struct PassTimingResources {
     // Rotates 0..FRAMES_IN_FLIGHT each frame. The active index picks which
     // buffer the next `attach_*` call binds to.
     frame_slot: usize,
+    // Bitmask (1 << PassId index) of the passes attached this frame, cleared by
+    // `begin_frame` and set by each `attach_*`. The sample buffer is reused
+    // across frames and never cleared, so a pass that ran a few frames ago but
+    // is absent this frame leaves stale timestamps in its slot; the resolve
+    // zeroes any pass whose bit is clear so the profiler reports 0 for a pass
+    // that did not actually run (e.g. every world pass behind an opaque menu).
+    attached: std::sync::atomic::AtomicU64,
 }
 
 impl PassTimingResources {
@@ -106,6 +113,7 @@ impl PassTimingResources {
         Some(Self {
             buffers: [b0, b1, b2],
             frame_slot: 0,
+            attached: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -122,7 +130,26 @@ impl PassTimingResources {
     pub fn begin_frame(&mut self) -> usize {
         let slot = self.frame_slot;
         self.frame_slot = (self.frame_slot + 1) % FRAMES_IN_FLIGHT;
+        // Reset the per-frame attached mask; the passes that run this frame set
+        // their bits via `attach_*`, and the resolve zeroes the rest.
+        self.attached.store(0, std::sync::atomic::Ordering::Relaxed);
         slot
+    }
+
+    // Bitmask of the passes attached since the last `begin_frame`. Captured
+    // after the frame's passes are encoded and handed to the completion handler
+    // so it can zero the stale slots of passes that did not run.
+    pub fn attached_mask(&self) -> u64 {
+        self.attached.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    // Record that `pass` was attached this frame (its slot holds fresh
+    // timestamps). `pass as usize < PASS_COUNT <= 64`, so the shift is in range.
+    fn mark_attached(&self, pass: PassId) {
+        self.attached.fetch_or(
+            1u64 << (pass as usize),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     // Buffer handle for an already-issued frame's completion handler.
@@ -135,6 +162,7 @@ impl PassTimingResources {
 
     // Attach a single-encoder render pass to its start + end slot pair.
     pub fn attach_render(&self, desc: &MTLRenderPassDescriptor, pass: PassId) {
+        self.mark_attached(pass);
         let (start, end) = slot_pair(pass);
         // SAFETY: All Metal sample-buffer accessors are marked unsafe by
         // objc2-metal because they take `*mut self`-equivalent ObjC arrays.
@@ -158,6 +186,7 @@ impl PassTimingResources {
     // cascade 0, bloom prefilter). Writes only the start sample; the end
     // sample is written by [`attach_render_last`].
     pub fn attach_render_first(&self, desc: &MTLRenderPassDescriptor, pass: PassId) {
+        self.mark_attached(pass);
         let (start, _) = slot_pair(pass);
         // SAFETY: see `attach_render`.
         unsafe {
@@ -191,6 +220,7 @@ impl PassTimingResources {
     // Mirrors [`attach_render`] for `MTLComputePassDescriptor`.
     #[allow(dead_code)] // Wiring lands incrementally.
     pub fn attach_compute(&self, desc: &MTLComputePassDescriptor, pass: PassId) {
+        self.mark_attached(pass);
         let (start, end) = slot_pair(pass);
         // SAFETY: see `attach_render`.
         unsafe {

@@ -276,7 +276,10 @@ pub trait RenderBackend: SceneControl + Send {
     fn take_input(&mut self) -> RenderInput;
     fn wait_idle(&self);
 
-    // Per-frame drive.
+    // Per-frame drive. `world_hidden` is set when an opaque menu backdrop
+    // covers the scene: the backend skips every world pass and presents only
+    // the overlay (`text_calls`) over a cleared target.
+    #[allow(clippy::too_many_arguments)]
     fn draw_frame(
         &mut self,
         elapsed: f32,
@@ -285,6 +288,7 @@ pub trait RenderBackend: SceneControl + Send {
         far: f32,
         cam_pos: [f32; 3],
         text_calls: &[TextDrawCall],
+        world_hidden: bool,
     ) -> Result<(), String>;
     fn update_view(&mut self, matrix: [[f32; 4]; 4]);
     fn update_model(&mut self, index: usize, model: [[f32; 4]; 4]);

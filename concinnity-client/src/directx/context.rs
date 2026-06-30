@@ -1101,6 +1101,7 @@ pub(super) fn debug_assert_main_thread(entry: &str) {
 }
 
 impl DxContext {
+    #[allow(clippy::too_many_arguments)]
     pub fn draw_frame(
         &mut self,
         elapsed: f32,
@@ -1109,6 +1110,7 @@ impl DxContext {
         far: f32,
         cam_pos: [f32; 3],
         text_calls: &[TextDrawCall],
+        world_hidden: bool,
     ) -> Result<(), String> {
         // Shader hot-reload: if either the filesystem watcher or the debug
         // `reload-shaders` command set the flag, rebuild every built-in PSO
@@ -1451,6 +1453,7 @@ impl DxContext {
             self.render_height.max(1),
             self.output_width.max(1),
             self.output_height.max(1),
+            world_hidden,
         )?;
 
         // Drain the parallel-encoder draw-call accumulator into this

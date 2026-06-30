@@ -193,6 +193,7 @@ mod tests {
         ssgi_enabled: false,
         rt_reflections_enabled: false,
         unified_gbuffer_prepass: false,
+        world_hidden: false,
     };
 
     // A transient texture desc of the given format at full drawable size.

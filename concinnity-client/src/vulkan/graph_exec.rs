@@ -179,6 +179,10 @@ pub(in crate::vulkan) struct GraphFrameParams<'a> {
     pub image_index: u32,
     pub frame_idx: usize,
     pub text_calls: &'a [TextDrawCall],
+    // An opaque menu backdrop hides the scene: the Main pass clears its target
+    // and skips every draw (the masked graph drops all other world passes), so
+    // nothing of the world renders behind the menu.
+    pub world_hidden: bool,
     // CPU visibility list (BVH-culled cullables + always_draw fallback).
     // Consumed by Main's legacy + instanced fallback passes and the
     // unified G-buffer pre-pass.
@@ -385,6 +389,28 @@ impl VkContext {
                         ts_start,
                     );
                 }
+            }
+            // When the world is hidden behind an opaque menu the masked graph
+            // drops the Bloom pass, so the pooled `bloom_top` (mip 0) the
+            // Composite still samples (binding 1) is never produced and stays in
+            // UNDEFINED layout (the bloom prefilter normally re-establishes it
+            // from UNDEFINED each frame). Transition it to
+            // SHADER_READ_ONLY_OPTIMAL so the Composite's sample is valid; its
+            // contents are irrelevant, the opaque overlay covers the frame. Only
+            // the borrowed pooled mip 0 (null memory) needs this: a committed
+            // mip 0 (bloom off) is pre-transitioned at init.
+            if params.world_hidden
+                && let Some(mip0) = self.bloom_mips.get(frame_idx).and_then(|m| m.first())
+                && mip0.memory == vk::DeviceMemory::null()
+            {
+                super::texture::transition_image_layout(
+                    &self.device,
+                    params.cmd,
+                    mip0.image,
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    vk::ImageAspectFlags::COLOR,
+                );
             }
             self.encode_pass_into(
                 PassId::Composite,
@@ -607,6 +633,7 @@ impl VkContext {
                     params.visible,
                     params.frustum,
                     params.cam_pos,
+                    params.world_hidden,
                 );
             }
             PassId::Composite => {

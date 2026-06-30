@@ -1343,6 +1343,7 @@ pub(super) fn debug_assert_main_thread(entry: &str) {
 //  Public API
 
 impl VkContext {
+    #[allow(clippy::too_many_arguments)]
     pub fn draw_frame(
         &mut self,
         elapsed: f32,
@@ -1351,6 +1352,7 @@ impl VkContext {
         far: f32,
         cam_pos: [f32; 3],
         text_calls: &[TextDrawCall],
+        world_hidden: bool,
     ) -> Result<(), String> {
         // Shader hot-reload: if either the filesystem watcher or the debug
         // `reload-shaders` command set the flag, rebuild every built-in
@@ -1574,6 +1576,7 @@ impl VkContext {
             cam_pos,
             text_calls,
             frame,
+            world_hidden,
         )?;
 
         unsafe { device.end_command_buffer(cmd) }.map_err(|e| format!("end cmd buf: {e}"))?;

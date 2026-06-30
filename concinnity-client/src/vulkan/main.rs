@@ -116,10 +116,37 @@ impl VkContext {
         visible: &[u32],
         frustum: &Frustum,
         cam_pos: [f32; 3],
+        world_hidden: bool,
     ) {
         let device = self.device.clone();
         let device = &device;
         let extent = self.render_extent;
+
+        // Opaque menu backdrop, MSAA path: skip the main render pass entirely.
+        // Beginning it would clear the MSAA colour+depth and, on
+        // `end_render_pass`, resolve the (undrawn) MSAA colour into hdr_resolve:
+        // a full-render-resolution resolve of a frame nothing presents (the
+        // composite samples the post-stack scene + the opaque overlay on top).
+        // On an immediate-mode GPU that resolve is the bulk of the paused
+        // frame's GPU cost. Skipping it drops the main pass to a lone layout
+        // barrier (~0us, so it falls off the passes HUD like Metal / DirectX),
+        // and the barrier leaves hdr_resolve sampled-ready for the plain-world
+        // composite path (no TAA / reflections sample it directly). Its
+        // contents are irrelevant under the opaque overlay, matching the
+        // DirectX paused path (which likewise skips the resolve). The
+        // single-sample path below has no resolve to skip (hdr_resolve is the
+        // colour attachment), so it keeps its cheap clear-only render pass.
+        if world_hidden && self.msaa_samples != vk::SampleCountFlags::TYPE_1 {
+            super::texture::transition_image_layout(
+                device,
+                cmd,
+                self.hdr_resolve_images[frame_idx].image,
+                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::ImageAspectFlags::COLOR,
+            );
+            return;
+        }
 
         // Clears for the main HDR attachments. With MSAA on, the
         // resolve attachment doesn't need a clear (resolve overwrites);
@@ -166,6 +193,16 @@ impl VkContext {
             .clear_values(clears);
 
         unsafe { device.cmd_begin_render_pass(cmd, &rp_begin, vk::SubpassContents::INLINE) };
+
+        // Opaque menu backdrop, single-sample path: the render pass above
+        // already cleared hdr_resolve (the colour attachment) and there is no
+        // resolve to skip, so just end immediately; nothing of the world draws
+        // behind the menu. (The MSAA path returned earlier without beginning a
+        // render pass at all.)
+        if world_hidden {
+            unsafe { device.cmd_end_render_pass(cmd) };
+            return;
+        }
 
         // Viewport: negative height flips Y to match Metal coordinate system.
         let vp = vk::Viewport {

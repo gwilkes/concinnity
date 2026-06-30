@@ -653,6 +653,7 @@ fn reload_shader_stages_on_empty_map_is_a_no_op() {
             _: f32,
             _: [f32; 3],
             _: &[crate::gfx::render_types::TextDrawCall],
+            _: bool,
         ) -> Result<(), String> {
             Ok(())
         }

@@ -20,6 +20,11 @@ use super::*;
 // reads as unavailable next to the live rows.
 const DISABLED_ROW_COLOR: [f32; 3] = [0.42, 0.42, 0.47];
 
+// Frame-rate ceiling while a menu view is open. A paused menu does not benefit
+// from a high refresh rate, and the world render is skipped behind an opaque
+// menu anyway, so the pacer holds the loop at this rate (clamping down only).
+const MENU_FPS_CAP: u32 = 60;
+
 // The full set of label ids to gray for a set of capability-gated rows: the
 // gated value labels themselves (the fallback when a row is not in a scroll
 // panel), plus every element of any scroll row that contains one of them, so a
@@ -166,8 +171,20 @@ impl GraphicsSystem {
         // interval. Coarse-sleep to ~1ms before the deadline, then spin for
         // sub-millisecond precision. `0` = unlimited (skip, and clear the running
         // deadline so re-enabling starts fresh).
-        if self.fps_cap > 0 {
-            let target = Duration::from_secs_f64(1.0 / self.fps_cap as f64);
+        // While a menu view is open (from last frame -- the live state is not
+        // resolved until the draw list is built below, and one frame of lag is
+        // imperceptible), clamp the cap down to `MENU_FPS_CAP`. Clamp down only:
+        // a user cap already below it is left untouched.
+        let effective_cap = if self.menu_active_prev {
+            match self.fps_cap {
+                0 => MENU_FPS_CAP,
+                cap => cap.min(MENU_FPS_CAP),
+            }
+        } else {
+            self.fps_cap
+        };
+        if effective_cap > 0 {
+            let target = Duration::from_secs_f64(1.0 / effective_cap as f64);
             let (wait_until, next) =
                 pace_deadline(Instant::now(), self.next_frame_deadline, target);
             while let Some(remaining) = wait_until.checked_duration_since(Instant::now()) {
@@ -220,8 +237,9 @@ impl GraphicsSystem {
         // `follow_cursor` sprites are emitted last so the cursor sits on top of
         // everything. `want_ui_cursor` is true when a cursor sprite is shown,
         // so the backend can hide the system cursor under it.
-        let (text_calls, want_ui_cursor, menu_active): (
+        let (text_calls, want_ui_cursor, menu_active, world_hidden): (
             Vec<crate::gfx::render_types::TextDrawCall>,
+            bool,
             bool,
             bool,
         ) = {
@@ -264,8 +282,24 @@ impl GraphicsSystem {
             let menu_active = labels.iter().any(|l| l.visible && l.view.is_some())
                 || scene_sprites.iter().any(|s| s.visible && s.view.is_some())
                 || cursor_sprites.iter().any(|s| s.visible && s.view.is_some());
-            (calls, want_cursor, menu_active)
+            // The whole world render can be skipped when an opaque full-canvas
+            // backdrop covers the scene (a menu authored with its dim alpha at
+            // 1.0): nothing of the scene is visible, so every world pass is
+            // wasted. A translucent dim keeps the world faintly visible and so
+            // does not qualify.
+            let world_hidden = menu_active
+                && scene_sprites
+                    .iter()
+                    .any(|s| s.visible && s.tint[3] >= 1.0 && gfx_sprite::covers_canvas(s));
+            (calls, want_cursor, menu_active, world_hidden)
         };
+        // The pacer (above, next frame) clamps the frame rate while a menu is
+        // open; record this frame's state for it to read.
+        self.menu_active_prev = menu_active;
+        // Publish the menu state for the simulation systems, which run after
+        // GraphicsSystem this same tick: physics + animation freeze while it is
+        // set, so a paused world stops consuming CPU/GPU behind the menu.
+        ctx.insert_resource(crate::ecs::MenuActive(menu_active));
 
         let backend = match self.backend.as_deref_mut() {
             Some(b) => b,
@@ -305,10 +339,13 @@ impl GraphicsSystem {
                 // despawn the entities whose countdown reached zero, through the
                 // same cascade a DespawnRequest uses. This is the churn that
                 // returns draw slots to the free list for the spawn drain below
-                // to recycle.
-                let expired = super::spawn::tick_lifetimes(ctx, dt);
-                for entity in expired {
-                    super::despawn::despawn_subtree(ctx, backend, entity);
+                // to recycle. Frozen while a menu is open so the world clock
+                // (timed despawns + cadence spawns below) truly pauses.
+                if !menu_active {
+                    let expired = super::spawn::tick_lifetimes(ctx, dt);
+                    for entity in expired {
+                        super::despawn::despawn_subtree(ctx, backend, entity);
+                    }
                 }
 
                 // Runtime entity despawn: drain DespawnRequest events, resolve
@@ -424,8 +461,14 @@ impl GraphicsSystem {
                 // instantiate the copies now due, at the spawner's position.
                 // Transient (unnamed) and Lifetime-bounded, so a steady spawner
                 // churns through recycled draw slots. After the SpawnRequest
-                // drain so both spawn paths reuse slots freed this frame.
-                let due_spawns = super::spawn::tick_spawners(ctx, dt);
+                // drain so both spawn paths reuse slots freed this frame. Frozen
+                // while a menu is open so spawner clocks do not advance behind
+                // the pause.
+                let due_spawns = if menu_active {
+                    Vec::new()
+                } else {
+                    super::spawn::tick_spawners(ctx, dt)
+                };
                 if !due_spawns.is_empty() {
                     let by_name = ctx
                         .resource::<crate::ecs::decompose::EntityByName>()
@@ -474,17 +517,22 @@ impl GraphicsSystem {
                 // Push the latest skinned poses to the GPU. AnimationSystem
                 // wrote them into the SkeletonPose components on the previous
                 // tick; the one-frame lag is invisible at animation rates.
-                for pose in ctx.query::<crate::assets::SkeletonPose>() {
-                    backend.update_skinned_pose(pose.skinned_index, &pose.joint_matrices);
-                }
-                // Push the model matrix for skinned instances that carry a
-                // Transform (the runtime-spawned ones), so a moved instance
-                // follows it. The authored templates have no Transform and keep
-                // the model baked into their draw object at load.
-                for (_entity, pose, transform) in
-                    ctx.join2::<crate::assets::SkeletonPose, crate::assets::Transform>()
-                {
-                    backend.update_skinned_model(pose.skinned_index, transform.model_matrix());
+                // Skipped while a menu is open: animation is frozen, so the
+                // poses are unchanged and the last upload still stands (the
+                // skinned draw is skipped behind an opaque menu anyway).
+                if !menu_active {
+                    for pose in ctx.query::<crate::assets::SkeletonPose>() {
+                        backend.update_skinned_pose(pose.skinned_index, &pose.joint_matrices);
+                    }
+                    // Push the model matrix for skinned instances that carry a
+                    // Transform (the runtime-spawned ones), so a moved instance
+                    // follows it. The authored templates have no Transform and keep
+                    // the model baked into their draw object at load.
+                    for (_entity, pose, transform) in
+                        ctx.join2::<crate::assets::SkeletonPose, crate::assets::Transform>()
+                    {
+                        backend.update_skinned_model(pose.skinned_index, transform.model_matrix());
+                    }
                 }
 
                 // apply any imperative scene jumps sent by UiInputSystem this
@@ -1331,7 +1379,7 @@ impl GraphicsSystem {
                 // Each backend's update_texture_slot rewrites whichever
                 // descriptors / argument-buffers sample that slot so it
                 // takes effect on this same draw_frame.
-                if let Some(streamer) = &mut self.texture_streamer {
+                if !world_hidden && let Some(streamer) = &mut self.texture_streamer {
                     streamer.update_scores(cam_pos, self.frame_count);
                     for slot in streamer.plan_and_dispatch() {
                         if let Err(e) = backend.evict_texture_slot(slot) {
@@ -1359,7 +1407,7 @@ impl GraphicsSystem {
                 // Drive normal-map streaming: identical to the albedo path
                 // above, but streamed item `i` maps to normal-map pool slot
                 // `i + 1` (slot 0 is the flat-normal fallback).
-                if let Some(streamer) = &mut self.normal_map_streamer {
+                if !world_hidden && let Some(streamer) = &mut self.normal_map_streamer {
                     streamer.update_scores(cam_pos, self.frame_count);
                     for item in streamer.plan_and_dispatch() {
                         if let Err(e) = backend.evict_normal_map_slot(item + 1) {
@@ -1394,7 +1442,7 @@ impl GraphicsSystem {
                 // by camera distance, dispatch this frame's background loads,
                 // then apply completed geometry uploads + evictions. A mesh is
                 // skipped in every pass until its geometry region is resident.
-                if let Some(streamer) = &mut self.mesh_streamer {
+                if !world_hidden && let Some(streamer) = &mut self.mesh_streamer {
                     streamer.update_scores(cam_pos, self.frame_count);
                     // A runtime eviction's freed space must not be reused
                     // until the in-flight command buffers that drew it retire.
@@ -1530,6 +1578,7 @@ impl GraphicsSystem {
                     far,
                     final_cam_pos,
                     &text_calls,
+                    world_hidden,
                 ) {
                     Ok(()) => {}
                     Err(e) => {

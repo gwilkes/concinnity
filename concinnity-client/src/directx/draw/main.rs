@@ -200,6 +200,7 @@ impl DxContext {
         frustum: &crate::gfx::frustum::Frustum,
         cam_pos: [f32; 3],
         visible: &[u32],
+        world_hidden: bool,
     ) {
         let depth_dsv = self.depth_dsv;
 
@@ -224,6 +225,14 @@ impl DxContext {
                 bottom: height as i32,
             };
             cmd.RSSetScissorRects(&[scissor]);
+        }
+
+        // Opaque menu backdrop: the render target was just cleared; skip every
+        // draw so nothing of the world renders behind the menu (the bindless
+        // ExecuteIndirect below would otherwise consume a stale indirect-command
+        // buffer, since the per-frame rebuild + cull were skipped this frame).
+        if world_hidden {
+            return;
         }
 
         // Pipeline-independent main-pass state: topology, geometry buffers,

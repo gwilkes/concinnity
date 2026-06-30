@@ -11,6 +11,18 @@ use crate::assets::Sprite;
 use crate::gfx::render_types::{TextDrawCall, TextVertex};
 use concinnity_core::gfx::overlay::{OverlayTransform, UI_REFERENCE_SIZE};
 
+// A view-owned sprite that spans the whole reference canvas is a full-screen
+// backdrop (e.g. a menu dim): it is stretched to fill the live window rather
+// than uniform-scaled, and an opaque one hides the scene behind it.
+pub(crate) fn covers_canvas(s: &Sprite) -> bool {
+    let [ref_w, ref_h] = UI_REFERENCE_SIZE;
+    s.view.is_some()
+        && s.x <= 0.0
+        && s.y <= 0.0
+        && s.x + s.width >= ref_w
+        && s.y + s.height >= ref_h
+}
+
 // Build a TextDrawCall per visible Sprite. `default_atlas_slot` is the atlas
 // the call binds (the shader does not sample for sentinel-UV verts, but the
 // backend still expects a valid slot). Pass the slot of any loaded font;
@@ -30,7 +42,6 @@ pub(crate) fn build_sprite_calls(
         None => return Vec::new(),
     };
     let overlay = OverlayTransform::from_viewport(viewport);
-    let [ref_w, ref_h] = UI_REFERENCE_SIZE;
     let [vw, vh] = viewport;
     let mut calls = Vec::new();
     for s in sprites {
@@ -45,9 +56,7 @@ pub(crate) fn build_sprite_calls(
             // A view-owned sprite spanning the whole reference canvas is a
             // full-screen backdrop (e.g. a menu dim): always fill the live
             // window instead of uniform-scaling, which would letterbox it.
-            let covers_canvas =
-                s.x <= 0.0 && s.y <= 0.0 && s.x + s.width >= ref_w && s.y + s.height >= ref_h;
-            if covers_canvas && vw > 0.0 && vh > 0.0 {
+            if covers_canvas(s) && vw > 0.0 && vh > 0.0 {
                 (0.0, 0.0, vw, vh)
             } else {
                 let (ax, ay) = overlay.forward(s.x, s.y);

@@ -71,6 +71,7 @@ impl MtlContext {
         object_buffer: Option<&Retained<ProtocolObject<dyn MTLBuffer>>>,
         bindless_tex_args: Option<&Retained<ProtocolObject<dyn MTLBuffer>>>,
         deformed_skinned: Option<&Retained<ProtocolObject<dyn MTLBuffer>>>,
+        world_hidden: bool,
     ) -> Result<u32, String> {
         // Build the HDR render pass descriptor. Colour writes into the MSAA
         // attachment and resolves into the single-sample target at end-of-pass;
@@ -148,6 +149,14 @@ impl MtlContext {
             prefilter_mip_count: self.env_map.prefilter_mip_count as f32,
             _end_pad: [0.0; 2],
         };
+
+        // While the world is hidden behind an opaque menu, the pass stops at the
+        // descriptor's Clear load action: skip every geometry sub-path so even a
+        // non-bindless skinned world (whose draw does not consult the now-empty
+        // visible / instance / object inputs) renders nothing behind the menu.
+        if world_hidden {
+            return Ok(0);
+        }
 
         let count_static = self.encode_main_static_into(
             &encoder,

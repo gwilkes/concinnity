@@ -393,6 +393,18 @@ impl System for PhysicsSystem {
             .unwrap_or(0.0);
         self.last_step = Some(now);
 
+        // Freeze while a menu is open: skip the solve so the world truly pauses.
+        // `last_step` is advanced above regardless, so the next live frame sees
+        // one normal interval rather than the whole paused span -- no catch-up
+        // burst on resume. The flag is published by GraphicsSystem, which runs
+        // first in the schedule, so it reflects this same tick.
+        if ctx
+            .resource::<crate::ecs::MenuActive>()
+            .is_some_and(|m| m.0)
+        {
+            return StepResult::Continue;
+        }
+
         if self.world.is_none() || dt <= 0.0 {
             return StepResult::Continue;
         }
@@ -881,6 +893,45 @@ mod tests {
             world.query::<Prop>().count(),
             0,
             "the Prop column is drained at load"
+        );
+    }
+
+    // A menu freezes the solve: while `MenuActive(true)` is published the body
+    // does not fall, and clearing it resumes the fall from where it froze. This
+    // is the "true pause" the menu relies on; `last_step` advancing under the
+    // freeze keeps the resume to one normal interval (no catch-up burst).
+    #[test]
+    fn menu_active_freezes_then_resumes_physics() {
+        use std::{thread, time::Duration};
+        let id = AssetId(1);
+        let mut world = World::new_empty();
+        world.add_component(PhysicsConfig::default());
+        world.add_component(ball_prop(id, [0.0, 5.0, 0.0], false));
+        world.add_component(ball_body(id));
+        world.start().unwrap();
+
+        // Paused: step several frames with real wall-clock dt; the body stays put.
+        world.insert_resource(crate::ecs::MenuActive(true));
+        for _ in 0..5 {
+            thread::sleep(Duration::from_millis(20));
+            world.step();
+        }
+        let y_paused = world.query::<Transform>().next().unwrap().position[1];
+        assert!(
+            (y_paused - 5.0).abs() < 1e-3,
+            "the body must not fall while a menu is active (y={y_paused})"
+        );
+
+        // Resumed: the body falls again.
+        world.insert_resource(crate::ecs::MenuActive(false));
+        for _ in 0..3 {
+            thread::sleep(Duration::from_millis(20));
+            world.step();
+        }
+        let y_resumed = world.query::<Transform>().next().unwrap().position[1];
+        assert!(
+            y_resumed < y_paused - 1e-3,
+            "the body must fall once the menu closes (y={y_resumed})"
         );
     }
 

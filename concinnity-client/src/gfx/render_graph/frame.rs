@@ -200,6 +200,13 @@ pub struct FrameGraphInputs {
     // separate `SsrPrepass` + `Velocity` nodes. Metal only today; the other
     // backends keep this false and emit their separate prepasses.
     pub unified_gbuffer_prepass: bool,
+    // `true` when an opaque full-screen menu backdrop covers the scene, so
+    // nothing the world passes produce is visible. The builder masks every
+    // gated world pass off and collapses the graph to `Main -> Composite`
+    // (Composite still presents the menu overlay). The backend pairs this with
+    // an empty visible set so the surviving Main pass is a bare clear; the
+    // opaque overlay then covers it.
+    pub world_hidden: bool,
 }
 
 impl FrameGraphInputs {
@@ -232,6 +239,7 @@ impl FrameGraphInputs {
             ssgi_enabled: false,
             rt_reflections_enabled: false,
             unified_gbuffer_prepass: false,
+            world_hidden: false,
         }
     }
 }
@@ -267,6 +275,38 @@ impl FrameGraphInputs {
 // hdr_color / hdr_depth / hdr_resolve → v2, and that v2 (not v1)
 // becomes the head AutoExposure reads and the RMW chain extends.
 pub fn build_frame_graph(inputs: &FrameGraphInputs) -> Result<CompiledGraph, GraphError> {
+    // When an opaque menu backdrop hides the scene, every world pass is wasted:
+    // nothing it produces is visible. Force every gated world pass off so the
+    // graph collapses to the minimal `Main -> Composite` (Composite still
+    // presents the overlay). Main survives as a bare clear because the backend
+    // feeds it an empty visible set this frame; the opaque overlay covers it.
+    let masked = if inputs.world_hidden {
+        Some(FrameGraphInputs {
+            shadow_enabled: false,
+            bindless_cull_enabled: false,
+            auto_exposure_enabled: false,
+            bloom_enabled: false,
+            velocity_enabled: false,
+            taa_enabled: false,
+            ssr_enabled: false,
+            particles_enabled: false,
+            fog_enabled: false,
+            decals_enabled: false,
+            ssr_prepass_enabled: false,
+            ssao_enabled: false,
+            upscale_enabled: false,
+            transparent_enabled: false,
+            raymarch_enabled: false,
+            two_pass_occlusion_enabled: false,
+            ssgi_enabled: false,
+            rt_reflections_enabled: false,
+            ..*inputs
+        })
+    } else {
+        None
+    };
+    let inputs = masked.as_ref().unwrap_or(inputs);
+
     let mut b = GraphBuilder::new();
 
     // Engine-owned imports the Main pass writes into. hdr_resolve is
@@ -844,12 +884,36 @@ mod tests {
             // Default off: the existing tests exercise the separate-node path
             // (the DX / Vulkan backends). Unified-path tests set this true.
             unified_gbuffer_prepass: false,
+            world_hidden: false,
         }
     }
 
     #[test]
     fn minimum_graph_is_main_then_composite() {
         let g = build_frame_graph(&all_off()).expect("compiles");
+        let order: Vec<PassId> = g.passes.iter().map(|p| p.id).collect();
+        assert_eq!(order, vec![PassId::Main, PassId::Composite]);
+        assert!(g.passes[1].presents);
+    }
+
+    #[test]
+    fn world_hidden_collapses_to_minimum_graph() {
+        // Every heavy world pass requested, but the opaque menu backdrop is up:
+        // the builder must mask them all off and yield the bare Main -> Composite
+        // graph, with Composite still the presenter for the overlay.
+        let mut i = all_off();
+        i.shadow_enabled = true;
+        i.bindless_cull_enabled = true;
+        i.ssr_prepass_enabled = true;
+        i.ssao_enabled = true;
+        i.ssgi_enabled = true;
+        i.rt_reflections_enabled = true;
+        i.bloom_enabled = true;
+        i.taa_enabled = true;
+        i.velocity_enabled = true;
+        i.two_pass_occlusion_enabled = true;
+        i.world_hidden = true;
+        let g = build_frame_graph(&i).expect("compiles");
         let order: Vec<PassId> = g.passes.iter().map(|p| p.id).collect();
         assert_eq!(order, vec![PassId::Main, PassId::Composite]);
         assert!(g.passes[1].presents);

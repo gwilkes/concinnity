@@ -145,6 +145,10 @@ pub(in crate::directx) struct GraphFrameParams<'a> {
     pub back_buffer: &'a ID3D12Resource,
     pub back_buffer_rtv: D3D12_CPU_DESCRIPTOR_HANDLE,
     pub text_calls: &'a [TextDrawCall],
+    // An opaque menu backdrop hides the scene: the Main pass clears its target
+    // and skips every draw (the masked graph drops all other world passes), so
+    // nothing of the world renders behind the menu.
+    pub world_hidden: bool,
     // Scene SRV the composite shader samples: TAA history when TAA is
     // on, SSR output when SSR is on and TAA is off, raw HDR scene SRV
     // otherwise. Computed in `record_frame` once before the dispatch;
@@ -633,6 +637,7 @@ impl DxContext {
                     params.frustum,
                     params.cam_pos,
                     params.visible,
+                    params.world_hidden,
                 );
             }
             PassId::Decals => {

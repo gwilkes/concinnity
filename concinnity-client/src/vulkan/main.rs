@@ -116,6 +116,7 @@ impl VkContext {
         visible: &[u32],
         frustum: &Frustum,
         cam_pos: [f32; 3],
+        world_hidden: bool,
     ) {
         let device = self.device.clone();
         let device = &device;
@@ -166,6 +167,15 @@ impl VkContext {
             .clear_values(clears);
 
         unsafe { device.cmd_begin_render_pass(cmd, &rp_begin, vk::SubpassContents::INLINE) };
+
+        // Opaque menu backdrop: the render pass already cleared the HDR target;
+        // skip every draw so nothing of the world renders behind the menu (the
+        // bindless indirect draw below would otherwise consume a stale draw-args
+        // buffer, since the per-frame rebuild was skipped this frame).
+        if world_hidden {
+            unsafe { device.cmd_end_render_pass(cmd) };
+            return;
+        }
 
         // Viewport: negative height flips Y to match Metal coordinate system.
         let vp = vk::Viewport {

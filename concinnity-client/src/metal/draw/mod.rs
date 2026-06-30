@@ -69,6 +69,7 @@ impl MtlContext {
     // until unified memory is exhausted and the GPU faults / the host panics.
     // Draining per frame frees each frame's command buffers once the GPU
     // retires them, bounding VRAM to the work actually in flight.
+    #[allow(clippy::too_many_arguments)]
     pub fn draw_frame(
         &mut self,
         elapsed: f32,
@@ -77,12 +78,22 @@ impl MtlContext {
         far: f32,
         cam_pos: [f32; 3],
         text_calls: &[TextDrawCall],
+        world_hidden: bool,
     ) -> Result<(), String> {
         objc2::rc::autoreleasepool(|_| {
-            self.draw_frame_inner(elapsed, fov_y_radians, near, far, cam_pos, text_calls)
+            self.draw_frame_inner(
+                elapsed,
+                fov_y_radians,
+                near,
+                far,
+                cam_pos,
+                text_calls,
+                world_hidden,
+            )
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn draw_frame_inner(
         &mut self,
         elapsed: f32,
@@ -91,6 +102,7 @@ impl MtlContext {
         far: f32,
         cam_pos: [f32; 3],
         text_calls: &[TextDrawCall],
+        world_hidden: bool,
     ) -> Result<(), String> {
         let mtm = objc2::MainThreadMarker::new()
             .ok_or("draw_frame must be called from the main thread")?;
@@ -164,7 +176,9 @@ impl MtlContext {
         // and the prefilter convolution runs on a worker thread. Runs AFTER
         // `acquire()` so its reserved-slot retire-pool collection sees a fence-
         // consistent frame id. Non-fatal: a failure keeps the current state.
-        if let Err(e) = self.bake_pending_probes(elapsed, near, far) {
+        // Skipped while the world is hidden: a probe bake feeds reflections no
+        // pass will sample this frame.
+        if !world_hidden && let Err(e) = self.bake_pending_probes(elapsed, near, far) {
             tracing::warn!("reflection probe bake failed, keeping current environment: {e}");
         }
 
@@ -343,64 +357,96 @@ impl MtlContext {
         // allocation is reused across frames; it's put back below before we
         // return Ok (the error path silently loses the capacity, which is
         // acceptable since draw_frame errors are exceptional).
+        // mem::take swaps out the persistent scratch buffer so its heap
+        // allocation is reused across frames; it's put back below before we
+        // return Ok. While the world is hidden behind an opaque menu, the
+        // surviving Main pass is fed an empty scene -- no visible set, no
+        // bindless object / cull / texture buffers, no instanced clusters, and
+        // no acceleration-structure refresh -- so it runs as a bare clear that
+        // the opaque overlay then covers. The masked graph drops every other
+        // world pass, so none of this work would be consumed anyway.
         let mut visible = std::mem::take(&mut self.visible_scratch);
         visible.clear();
-        self.cull_bvh
-            .query(&frustum, cam_pos, |idx| visible.push(idx));
-        visible.sort_unstable();
-        visible.extend_from_slice(&self.always_draw);
-
-        // Per-frame GPU buffer prep for the bindless path.
-        // The object data + indirect-args + bindless texture argbuf are
-        // all per-frame Metal buffers the bindless Main pass + Cull
-        // compute pass consume. They must outlive the command buffer,
-        // hence the bindings kept here through to `cmd_buf.commit()`.
-        let object_buffer = if self.bindless {
-            self.build_object_buffer(ring_slot)?
+        let (object_buffer, cull_draw_args, bindless_tex_args, prepared_instances) = if world_hidden
+        {
+            (
+                None,
+                None,
+                None,
+                super::instanced::PreparedInstances {
+                    clusters: Vec::new(),
+                },
+            )
         } else {
-            None
-        };
-        let cull_draw_args = if object_buffer.is_some() {
-            let draw_args = self.build_draw_args_buffer(cam_pos, ring_slot)?;
-            if draw_args.is_some() {
-                self.ensure_icb_capacity(self.cull_count())?;
-                // GPU-driven cascaded shadow: size the per-cascade
-                // shadow ICB to NUM_SHADOW_CASCADES * cull_count. A no-op when
-                // the shadow-bindless path is inactive (no shadow cull encoder).
-                self.ensure_shadow_icb_capacity(self.cull_count())?;
-                // Per-planar-slot mirror cull ICBs: one per distinct reflection
-                // plane, each sized to cull_count. A no-op (clears the slots) when
-                // the world has no planar set (RT on, or no flat reflectors).
-                let mirror_slots = self
-                    .planar_reflection
-                    .as_ref()
-                    .map(|s| s.planes.len())
-                    .unwrap_or(0);
-                self.ensure_mirror_icb_capacity(mirror_slots, self.cull_count())?;
-            }
-            draw_args
-        } else {
-            None
-        };
-        let bindless_tex_args = if object_buffer.is_some() {
-            self.build_bindless_texture_args(ring_slot)?
-        } else {
-            None
-        };
+            // Resolve the visible set for the legacy CPU draw path, the TAA
+            // velocity pre-pass, and the SSAO pre-pass: BVH-culled cullable
+            // objects, then the always-draw fallback (skybox, rooms, dynamic
+            // props). The bindless static pass instead consumes the GPU-culled
+            // indirect command buffer, so it never walks this list.
+            self.cull_bvh
+                .query(&frustum, cam_pos, |idx| visible.push(idx));
+            visible.sort_unstable();
+            visible.extend_from_slice(&self.always_draw);
 
-        // Cull + LOD-bucket + upload every instanced cluster ONCE here, on the
-        // main thread before the pass fan-out. The main / SSR / SSAO / velocity
-        // passes share this prepared set instead of each repeating the cull and
-        // re-uploading the instance matrices to their own transient buffer.
-        let prepared_instances = self.prepare_instanced_draws(ring_slot, cam_pos, &frustum)?;
+            // Per-frame GPU buffer prep for the bindless path.
+            // The object data + indirect-args + bindless texture argbuf are
+            // all per-frame Metal buffers the bindless Main pass + Cull
+            // compute pass consume. They must outlive the command buffer,
+            // hence the bindings kept here through to `cmd_buf.commit()`.
+            let object_buffer = if self.bindless {
+                self.build_object_buffer(ring_slot)?
+            } else {
+                None
+            };
+            let cull_draw_args = if object_buffer.is_some() {
+                let draw_args = self.build_draw_args_buffer(cam_pos, ring_slot)?;
+                if draw_args.is_some() {
+                    self.ensure_icb_capacity(self.cull_count())?;
+                    // GPU-driven cascaded shadow: size the per-cascade
+                    // shadow ICB to NUM_SHADOW_CASCADES * cull_count. A no-op when
+                    // the shadow-bindless path is inactive (no shadow cull encoder).
+                    self.ensure_shadow_icb_capacity(self.cull_count())?;
+                    // Per-planar-slot mirror cull ICBs: one per distinct reflection
+                    // plane, each sized to cull_count. A no-op (clears the slots) when
+                    // the world has no planar set (RT on, or no flat reflectors).
+                    let mirror_slots = self
+                        .planar_reflection
+                        .as_ref()
+                        .map(|s| s.planes.len())
+                        .unwrap_or(0);
+                    self.ensure_mirror_icb_capacity(mirror_slots, self.cull_count())?;
+                }
+                draw_args
+            } else {
+                None
+            };
+            let bindless_tex_args = if object_buffer.is_some() {
+                self.build_bindless_texture_args(ring_slot)?
+            } else {
+                None
+            };
 
-        // Keep the RT acceleration structure current with this frame's
-        // transforms before any pass reads `rt_accel`. The default `Auto` mode
-        // rebuilds the TLAS only when a participating prop actually moved; a
-        // fully static scene pays just a matrix compare here. Non-fatal: a
-        // transient rebuild failure keeps last frame's BVH rather than stopping
-        // the renderer.
-        self.rt_dynamic_update(frame_id);
+            // Cull + LOD-bucket + upload every instanced cluster ONCE here, on the
+            // main thread before the pass fan-out. The main / SSR / SSAO / velocity
+            // passes share this prepared set instead of each repeating the cull and
+            // re-uploading the instance matrices to their own transient buffer.
+            let prepared_instances = self.prepare_instanced_draws(ring_slot, cam_pos, &frustum)?;
+
+            // Keep the RT acceleration structure current with this frame's
+            // transforms before any pass reads `rt_accel`. The default `Auto` mode
+            // rebuilds the TLAS only when a participating prop actually moved; a
+            // fully static scene pays just a matrix compare here. Non-fatal: a
+            // transient rebuild failure keeps last frame's BVH rather than stopping
+            // the renderer.
+            self.rt_dynamic_update(frame_id);
+
+            (
+                object_buffer,
+                cull_draw_args,
+                bindless_tex_args,
+                prepared_instances,
+            )
+        };
 
         // Per-frame pass uniforms hoisted upfront.
         // Every pass that needs a struct of per-frame params builds its
@@ -635,6 +681,10 @@ impl MtlContext {
             // Metal collapses the SSR / SSAO / velocity pre-passes into one
             // GBufferPrepass node; the other backends keep them separate.
             unified_gbuffer_prepass: true,
+            // An opaque menu backdrop hides the scene: the builder masks every
+            // world pass off, collapsing to Main (a bare clear, fed the empty
+            // scene above) -> Composite (presents the overlay).
+            world_hidden,
         };
         let graph = crate::gfx::render_graph::build_frame_graph(&graph_inputs)
             .map_err(|e| format!("frame graph: {}", e))?;
@@ -677,6 +727,7 @@ impl MtlContext {
             skinned_joint_bufs: &skinned_joint_bufs,
             scene_color: Some(&scene_color),
             text_calls,
+            world_hidden,
             elapsed,
             vp,
             inv_vp,

@@ -127,12 +127,21 @@ impl RenderBackend for MtlContext {
         far: f32,
         cam_pos: [f32; 3],
         text_calls: &[TextDrawCall],
+        world_hidden: bool,
     ) -> Result<(), String> {
         // Not in the guarded `forward!` block: draw_frame needs the
         // MainThreadMarker as a *value* (it threads it into NSEvent pumping and
         // window ops), so it proves the invariant itself and returns Err off
         // the main thread rather than asserting: no point double-checking.
-        self.draw_frame(elapsed, fov_y_radians, near, far, cam_pos, text_calls)
+        self.draw_frame(
+            elapsed,
+            fov_y_radians,
+            near,
+            far,
+            cam_pos,
+            text_calls,
+            world_hidden,
+        )
     }
 
     fn window_closed(&mut self) -> bool {

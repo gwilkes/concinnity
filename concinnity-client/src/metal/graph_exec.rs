@@ -97,6 +97,10 @@ pub(in crate::metal) struct GraphFrameParams<'a> {
     pub skinned_joint_bufs: &'a [Retained<ProtocolObject<dyn MTLBuffer>>],
     pub scene_color: Option<&'a Retained<ProtocolObject<dyn MTLTexture>>>,
     pub text_calls: &'a [TextDrawCall],
+    // An opaque menu backdrop hides the scene: the Main pass runs as a bare
+    // clear (it is the only surviving world pass in the masked graph), skipping
+    // every geometry sub-path so nothing of the world draws behind the menu.
+    pub world_hidden: bool,
     // Main-pass params. Built by draw_frame between the un-migrated
     // pre-main legacy work and the pre-graph dispatch, then handed in
     // here so the executor can call encode_main_pass with the same
@@ -466,6 +470,7 @@ impl MtlContext {
                 params.object_buffer,
                 params.bindless_tex_args,
                 params.deformed_skinned,
+                params.world_hidden,
             )?,
             PassId::AutoExposure => self.encode_auto_exposure(cmd_buf)?,
             PassId::Bloom => {

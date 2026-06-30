@@ -289,6 +289,7 @@ impl VkContext {
         cam_pos: [f32; 3],
         text_calls: &[TextDrawCall],
         frame_idx: usize,
+        world_hidden: bool,
     ) -> Result<Vec<vk::CommandBuffer>, String> {
         let device = self.device.clone();
         let device = &device;
@@ -492,6 +493,10 @@ impl VkContext {
             // emits the single node and skips `SsrPrepass` / `Velocity`. Mirrors
             // DirectX's `unified_gbuffer_prepass: self.gbuffer.is_some()`.
             unified_gbuffer_prepass: self.gbuffer.is_some(),
+            // An opaque menu backdrop hides the scene: the shared builder masks
+            // every world pass off, collapsing to Main (a bare clear, fed the
+            // empty scene below) -> Composite (presents the overlay).
+            world_hidden,
         };
 
         //  Camera projection + per-frame view state. Computed before the main
@@ -586,7 +591,10 @@ impl VkContext {
         // The compute dispatch itself runs through the graph as
         // `PassId::Cull`; the toposort orders Cull → Main via the
         // `draw_args` buffer RAW edge declared on Main.
-        if seed_inputs.bindless_cull_enabled {
+        // Skipped while the world is hidden behind an opaque menu: the masked
+        // graph drops the Cull pass and Main runs as a bare clear, so this
+        // per-object buffer prep would feed nothing.
+        if !world_hidden && seed_inputs.bindless_cull_enabled {
             self.build_object_buffer(frame_idx);
             self.build_draw_args_buffer(frame_idx, cam_pos);
         }
@@ -597,13 +605,16 @@ impl VkContext {
         // a second BVH walk. `mem::take` swaps out the persistent scratch
         // buffer so its heap allocation is reused across frames; it's put
         // back below before we return Ok (error path loses capacity, fine
-        // since record_frame errors are exceptional).
+        // since record_frame errors are exceptional). Left empty when the world
+        // is hidden so the Main pass draws nothing behind the menu.
         let mut visible = std::mem::take(&mut self.visible_scratch);
         visible.clear();
-        self.cull_bvh
-            .query(&frustum, cam_pos, |idx| visible.push(idx));
-        visible.sort_unstable();
-        visible.extend_from_slice(&self.always_draw);
+        if !world_hidden {
+            self.cull_bvh
+                .query(&frustum, cam_pos, |idx| visible.push(idx));
+            visible.sort_unstable();
+            visible.extend_from_slice(&self.always_draw);
+        }
 
         //  Single merged frame graph dispatched in one
         //  `execute_graph` call. The toposort orders Cull → Main via
@@ -628,6 +639,7 @@ impl VkContext {
             image_index,
             frame_idx,
             text_calls,
+            world_hidden,
             visible: &visible,
             frustum: &frustum,
             cam_pos,

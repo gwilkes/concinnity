@@ -179,6 +179,10 @@ pub(in crate::vulkan) struct GraphFrameParams<'a> {
     pub image_index: u32,
     pub frame_idx: usize,
     pub text_calls: &'a [TextDrawCall],
+    // An opaque menu backdrop hides the scene: the Main pass clears its target
+    // and skips every draw (the masked graph drops all other world passes), so
+    // nothing of the world renders behind the menu.
+    pub world_hidden: bool,
     // CPU visibility list (BVH-culled cullables + always_draw fallback).
     // Consumed by Main's legacy + instanced fallback passes and the
     // unified G-buffer pre-pass.
@@ -607,6 +611,7 @@ impl VkContext {
                     params.visible,
                     params.frustum,
                     params.cam_pos,
+                    params.world_hidden,
                 );
             }
             PassId::Composite => {

@@ -98,6 +98,7 @@ impl DxContext {
         // Drawable (swapchain) resolution; only the Composite pass uses it.
         output_width: u32,
         output_height: u32,
+        world_hidden: bool,
     ) -> Result<Vec<ID3D12GraphicsCommandList>, String> {
         // Render-target aspect, shared by the main projection below and the
         // cull frustum.
@@ -146,7 +147,10 @@ impl DxContext {
         // a `PassId::Cull` node that writes the indirect command buffer
         // ahead of Main.
         let bindless_cull_enabled = self.cull.main_bindless_pso.is_some() && self.cull_count() > 0;
-        if bindless_cull_enabled {
+        // Skipped while the world is hidden behind an opaque menu: the masked
+        // graph drops the Cull pass and Main runs as a bare clear, so this
+        // per-object buffer rebuild would feed nothing.
+        if !world_hidden && bindless_cull_enabled {
             self.build_object_buffer(frame_idx);
         }
 
@@ -159,7 +163,7 @@ impl DxContext {
         // instanced cluster declared LOD alternates (every cluster
         // collapses to a single LOD0 bucket containing all instances,
         // same byte order as the legacy single-draw path).
-        if !self.instanced.clusters.is_empty() {
+        if !world_hidden && !self.instanced.clusters.is_empty() {
             self.build_instance_upload(frame_idx, cam_pos);
         }
 
@@ -242,6 +246,10 @@ impl DxContext {
             // SSAO / velocity geometry pre-passes. On whenever the G-buffer
             // resources exist (any of SSR / SSGI / SSAO / TAA / FSR enabled).
             unified_gbuffer_prepass: self.gbuffer.is_some(),
+            // An opaque menu backdrop hides the scene: the shared builder masks
+            // every world pass off, collapsing to Main (a bare clear, fed the
+            // empty scene below) -> Composite (presents the overlay).
+            world_hidden,
         };
 
         // Compute the camera VPs the main + velocity passes consume.
@@ -330,10 +338,14 @@ impl DxContext {
         let frustum = crate::gfx::frustum::Frustum::from_view_projection(vp_mat);
         let mut visible = self.visible_scratch.replace(Vec::new());
         visible.clear();
-        self.cull_bvh
-            .query(&frustum, cam_pos, |idx| visible.push(idx));
-        visible.sort_unstable();
-        visible.extend_from_slice(&self.always_draw);
+        // Left empty while the world is hidden behind an opaque menu so the
+        // Main pass draws nothing behind it.
+        if !world_hidden {
+            self.cull_bvh
+                .query(&frustum, cam_pos, |idx| visible.push(idx));
+            visible.sort_unstable();
+            visible.extend_from_slice(&self.always_draw);
+        }
 
         let (view_gva, light_gva) = unsafe {
             (
@@ -376,6 +388,7 @@ impl DxContext {
             back_buffer,
             back_buffer_rtv,
             text_calls,
+            world_hidden,
             scene_srv,
             width,
             height,

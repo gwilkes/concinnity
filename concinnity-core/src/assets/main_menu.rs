@@ -46,7 +46,9 @@ pub struct MainMenu {
     /// Only `"Escape"` is currently recognised by the runtime.
     pub toggle_key: String,
     /// RGBA fill drawn across the whole window behind the items. An alpha of 0
-    /// draws no backdrop.
+    /// draws no backdrop. A fully opaque alpha (1.0) hides the scene completely,
+    /// which lets the renderer skip the entire world render while the menu is
+    /// open: the frame then costs only the menu overlay.
     pub dim: [f32; 4],
     /// Horizontally center the menu and align it to the top of the window.
     /// When false, `x` is the column's center and `y` is the top of the first

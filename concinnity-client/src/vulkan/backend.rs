@@ -70,7 +70,7 @@ impl RenderBackend for VkContext {
         fn update_quality_params(&mut self, settings: crate::gfx::backend::QualitySettings);
         fn take_input(&mut self) -> RenderInput;
         fn wait_idle(&self);
-        fn draw_frame(&mut self, elapsed: f32, fov_y_radians: f32, near: f32, far: f32, cam_pos: [f32; 3], text_calls: &[TextDrawCall]) -> Result<(), String>;
+        fn draw_frame(&mut self, elapsed: f32, fov_y_radians: f32, near: f32, far: f32, cam_pos: [f32; 3], text_calls: &[TextDrawCall], world_hidden: bool) -> Result<(), String>;
         fn update_view(&mut self, matrix: [[f32; 4]; 4]);
         fn update_model(&mut self, index: usize, model: [[f32; 4]; 4]);
         fn retire_draw_object(&mut self, draw_idx: usize);

@@ -1421,6 +1421,24 @@ mod tests {
         assert!(!assets.iter().any(|v| asset_name(v) == "m_dim"));
     }
 
+    // A MainMenu that omits `dim` (as Bistro declares its menu) inherits the
+    // opaque default, so the emitted backdrop fully covers the scene -- the cue
+    // the renderer keys off to skip the world while the menu is open.
+    #[test]
+    fn default_menu_emits_opaque_backdrop() {
+        let mut assets = vec![serde_json::json!({
+            "name": "main_menu", "type": "MainMenu",
+            "args": { "title": "Bistro_v5_2", "initial": false }
+        })];
+        expand_main_menus(&mut assets).unwrap();
+        let tint = &by_name(&assets, "main_menu_dim")["args"]["tint"];
+        assert_eq!(
+            tint[3].as_f64().unwrap(),
+            1.0,
+            "default menu backdrop must be opaque (tint={tint})"
+        );
+    }
+
     #[test]
     fn generated_name_collision_is_an_error() {
         let mut assets = vec![

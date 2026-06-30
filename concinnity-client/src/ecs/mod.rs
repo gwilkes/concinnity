@@ -44,6 +44,15 @@ pub enum StepResult {
     Stop,
 }
 
+// Per-frame menu state, published as a resource by GraphicsSystem (which runs
+// first in the schedule) and read by the simulation systems the same tick.
+// `true` while any menu view is open: physics and animation then freeze so they
+// stop consuming resources behind the menu. Each system keeps its own clock
+// aligned across the freeze, so resuming costs one normal frame -- no catch-up
+// burst, no pose jump.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MenuActive(pub bool);
+
 // System -- has behavior, receives a PipelineContext each tick. Every system
 // is internal engine code: `World::build_internal_systems` constructs it from
 // world components (via the system's own `new(..)`), so a system is never
@@ -256,6 +265,14 @@ impl World {
     #[cfg(test)]
     pub fn despawn(&mut self, entity: Entity) {
         self.components.despawn(entity);
+    }
+
+    // Seed a singleton resource that persists across steps. Stands in for the
+    // GraphicsSystem-published resources (e.g. `MenuActive`) in system tests
+    // that drive a later system directly without a GraphicsSystem in the world.
+    #[cfg(test)]
+    pub fn insert_resource<T: std::any::Any>(&mut self, value: T) {
+        self.resources.insert(value);
     }
 
     // Mutable view of the active systems. Mirror of `systems()`; lets the

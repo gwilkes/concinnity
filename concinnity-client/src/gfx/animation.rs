@@ -93,6 +93,11 @@ pub struct AnimationSystem {
     targets: HashMap<AssetId, TargetState>,
     // Wall-clock origin, captured on the first step.
     start: Option<Instant>,
+    // When a menu opened (and froze playback), if currently paused. On resume
+    // the origin `start` is shifted forward by the paused span so clip time `t`
+    // is continuous across the pause: the animation freezes on its current pose
+    // and resumes from it, with no jump.
+    pause_anchor: Option<Instant>,
     // One entry per file-backed Animation, captured at init under
     // `cn debug`. Empty when hot-reload is off or every clip is inline.
     reload_entries: Vec<AnimationReloadEntry>,
@@ -120,6 +125,7 @@ impl AnimationSystem {
         Self {
             targets: HashMap::new(),
             start: None,
+            pause_anchor: None,
             reload_entries: Vec::new(),
         }
     }
@@ -212,6 +218,15 @@ impl AnimationSystem {
             }
         }
     }
+}
+
+// The animation origin to use on the frame a pause ends. Shifting the original
+// origin forward by the paused span (now - anchor) holds clip time
+// `t = now - origin` exactly where it was when the pause began, so playback
+// resumes from the frozen pose with no jump. Split out so the continuity
+// property is unit-testable without a live system.
+fn resumed_origin(start: Instant, anchor: Instant, now: Instant) -> Instant {
+    start + now.saturating_duration_since(anchor)
 }
 
 // Advance one bucket's `current_weights` along its active transition (if
@@ -327,6 +342,27 @@ impl System for AnimationSystem {
         // not here. `cn run` has no debug hook, so this step is reload-free.
 
         let now = Instant::now();
+
+        // Freeze while a menu is open: skip all sampling so animation stops
+        // consuming CPU/GPU behind the menu, recording when the pause began.
+        // The flag is published by GraphicsSystem, which runs first this tick.
+        let paused = ctx
+            .resource::<crate::ecs::MenuActive>()
+            .is_some_and(|m| m.0);
+        if paused {
+            self.pause_anchor.get_or_insert(now);
+            return StepResult::Continue;
+        }
+        // Resuming: advance the origin by the paused span so clip time `t` stays
+        // continuous -- the animation resumes from the exact pose it froze on,
+        // with no jump. (A pause before the first step has no origin yet, so it
+        // just defers the capture below.)
+        if let Some(anchor) = self.pause_anchor.take()
+            && let Some(start) = self.start.as_mut()
+        {
+            *start = resumed_origin(*start, anchor, now);
+        }
+
         let start = *self.start.get_or_insert(now);
         let t = (now - start).as_secs_f32();
 
@@ -384,8 +420,30 @@ impl System for AnimationSystem {
 
 #[cfg(test)]
 mod tests {
+    use super::resumed_origin;
     use crate::assets::Animation;
     use crate::ecs::World;
+    use std::time::{Duration, Instant};
+
+    // Resuming after a pause must leave clip time `t = now - origin` exactly
+    // where it was when the pause began, so playback continues from the frozen
+    // pose with no jump, no matter how long the menu was open.
+    #[test]
+    fn resumed_origin_freezes_clip_time_across_pause() {
+        let start = Instant::now();
+        // Paused at t = 5s, menu held open for 30s of real time.
+        let anchor = start + Duration::from_secs(5);
+        let now = anchor + Duration::from_secs(30);
+
+        let t_at_pause = (anchor - start).as_secs_f32();
+        let new_origin = resumed_origin(start, anchor, now);
+        let t_on_resume = (now - new_origin).as_secs_f32();
+
+        assert!(
+            (t_on_resume - t_at_pause).abs() < 1e-6,
+            "clip time jumped across the pause: {t_at_pause} -> {t_on_resume}"
+        );
+    }
 
     // An `Animation` in the world implies the internal AnimationSystem: it is
     // constructed by `World::start`, not declared as an asset.

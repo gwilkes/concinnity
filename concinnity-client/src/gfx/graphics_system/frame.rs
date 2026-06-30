@@ -296,6 +296,10 @@ impl GraphicsSystem {
         // The pacer (above, next frame) clamps the frame rate while a menu is
         // open; record this frame's state for it to read.
         self.menu_active_prev = menu_active;
+        // Publish the menu state for the simulation systems, which run after
+        // GraphicsSystem this same tick: physics + animation freeze while it is
+        // set, so a paused world stops consuming CPU/GPU behind the menu.
+        ctx.insert_resource(crate::ecs::MenuActive(menu_active));
 
         let backend = match self.backend.as_deref_mut() {
             Some(b) => b,
@@ -335,10 +339,13 @@ impl GraphicsSystem {
                 // despawn the entities whose countdown reached zero, through the
                 // same cascade a DespawnRequest uses. This is the churn that
                 // returns draw slots to the free list for the spawn drain below
-                // to recycle.
-                let expired = super::spawn::tick_lifetimes(ctx, dt);
-                for entity in expired {
-                    super::despawn::despawn_subtree(ctx, backend, entity);
+                // to recycle. Frozen while a menu is open so the world clock
+                // (timed despawns + cadence spawns below) truly pauses.
+                if !menu_active {
+                    let expired = super::spawn::tick_lifetimes(ctx, dt);
+                    for entity in expired {
+                        super::despawn::despawn_subtree(ctx, backend, entity);
+                    }
                 }
 
                 // Runtime entity despawn: drain DespawnRequest events, resolve
@@ -454,8 +461,14 @@ impl GraphicsSystem {
                 // instantiate the copies now due, at the spawner's position.
                 // Transient (unnamed) and Lifetime-bounded, so a steady spawner
                 // churns through recycled draw slots. After the SpawnRequest
-                // drain so both spawn paths reuse slots freed this frame.
-                let due_spawns = super::spawn::tick_spawners(ctx, dt);
+                // drain so both spawn paths reuse slots freed this frame. Frozen
+                // while a menu is open so spawner clocks do not advance behind
+                // the pause.
+                let due_spawns = if menu_active {
+                    Vec::new()
+                } else {
+                    super::spawn::tick_spawners(ctx, dt)
+                };
                 if !due_spawns.is_empty() {
                     let by_name = ctx
                         .resource::<crate::ecs::decompose::EntityByName>()
@@ -504,17 +517,22 @@ impl GraphicsSystem {
                 // Push the latest skinned poses to the GPU. AnimationSystem
                 // wrote them into the SkeletonPose components on the previous
                 // tick; the one-frame lag is invisible at animation rates.
-                for pose in ctx.query::<crate::assets::SkeletonPose>() {
-                    backend.update_skinned_pose(pose.skinned_index, &pose.joint_matrices);
-                }
-                // Push the model matrix for skinned instances that carry a
-                // Transform (the runtime-spawned ones), so a moved instance
-                // follows it. The authored templates have no Transform and keep
-                // the model baked into their draw object at load.
-                for (_entity, pose, transform) in
-                    ctx.join2::<crate::assets::SkeletonPose, crate::assets::Transform>()
-                {
-                    backend.update_skinned_model(pose.skinned_index, transform.model_matrix());
+                // Skipped while a menu is open: animation is frozen, so the
+                // poses are unchanged and the last upload still stands (the
+                // skinned draw is skipped behind an opaque menu anyway).
+                if !menu_active {
+                    for pose in ctx.query::<crate::assets::SkeletonPose>() {
+                        backend.update_skinned_pose(pose.skinned_index, &pose.joint_matrices);
+                    }
+                    // Push the model matrix for skinned instances that carry a
+                    // Transform (the runtime-spawned ones), so a moved instance
+                    // follows it. The authored templates have no Transform and keep
+                    // the model baked into their draw object at load.
+                    for (_entity, pose, transform) in
+                        ctx.join2::<crate::assets::SkeletonPose, crate::assets::Transform>()
+                    {
+                        backend.update_skinned_model(pose.skinned_index, transform.model_matrix());
+                    }
                 }
 
                 // apply any imperative scene jumps sent by UiInputSystem this
@@ -1361,7 +1379,7 @@ impl GraphicsSystem {
                 // Each backend's update_texture_slot rewrites whichever
                 // descriptors / argument-buffers sample that slot so it
                 // takes effect on this same draw_frame.
-                if let Some(streamer) = &mut self.texture_streamer {
+                if !world_hidden && let Some(streamer) = &mut self.texture_streamer {
                     streamer.update_scores(cam_pos, self.frame_count);
                     for slot in streamer.plan_and_dispatch() {
                         if let Err(e) = backend.evict_texture_slot(slot) {
@@ -1389,7 +1407,7 @@ impl GraphicsSystem {
                 // Drive normal-map streaming: identical to the albedo path
                 // above, but streamed item `i` maps to normal-map pool slot
                 // `i + 1` (slot 0 is the flat-normal fallback).
-                if let Some(streamer) = &mut self.normal_map_streamer {
+                if !world_hidden && let Some(streamer) = &mut self.normal_map_streamer {
                     streamer.update_scores(cam_pos, self.frame_count);
                     for item in streamer.plan_and_dispatch() {
                         if let Err(e) = backend.evict_normal_map_slot(item + 1) {
@@ -1424,7 +1442,7 @@ impl GraphicsSystem {
                 // by camera distance, dispatch this frame's background loads,
                 // then apply completed geometry uploads + evictions. A mesh is
                 // skipped in every pass until its geometry region is resident.
-                if let Some(streamer) = &mut self.mesh_streamer {
+                if !world_hidden && let Some(streamer) = &mut self.mesh_streamer {
                     streamer.update_scores(cam_pos, self.frame_count);
                     // A runtime eviction's freed space must not be reused
                     // until the in-flight command buffers that drew it retire.

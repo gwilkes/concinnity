@@ -819,6 +819,15 @@ impl MtlContext {
                 .pass_timing
                 .as_ref()
                 .map(|p| p.buffer_for(pass_timing_slot));
+            // Which passes actually ran this frame. The sample buffer is reused
+            // across frames and never cleared, so a pass absent this frame (e.g.
+            // every world pass behind an opaque menu) would otherwise resolve to
+            // its last run's stale timestamps; the handler zeroes those slots.
+            let active_mask = self
+                .pass_timing
+                .as_ref()
+                .map(|p| p.attached_mask())
+                .unwrap_or(0);
             let handler = block2::RcBlock::new(
                 move |cb: std::ptr::NonNull<ProtocolObject<dyn objc2_metal::MTLCommandBuffer>>| {
                     let cb = unsafe { cb.as_ref() };
@@ -841,8 +850,17 @@ impl MtlContext {
                     let mut frame_us = (span * 1.0e6).clamp(0.0, f64::from(u32::MAX)) as u32;
                     if let Some(buf) = &pass_buffer {
                         let per_pass = super::pass_timing::resolve(buf);
-                        for (slot, micros) in pass_times.iter().zip(per_pass.iter()) {
-                            slot.store(*micros, std::sync::atomic::Ordering::Relaxed);
+                        for (i, (slot, micros)) in
+                            pass_times.iter().zip(per_pass.iter()).enumerate()
+                        {
+                            // Report a pass's time only if it ran this frame;
+                            // otherwise its sample-buffer slot holds stale data.
+                            let value = if active_mask & (1u64 << i) != 0 {
+                                *micros
+                            } else {
+                                0
+                            };
+                            slot.store(value, std::sync::atomic::Ordering::Relaxed);
                         }
                         if let Some(span_us) = super::pass_timing::frame_span_us(buf) {
                             frame_us = span_us;

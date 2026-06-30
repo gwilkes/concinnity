@@ -45,10 +45,12 @@ pub struct MainMenu {
     /// Key that toggles the menu while the cursor is free. Empty binds no key.
     /// Only `"Escape"` is currently recognised by the runtime.
     pub toggle_key: String,
-    /// RGBA fill drawn across the whole window behind the items. An alpha of 0
-    /// draws no backdrop. A fully opaque alpha (1.0) hides the scene completely,
-    /// which lets the renderer skip the entire world render while the menu is
-    /// open: the frame then costs only the menu overlay.
+    /// RGBA fill drawn across the whole window behind the items. Defaults to
+    /// opaque black: a fully opaque alpha (1.0) hides the scene completely, which
+    /// lets the renderer skip the entire world render while the menu is open, so
+    /// the frame costs only the menu overlay. Lower the alpha to keep the world
+    /// visible behind a translucent fade (the world then keeps rendering); an
+    /// alpha of 0 draws no backdrop at all.
     pub dim: [f32; 4],
     /// Horizontally center the menu and align it to the top of the window.
     /// When false, `x` is the column's center and `y` is the top of the first
@@ -126,7 +128,7 @@ impl Default for MainMenu {
             title: String::new(),
             initial: true,
             toggle_key: "Escape".to_string(),
-            dim: [0.0, 0.0, 0.0, 0.55],
+            dim: [0.0, 0.0, 0.0, 1.0],
             centered: true,
             x: 640.0,
             y: 300.0,

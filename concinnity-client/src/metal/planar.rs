@@ -15,16 +15,16 @@
 // probe cube (logged at init, see `metal/init`). The plane -> slot grouping is
 // the pure, unit-tested `gfx::planar_reflection::assign_planar_slots`.
 //
-// On the bindless path each plane gets a DEDICATED mirror cull: the GPU cull
-// kernel re-runs against the reflected-camera frustum (`encode_mirror_cull`) into
-// that plane's own mirror ICB, which the face render then executes. So geometry
-// visible only in the reflection (behind or beside the main camera, outside its
-// frustum) is captured, not just the main camera's visible set. The reflected
-// view-proj carries the oblique near-plane clip, so the extracted frustum also
-// rejects geometry behind the reflector. A non-bindless world has no GPU cull to
-// mirror and falls back to reusing the main visible set (the older V1
-// approximation). The matrices + frustum come from the pure, unit-tested
-// `gfx::planar_reflection` + `gfx::frustum`.
+// Each plane gets a DEDICATED mirror cull against its reflected-camera frustum,
+// so geometry visible only in the reflection (behind or beside the main camera,
+// outside its frustum) is captured, not just the main camera's visible set. The
+// reflected view-proj carries the oblique near-plane clip, so the extracted
+// frustum also rejects geometry behind the reflector. On the bindless path the GPU
+// cull kernel re-runs into that plane's own mirror ICB (`encode_mirror_cull`),
+// which the face render executes; on the non-bindless path the CPU cull re-runs
+// against the reflected frustum (`reflected_visible_set`) into a per-frame scratch
+// list the legacy face render draws. The matrices + frustum come from the pure,
+// unit-tested `gfx::planar_reflection` + `gfx::frustum`.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 #![allow(clippy::incompatible_msrv)]
@@ -180,6 +180,11 @@ impl MtlContext {
         // the mirror render shares the main camera's projection + jitter, keeping
         // the reflection aligned with the reflective fragment's screen-space sample.
         let proj = super::math::mat4_mul(params.vp, super::math::mat4_inverse(self.view_matrix));
+        // Reused across planes for the non-bindless CPU reflected-frustum cull:
+        // `reflected_visible_set` clears it each plane, so one allocation serves
+        // the whole frame. Unused on the bindless path (the GPU mirror cull drives
+        // the face render through the mirror ICB instead).
+        let mut reflected_visible: Vec<u32> = Vec::new();
         for (slot, (plane, targets)) in set.planes.iter().zip(set.targets.iter()).enumerate() {
             let oriented =
                 crate::gfx::planar_reflection::orient_plane_toward(*plane, params.cam_pos);
@@ -191,19 +196,21 @@ impl MtlContext {
                 PLANAR_CLIP_BIAS,
             );
 
-            // Dedicated mirror cull (bindless path): re-run the GPU cull against
-            // this plane's reflected-camera frustum into the slot's mirror ICB, so
-            // geometry visible only in the reflection (behind or beside the main
-            // camera, outside its frustum) is captured. The reflected view-proj
-            // already carries the oblique near-plane clip, so its extracted frustum
-            // also rejects geometry behind the reflector. The face render then
-            // executes that ICB (`icb_override`). A non-bindless world has no GPU
-            // cull to mirror, so it falls back to the main camera's visible set.
-            let icb_override = if let (Some(object_buffer), Some(draw_args)) =
+            // Re-cull against this plane's reflected-camera frustum so geometry
+            // visible only in the reflection (behind or beside the main camera,
+            // outside its frustum) is captured. The reflected view-proj already
+            // carries the oblique near-plane clip, so its extracted frustum also
+            // rejects geometry behind the reflector.
+            let mirror_frustum = crate::gfx::frustum::Frustum::from_view_projection(m.view_proj);
+            let (icb_override, visible): (
+                Option<&ProtocolObject<dyn objc2_metal::MTLIndirectCommandBuffer>>,
+                &[u32],
+            ) = if let (Some(object_buffer), Some(draw_args)) =
                 (params.object_buffer, params.draw_args_buffer)
             {
-                let mirror_frustum =
-                    crate::gfx::frustum::Frustum::from_view_projection(m.view_proj);
+                // Bindless path: the GPU cull kernel re-runs into this plane's
+                // mirror ICB, which the face render executes (`icb_override`); the
+                // CPU `visible` slice is unused on the bindless static path.
                 self.encode_mirror_cull(
                     cmd_buf,
                     object_buffer,
@@ -212,9 +219,22 @@ impl MtlContext {
                     m.eye,
                     slot,
                 )?;
-                self.cull.mirror_slots.get(slot).map(|s| s.icb.as_ref())
+                (
+                    self.cull.mirror_slots.get(slot).map(|s| s.icb.as_ref()),
+                    params.visible,
+                )
             } else {
-                None
+                // Non-bindless path: no GPU cull to mirror. Re-cull the CPU visible
+                // set against the reflected frustum so the legacy face render draws
+                // the reflection's geometry instead of the main camera's set.
+                crate::gfx::planar_reflection::reflected_visible_set(
+                    &self.cull_bvh,
+                    &mirror_frustum,
+                    m.eye,
+                    &self.always_draw,
+                    &mut reflected_visible,
+                );
+                (None, reflected_visible.as_slice())
             };
 
             self.encode_main_into_face(
@@ -226,7 +246,7 @@ impl MtlContext {
                 m.view_proj,
                 m.eye,
                 params.elapsed,
-                params.visible,
+                visible,
                 params.prepared_instances,
                 params.skinned_joint_bufs,
                 params.object_buffer,

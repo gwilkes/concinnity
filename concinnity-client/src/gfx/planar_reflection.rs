@@ -339,6 +339,27 @@ pub(crate) fn planar_matrices(
     }
 }
 
+// Resolve the CPU visible set for a planar mirror render: BVH-cull the cullable
+// draw objects against the reflected-camera frustum, then append the always-draw
+// fallback (skybox, rooms) so it appears in the reflection too. Mirrors the main
+// camera's visible-set resolution but against the reflected frustum, so geometry
+// visible only in the reflection (behind or beside the main camera, outside its
+// frustum) is captured instead of reusing the main camera's set. `eye` is the
+// reflected camera position, consulted only for the leaves' distance-based cull.
+// `out` is cleared then refilled, so a caller can reuse one buffer across planes.
+pub(crate) fn reflected_visible_set(
+    bvh: &crate::gfx::bvh::Bvh,
+    reflected_frustum: &crate::gfx::frustum::Frustum,
+    eye: [f32; 3],
+    always_draw: &[u32],
+    out: &mut Vec<u32>,
+) {
+    out.clear();
+    bvh.query(reflected_frustum, eye, |idx| out.push(idx));
+    out.sort_unstable();
+    out.extend_from_slice(always_draw);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -540,6 +561,83 @@ mod tests {
         assert_eq!(a.representatives.len(), 1, "flip is the same surface");
         assert_eq!(a.slots[0], Some(0));
         assert_eq!(a.slots[1], Some(0));
+    }
+
+    #[test]
+    fn reflected_frustum_captures_geometry_behind_the_camera() {
+        // A vertical mirror at z = -5 (unit normal +z, facing the camera). The
+        // camera sits at the origin looking down -z, toward the mirror. An object
+        // BEHIND the camera (z = +3) is outside the main frustum, but its
+        // reflection is visible in the mirror -- so the reflected-frustum cull must
+        // capture it where the main-camera set would miss it (the V1 gap).
+        let plane = [0.0, 0.0, 1.0, 5.0]; // n.p + d = 0 -> z = -5
+        let view = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let proj = perspective(1.2, 1.6, 0.1, 100.0);
+        let cam_pos = [0.0, 0.0, 0.0];
+        let m = planar_matrices(view, proj, cam_pos, plane, 0.0);
+
+        // One cullable object behind the camera.
+        let bvh = crate::gfx::bvh::Bvh::build(&[crate::gfx::bvh::BvhItem {
+            bb_min: [-0.5, -0.5, 2.5],
+            bb_max: [0.5, 0.5, 3.5],
+            cull_distance: 0.0,
+            index: 0,
+        }]);
+
+        // The main camera rejects it (behind the near plane).
+        let main_frustum = crate::gfx::frustum::Frustum::from_view_projection(proj);
+        let mut main_visible = Vec::new();
+        bvh.query(&main_frustum, cam_pos, |i| main_visible.push(i));
+        assert!(
+            !main_visible.contains(&0),
+            "object behind the camera must be outside the main frustum"
+        );
+
+        // The reflected frustum captures it, and the always-draw fallback is
+        // appended after the culled set.
+        let reflected_frustum = crate::gfx::frustum::Frustum::from_view_projection(m.view_proj);
+        let always = [7u32];
+        let mut out = Vec::new();
+        reflected_visible_set(&bvh, &reflected_frustum, m.eye, &always, &mut out);
+        assert!(
+            out.contains(&0),
+            "object behind the camera must be visible in the reflection"
+        );
+        assert_eq!(
+            out.last(),
+            Some(&7),
+            "always-draw fallback appended after the culled set"
+        );
+    }
+
+    #[test]
+    fn reflected_visible_set_reuses_the_output_buffer() {
+        // The buffer is cleared each call, so reusing it across planes never leaks
+        // a prior plane's culled indices.
+        let bvh = crate::gfx::bvh::Bvh::build(&[crate::gfx::bvh::BvhItem {
+            bb_min: [-0.5, -0.5, -0.5],
+            bb_max: [0.5, 0.5, 0.5],
+            cull_distance: 0.0,
+            index: 3,
+        }]);
+        // A frustum that rejects everything (identity clip cube, box far outside).
+        let empty_frustum = crate::gfx::frustum::Frustum::from_view_projection([
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [-100.0, 0.0, 0.0, 1.0],
+        ]);
+        let mut out = vec![99, 99, 99];
+        reflected_visible_set(&bvh, &empty_frustum, [0.0, 0.0, 0.0], &[], &mut out);
+        assert!(
+            out.is_empty(),
+            "stale indices must be cleared before refill"
+        );
     }
 
     #[test]

@@ -20,4 +20,5 @@ crate::define_system_assets! {
     UiInputSystem   => crate::ui::UiInputSystem,
     FpsCounter      => crate::hud::fps_counter::FpsCounterSystem,
     StatHud         => crate::hud::stat_hud::StatHudSystem,
+    DebugHud        => crate::hud::debug_hud::DebugHudSystem,
 }

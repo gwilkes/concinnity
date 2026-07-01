@@ -30,11 +30,16 @@ const SETTINGS_TABS: [(&str, &str); 3] = [
 // Setting rows per tab, top to bottom: (setting key, display label). The runtime
 // (`concinnity_client::gfx::settings`) knows each key's options and how to apply
 // it; this only chooses which rows appear.
-const VIDEO_ROWS: [(&str, &str); 4] = [
+const VIDEO_ROWS: [(&str, &str); 7] = [
     ("vsync", "Vsync"),
     ("fps_cap", "Frame Rate"),
     ("window_mode", "Window Mode"),
     ("window_size", "Window Size"),
+    // Stats-HUD display: the master toggle leads, then the per-readout toggles.
+    // The master grays the two sub-rows out (rather than hiding them) when off.
+    ("perf_stats", "Display Performance Stats"),
+    ("show_fps", "Show Framerate"),
+    ("show_vram", "Show VRAM Usage"),
 ];
 // Rows tucked under the Video "Advanced" collapsible group (collapsed by
 // default), so the top of the Video tab stays uncrowded. More live
@@ -174,8 +179,8 @@ const SETTINGS_ROW_PAD: f32 = 18.0;
 const TOP_MARGIN_FRAC: f32 = 0.07;
 // How many setting rows the settings scroll band shows at once; a tab with more
 // body rows than this scrolls (mouse wheel or scrollbar thumb). Sized so the
-// band plus the heading, tab bar, and Back button all fit the reference canvas.
-const VISIBLE_SETTINGS_ROWS: usize = 5;
+// band plus the tab bar and Back button all fit the reference canvas.
+const VISIBLE_SETTINGS_ROWS: usize = 6;
 // Scrollbar gutter width and its gap from the content band, in reference pixels.
 const SCROLLBAR_GAP: f32 = 12.0;
 const SCROLLBAR_WIDTH: f32 = 8.0;
@@ -355,9 +360,9 @@ fn emit_settings_tab(
         }));
     }
 
-    // Stacked from a fixed top margin: heading, tab bar, a scrollable body band,
-    // then the Back button below the band. Top-aligned (not vertically centered)
-    // so the heading and tab bar hold position across tabs.
+    // Stacked from a fixed top margin: the tab bar, a scrollable body band, then
+    // the Back button below the band. Top-aligned (not vertically centered) so
+    // the tab bar holds position across tabs.
     let pitch = style.button_height + style.row_gap;
     let center_x = if style.centered { win_w / 2.0 } else { style.x };
     let start_y = if style.centered {
@@ -391,23 +396,13 @@ fn emit_settings_tab(
     let control_x = (content_x + content_w * SETTINGS_CONTROL_FRAC)
         .max(content_x + content_w - SETTINGS_CONTROL_WIDTH);
 
-    // Row 0: heading.
-    let title_scale = style.text_scale * 1.4;
-    out.push(label_value(
-        &format!("{}_title", view),
-        "Settings",
-        font,
-        centered_x(center_x, "Settings", font_px, title_scale),
-        text_y(0, title_scale),
-        style.text_color,
-        title_scale,
-    ));
-
-    // Row 1: tab bar, laid out as a centered horizontal row. The active tab is
+    // Row 0: tab bar, laid out as a centered horizontal row. The active tab is
     // accent-colored with an underline marker and has no button (you are
     // already here); every other tab is a button that switches to its view.
+    // There is no "Settings" heading -- the tabs already name the screen, and
+    // dropping it gives the body band an extra row of space.
     let tab_scale = style.text_scale * 1.1;
-    let tab_text_y = text_y(1, tab_scale);
+    let tab_text_y = text_y(0, tab_scale);
     let tab_gap = font_px * AVG_ADVANCE_RATIO * tab_scale * 1.2;
     let tab_widths: Vec<f32> = SETTINGS_TABS
         .iter()
@@ -453,7 +448,7 @@ fn emit_settings_tab(
                 "type": "HitRegion",
                 "args": {
                     "x": tab_x,
-                    "y": row_y(1),
+                    "y": row_y(0),
                     "width": *w,
                     "height": style.button_height,
                     "label": label_name,
@@ -470,7 +465,7 @@ fn emit_settings_tab(
     // bar. Rows past `VISIBLE_SETTINGS_ROWS` (or revealed by expanding a group)
     // overflow the band and scroll. `text_y_at` centers row text on an absolute
     // row top (the body rows are placed by base_y, not by chrome row index).
-    let band_top = row_y(2);
+    let band_top = row_y(1);
     let band_h = VISIBLE_SETTINGS_ROWS as f32 * pitch;
     let text_y_at = |y: f32, scale: f32| y + (style.button_height - font_px * scale) / 2.0;
 

@@ -93,7 +93,8 @@ mod scene_member;
 mod transform;
 
 // HUD-overlay request components. Declaring one runs the matching internal
-// overlay behavior (in the client crate); both are pure data here.
+// overlay behavior (in the client crate); all are pure data here.
+mod debug_hud;
 mod fps_counter;
 mod stat_hud;
 
@@ -211,5 +212,6 @@ pub use scene_member::SceneMember;
 pub use transform::Transform;
 
 // HUD-overlay request components; their behavior lives in the client crate.
+pub use debug_hud::DebugHud;
 pub use fps_counter::FpsCounter;
 pub use stat_hud::StatHud;

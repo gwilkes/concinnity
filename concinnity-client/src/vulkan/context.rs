@@ -1762,6 +1762,14 @@ impl VkContext {
         self.window.set_ui_cursor_hidden(hidden);
     }
 
+    // Whether the real cursor has left the window so the renderer should stop
+    // drawing the in-engine UI cursor (windowed / borderless). Recomputed each
+    // `poll` (in `window_closed`); false while captured or in fullscreen (which
+    // confines the cursor instead).
+    pub fn cursor_outside_window(&self) -> bool {
+        self.window.cursor_outside_window()
+    }
+
     // A togglable menu coexists with a captured camera; see
     // `RenderBackend::set_menu_mode`.
     pub fn set_menu_mode(&mut self, on: bool) {

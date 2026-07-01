@@ -1706,6 +1706,11 @@ impl DxContext {
 impl DxContext {
     pub fn window_closed(&mut self) -> bool {
         pump_messages();
+        // Refresh the in-engine cursor's window-exit / fullscreen-confinement
+        // state now this frame's messages are drained (mirrors the tail of
+        // Metal's `pump_ns_events`). GraphicsSystem reads `cursor_outside_window`
+        // later this same frame.
+        update_ui_cursor_confinement(&mut self.win_state);
         self.win_state.closed
     }
 
@@ -1747,6 +1752,14 @@ impl DxContext {
     // it every frame with the same value is cheap.
     pub fn set_ui_cursor_hidden(&mut self, hidden: bool) {
         do_set_ui_cursor_hidden(&mut self.win_state, hidden);
+    }
+
+    // Whether the real cursor has left the window so the renderer should stop
+    // drawing the in-engine UI cursor (windowed / borderless). Recomputed each
+    // frame by `update_ui_cursor_confinement` in `window_closed`; false while
+    // captured or in fullscreen (which confines the cursor instead).
+    pub fn cursor_outside_window(&self) -> bool {
+        self.win_state.cursor_outside_window
     }
 
     // A togglable menu coexists with a captured camera; see

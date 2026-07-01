@@ -54,6 +54,7 @@ impl RenderBackend for DxContext {
         fn window_closed(&mut self) -> bool;
         fn capture_cursor(&mut self);
         fn set_ui_cursor_hidden(&mut self, hidden: bool);
+        fn cursor_outside_window(&self) -> bool;
         fn set_menu_mode(&mut self, on: bool);
         fn set_camera_capture(&mut self, capture: bool);
         fn set_reflection_probes(&mut self, probes: &[crate::gfx::reflection_probe::ProbePlacement]);

@@ -3,8 +3,8 @@
 
 use objc2::rc::Retained;
 use objc2_app_kit::{
-    NSApplication, NSCursor, NSEventMask, NSEventModifierFlags, NSEventType, NSWindow,
-    NSWindowButton, NSWindowStyleMask, NSWindowTitleVisibility,
+    NSApplication, NSCursor, NSEvent, NSEventMask, NSEventModifierFlags, NSEventType, NSScreen,
+    NSWindow, NSWindowButton, NSWindowStyleMask, NSWindowTitleVisibility,
 };
 use objc2_foundation::{NSDate, NSPoint, NSSize};
 
@@ -66,6 +66,11 @@ pub(super) struct KeyState {
     // produced before CGAssociateMouseAndMouseCursorPosition(0) took
     // effect, often during init) can't snap the camera.
     pub(super) discard_next_motion: bool,
+    // Whether the real cursor has left the window content area while the cursor
+    // is free (windowed / borderless). Recomputed each frame by
+    // `update_ui_cursor_confinement`; the renderer hides the in-engine cursor
+    // when set. False while captured or in fullscreen (which confines instead).
+    pub(super) cursor_outside_window: bool,
 }
 
 unsafe extern "C" {
@@ -161,6 +166,78 @@ impl MtlContext {
         } else {
             NSCursor::unhide();
         }
+    }
+
+    // Whether the real cursor has left the window so the renderer should stop
+    // drawing the in-engine UI cursor. Recomputed each frame by
+    // `update_ui_cursor_confinement`.
+    pub fn cursor_outside_window(&self) -> bool {
+        self.keys.cursor_outside_window
+    }
+
+    // Per-frame bookkeeping for an in-engine UI cursor (a menu): report whether
+    // the real cursor has left the window so the renderer can stop drawing the
+    // cursor in windowed / borderless modes, and confine the cursor to the
+    // active screen while in fullscreen so it cannot stray onto another display.
+    // A no-op while the cursor is captured (a gameplay camera owns the pointer)
+    // or with no host window (embedded preview).
+    fn update_ui_cursor_confinement(&mut self, mtm: objc2::MainThreadMarker) {
+        if self.cursor_captured {
+            self.keys.cursor_outside_window = false;
+            return;
+        }
+        let Some(window) = self.host_window() else {
+            self.keys.cursor_outside_window = false;
+            return;
+        };
+        let Some(screen) = window.screen() else {
+            self.keys.cursor_outside_window = false;
+            return;
+        };
+        // Global cursor position (AppKit screen coordinates, origin bottom-left
+        // of the primary display, y up).
+        let cursor = NSEvent::mouseLocation();
+        if self.fullscreen.load(std::sync::atomic::Ordering::Relaxed) {
+            // Confine to the fullscreen display: if the cursor strayed onto
+            // another monitor, warp it back just inside the edge. A
+            // single-display fullscreen is already confined by the OS, so this
+            // never fires there.
+            let sf = screen.frame();
+            let (min_x, max_x) = (sf.origin.x, sf.origin.x + sf.size.width);
+            let (min_y, max_y) = (sf.origin.y, sf.origin.y + sf.size.height);
+            // Only warp when actually off the screen, so a cursor resting near
+            // the edge is never nudged (an unconditional clamp would warp a
+            // valid sub-pixel position in the last row/column every frame).
+            let outside =
+                cursor.x < min_x || cursor.x >= max_x || cursor.y < min_y || cursor.y >= max_y;
+            if outside {
+                let cx = cursor.x.clamp(min_x, max_x - 1.0);
+                let cy = cursor.y.clamp(min_y, max_y - 1.0);
+                // CGWarpMouseCursorPosition takes the global display coordinate
+                // space (origin top-left of the primary display, y down); flip Y
+                // about the PRIMARY display height (screens[0], the (0,0)-origin
+                // screen), which is correct for any monitor arrangement -- not
+                // just when the window is on the main display.
+                let screens = NSScreen::screens(mtm);
+                let primary_h = if screens.count() > 0 {
+                    screens.objectAtIndex(0).frame().size.height
+                } else {
+                    sf.size.height
+                };
+                let warp = NSPoint::new(cx, primary_h - cy);
+                unsafe { CGWarpMouseCursorPosition(warp) };
+            }
+            self.keys.cursor_outside_window = false;
+            return;
+        }
+        // Windowed / borderless: the in-engine cursor shows only while the real
+        // cursor is over the content area.
+        let content = window.contentRectForFrameRect(window.frame());
+        let inside = cursor.x >= content.origin.x
+            && cursor.x < content.origin.x + content.size.width
+            && cursor.y >= content.origin.y
+            && cursor.y < content.origin.y + content.size.height;
+        self.keys.cursor_outside_window = !inside;
     }
 
     // Show the cursor and stop accumulating mouse deltas.
@@ -437,16 +514,14 @@ impl MtlContext {
                             self.keys.mouse_dy += event.deltaY() as f32;
                         }
                     } else {
-                        // Track absolute position for UI hit-testing.
-                        // locationInWindow() origin is bottom-left of the content area (AppKit
-                        // convention); flip Y so (0,0) is top-left, matching TextLabel coords.
-                        let loc = event.locationInWindow();
-                        let h = self
-                            .host_window()
-                            .map(|w| w.contentRectForFrameRect(w.frame()).size.height as f32)
-                            .unwrap_or(720.0);
-                        self.keys.mouse_x = loc.x as f32;
-                        self.keys.mouse_y = h - loc.y as f32;
+                        // Track the absolute cursor position for UI hit-testing and
+                        // the in-engine pointer, in MTKView pixels with a top-left
+                        // origin (see cursor_in_content: sourced from the global
+                        // cursor position so a fullscreen menu-bar reveal cannot
+                        // fling the pointer off screen).
+                        let (mx, my) = self.cursor_in_content();
+                        self.keys.mouse_x = mx;
+                        self.keys.mouse_y = my;
                     }
                 }
                 NSEventType::LeftMouseDown => {
@@ -490,18 +565,48 @@ impl MtlContext {
                 }
             }
         }
+        // After draining this frame's events, refresh the in-engine cursor's
+        // window-exit / fullscreen-confinement state.
+        self.update_ui_cursor_confinement(mtm);
     }
 
-    // Returns true when the event's click position is inside the window's
-    // content area (below the title bar). Title-bar clicks (traffic lights,
-    // drag area) return false so they don't trigger cursor recapture.
-    fn in_content_area(&self, event: &objc2_app_kit::NSEvent) -> bool {
+    // The live cursor position in MTKView pixels with a top-left origin, for UI
+    // hit-testing and the in-engine pointer. The Y flip is about the live
+    // `mtk_view.bounds()` height -- the exact view the renderer draws the overlay
+    // + cursor against (`MtlContext::logical_size`) -- and the conversion goes
+    // through the MTKView (not `window.contentView()`, which in embedded
+    // play-in-view mode is the host's content view rather than our subview), so
+    // pointer and draw share one reference in every window mode.
+    fn cursor_in_content(&self) -> (f32, f32) {
+        // Source the pointer from the GLOBAL cursor position, NOT from a mouse
+        // event's `locationInWindow`. When macOS auto-reveals the menu bar over a
+        // native-fullscreen window it shrinks the window and delivers the move
+        // events relative to a transient system window, so `locationInWindow`
+        // collapses to a bogus value (measured: cursor pinned at the physical
+        // screen top -> loc.y jumps from ~1060 to 64 in a 1084-tall window,
+        // flinging the pointer to the bottom). `NSEvent::mouseLocation()` stays
+        // correct throughout, so convert THAT through our own window + MTKView.
+        let glob = NSEvent::mouseLocation();
         let Some(window) = self.host_window() else {
-            return false;
+            return (glob.x as f32, 0.0);
         };
-        let content_h = window.contentRectForFrameRect(window.frame()).size.height;
+        let win_pt = window.convertPointFromScreen(glob);
+        let p = self.mtk_view.convertPoint_fromView(win_pt, None);
+        let h = self.mtk_view.bounds().size.height;
+        (p.x as f32, (h - p.y) as f32)
+    }
+
+    // Returns true when the event's click position is inside the MTKView's
+    // drawable area (below the title bar). Title-bar clicks (traffic lights,
+    // drag area) land above the view and return false so they don't trigger
+    // cursor recapture. Uses the MTKView's own coordinate system + bounds (the
+    // same reference as cursor_in_content) rather than
+    // `contentRectForFrameRect(frame)`, which diverges during a fullscreen
+    // title-bar reveal.
+    fn in_content_area(&self, event: &NSEvent) -> bool {
         let loc = event.locationInWindow();
-        loc.y >= 0.0 && loc.y < content_h
+        let p = self.mtk_view.convertPoint_fromView(loc, None);
+        p.y >= 0.0 && p.y < self.mtk_view.bounds().size.height
     }
 
     // Replace the runtime movement key map. `handle_key` decodes events through

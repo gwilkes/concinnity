@@ -52,6 +52,21 @@ pub(super) struct WindowState {
     // Camera3D world). When set, Escape routes to the ECS and clicks never
     // recapture; GraphicsSystem drives capture from the active menu instead.
     pub(super) menu_mode: bool,
+    // The current window mode. Tracked so the per-frame cursor confinement
+    // knows whether to confine (Fullscreen) or hide the in-engine arrow on
+    // leave (Windowed / Borderless). The window is always created windowed;
+    // `do_set_window_mode` keeps this in sync as the settings menu cycles it.
+    pub(super) window_mode: WindowMode,
+    // Whether the real cursor has left the window content area while the cursor
+    // is free (windowed / borderless). Recomputed each frame by
+    // `update_ui_cursor_confinement`; the renderer hides the in-engine cursor
+    // when set. False while captured or in fullscreen (which confines instead).
+    pub(super) cursor_outside_window: bool,
+    // Whether the per-frame confinement currently holds a `ClipCursor` clip for
+    // a fullscreen menu (distinct from capture's own clip). Tracked so the clip
+    // is released exactly once when the confining condition ends (mode change or
+    // capture engaging), keeping it balanced against capture's clip.
+    pub(super) menu_clip_active: bool,
     pub(super) closed: bool,
     pub(super) width: i32,
     pub(super) height: i32,
@@ -115,6 +130,105 @@ pub(super) fn do_set_ui_cursor_hidden(state: &mut WindowState, hidden: bool) {
     unsafe { ShowCursor(!hidden) };
 }
 
+// The window's client area in screen coordinates (top-left origin, y down),
+// or None if the rect query fails. Shared by the confinement's content-area
+// test and its fullscreen `ClipCursor` bounds.
+fn client_screen_rect(hwnd: HWND) -> Option<RECT> {
+    let mut rect = RECT::default();
+    if unsafe { GetClientRect(hwnd, &mut rect) }.is_err() {
+        return None;
+    }
+    let mut tl = POINT {
+        x: rect.left,
+        y: rect.top,
+    };
+    let mut br = POINT {
+        x: rect.right,
+        y: rect.bottom,
+    };
+    unsafe {
+        if ClientToScreen(hwnd, &mut tl).as_bool() && ClientToScreen(hwnd, &mut br).as_bool() {
+            Some(RECT {
+                left: tl.x,
+                top: tl.y,
+                right: br.x,
+                bottom: br.y,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+// Per-frame bookkeeping for an in-engine UI cursor (a menu), mirroring the
+// Metal `update_ui_cursor_confinement`: report whether the real cursor has left
+// the window content area so the renderer can stop drawing the in-engine cursor
+// in windowed / borderless modes, and confine the cursor to the window while in
+// fullscreen so it cannot stray onto another display. A no-op while the cursor
+// is captured (a gameplay camera owns the pointer). Called each frame after the
+// message pump; `cursor_outside_window` is read by GraphicsSystem the same frame.
+pub(super) fn update_ui_cursor_confinement(state: &mut WindowState) {
+    // While captured the pointer is already clipped + hidden for the camera, so
+    // there is no in-engine arrow to hide and nothing to confine here. Capture
+    // owns the clip now (`do_capture_cursor` set its own), so just relinquish our
+    // flag without releasing -- releasing would undo capture's clip.
+    if state.cursor_captured {
+        state.menu_clip_active = false;
+        state.cursor_outside_window = false;
+        return;
+    }
+    let mut cursor = POINT::default();
+    let (Ok(()), Some(rect)) = (
+        unsafe { GetCursorPos(&mut cursor) },
+        client_screen_rect(state.hwnd),
+    ) else {
+        release_menu_clip(state);
+        state.cursor_outside_window = false;
+        return;
+    };
+    if matches!(state.window_mode, WindowMode::Fullscreen) {
+        // Confine the cursor to the fullscreen window so a menu pointer cannot
+        // wander onto another monitor -- but ONLY while this window is the
+        // foreground window. ClipCursor is a global per-desktop resource: Windows
+        // drops our clip when the window is deactivated, and the render loop keeps
+        // ticking while backgrounded (run_loop_default never blocks on the message
+        // pump), so re-asserting the clip unconditionally would yank the cursor
+        // away from whatever app the user Alt+Tabbed to. When not foreground we
+        // just clear our flag: Windows already released the clip, and issuing our
+        // own ClipCursor(None) from the background could stomp the foreground app's
+        // clip. It is a hard OS confine (no visible snap-back), re-applied each
+        // frame while foreground; released once when the condition ends
+        // (see `release_menu_clip`).
+        if unsafe { GetForegroundWindow() } == state.hwnd {
+            let _ = unsafe { ClipCursor(Some(&rect)) };
+            state.menu_clip_active = true;
+        } else {
+            state.menu_clip_active = false;
+        }
+        state.cursor_outside_window = false;
+        return;
+    }
+    // Windowed / borderless: the in-engine cursor shows only while the real
+    // cursor is over the content area. Drop any fullscreen menu clip first (the
+    // mode may have just changed out of fullscreen).
+    release_menu_clip(state);
+    let inside = cursor.x >= rect.left
+        && cursor.x < rect.right
+        && cursor.y >= rect.top
+        && cursor.y < rect.bottom;
+    state.cursor_outside_window = !inside;
+}
+
+// Release the fullscreen-menu `ClipCursor` clip if the confinement holds one.
+// Edge-triggered so it is balanced against capture's own clip and never frees a
+// clip we do not own.
+fn release_menu_clip(state: &mut WindowState) {
+    if state.menu_clip_active {
+        state.menu_clip_active = false;
+        let _ = unsafe { ClipCursor(None) };
+    }
+}
+
 // NOTE: the window-mode / window-size helpers below mirror the Metal
 // implementation (`metal/input.rs`) for cross-backend parity but are written on
 // macOS and have NOT been built or run on Windows; verify the exact `windows`
@@ -128,6 +242,9 @@ pub(super) fn do_set_ui_cursor_hidden(state: &mut WindowState, hidden: bool) {
 // WM_SIZE, which the resize path turns into a ResizeBuffers.
 pub(super) fn do_set_window_mode(state: &mut WindowState, mode: WindowMode) {
     let hwnd = state.hwnd;
+    // Record the mode so the per-frame cursor confinement can tell fullscreen
+    // (confine) from windowed / borderless (hide the arrow on leave).
+    state.window_mode = mode;
     unsafe {
         match mode {
             WindowMode::Windowed => {
@@ -425,6 +542,11 @@ pub(super) fn create_window(
         recapture_on_click: false,
         ui_cursor_hidden: false,
         menu_mode: false,
+        // The window is created as a standard titled window; a persisted
+        // Borderless / Fullscreen choice is applied later via set_window_mode.
+        window_mode: WindowMode::Windowed,
+        cursor_outside_window: false,
+        menu_clip_active: false,
         closed: false,
         width: width as i32,
         height: height as i32,

@@ -1,24 +1,22 @@
 // src/hud/stat_hud.rs
 //
-// Performance-HUD overlay behavior. An internal system (not a declarable
+// Default stats-HUD overlay behavior. An internal system (not a declarable
 // asset): `World::start` constructs one from the world's `StatHud` component
 // and it writes live engine stats into that component's `TextLabel` chips.
+//
+// The frame-rate and GPU-memory chips are gated by the in-game video setting
+// "Display performance stats" (published by `GraphicsSystem` as the `HudPrefs`
+// resource); the exposure and HDR chips show whenever their feature is active.
+// Developer readouts (passes / cursor / camera) live on `DebugHud`.
 
-use crate::assets::{Camera3D, FrameInput, StatHud, TextLabel};
+use crate::assets::{StatHud, TextLabel};
 use crate::ecs::asset_id::AssetId;
-use crate::ecs::{PipelineContext, StepResult, System};
-use crate::gfx::profile::PassTiming;
+use crate::ecs::{HudPrefs, PipelineContext, StepResult, System};
 use std::time::Instant;
 
 // How often the chip text is rebuilt, in seconds. The frame rate is averaged
 // over this window so the number is readable rather than flickering.
 const EMIT_INTERVAL_SECS: f32 = 0.5;
-
-// How many per-pass entries the passes chip lists. Picked to fit comfortably
-// under the FPS / VRAM / EV / EDR strip on a typical 720p+ HUD; passes past
-// this count are dropped from the chip (still visible via the debug WS
-// `profile.passes` reply).
-const PASSES_CHIP_TOP_N: usize = 6;
 
 // Build the frame-rate chip text from a frame count over an elapsed window.
 fn fps_text(frames: u32, elapsed_secs: f32) -> String {
@@ -54,81 +52,16 @@ fn edr_text(max_edr: Option<f32>) -> String {
     }
 }
 
-// Build the cursor-position chip text from the latest window-space cursor
-// coordinates (origin top-left). Rounded to whole pixels: sub-pixel jitter is
-// not useful on a debug readout. The reading is only meaningful when the
-// cursor is not captured (free-look worlds leave it stale); the chip still
-// renders so a screenshot carries a reference point.
-fn mouse_text(x: f32, y: f32) -> String {
-    format!("MOUSE {x:.0}, {y:.0}")
-}
-
-// Build the camera-pose chip text from the live `Camera3D` pose, or blank when
-// the world has no camera. The values are exactly what the debug `camera-set`
-// command consumes, so a screenshot of this chip carries the arguments to
-// reproduce the shot.
-fn camera_text(pose: Option<([f32; 3], f32, f32)>) -> String {
-    match pose {
-        Some((p, yaw, pitch)) => {
-            format!(
-                "CAM {:.2} {:.2} {:.2}\nyaw {yaw:.3} pitch {pitch:.3}",
-                p[0], p[1], p[2]
-            )
-        }
-        None => String::new(),
-    }
-}
-
-// Build the per-pass timing chip text from the active backend's
-// `RenderStats.pass_times_us` array. Picks the top
-// [`PASSES_CHIP_TOP_N`] entries by GPU microseconds, descending, one per
-// line as `name µs`. Returns an empty string when every slot is at the
-// default `("", 0)` (the chip then renders nothing, DX/Vulkan keep it
-// blank until their per-pass timing pools land).
+// Draws the default stats HUD: an `FPS` chip, a `VRAM` chip, an `EV` chip (when
+// auto-exposure is on), and an `EDR` chip (when the renderer is on the HDR
+// display path), each written into its own `TextLabel`. Give the labels a
+// `background` colour for the boxed look.
 //
-// **Apple-GPU caveat:** the GPU overlaps fragment work across encoders,
-// so summing these values exceeds `gpu_frame_us`. Display them as
-// per-pass attributions, not as components of a total. The chip's
-// "PASSES" header is meant to make that obvious at a glance: there is
-// no row labelled "total".
-fn passes_text(slots: &[PassTiming]) -> String {
-    let mut entries: Vec<(&'static str, u32)> = slots
-        .iter()
-        .copied()
-        .filter(|(name, micros)| !name.is_empty() && *micros > 0)
-        .collect();
-    if entries.is_empty() {
-        return String::new();
-    }
-    // Sort descending by µs; stable so equal-time passes keep their
-    // PassId-order (alphabetical-ish across a typical frame).
-    entries.sort_by_key(|e| std::cmp::Reverse(e.1));
-    entries.truncate(PASSES_CHIP_TOP_N);
-    let mut out = String::from("PASSES");
-    for (name, micros) in entries {
-        out.push('\n');
-        out.push_str(name);
-        out.push(' ');
-        // Format compactly. < 1 ms reads as raw µs (e.g. "120 us"); ≥ 1 ms
-        // reads as a single-decimal millisecond figure ("1.2 ms"). Keeps
-        // the column width steady across the typical 50 µs to 5 ms band.
-        if micros < 1000 {
-            out.push_str(&format!("{micros} us"));
-        } else {
-            out.push_str(&format!("{:.1} ms", micros as f32 / 1000.0));
-        }
-    }
-    out
-}
-
-// Draws a compact performance HUD: an `FPS` chip, a `VRAM` chip, an `EV`
-// chip (when auto-exposure is on), and an `EDR` chip (when the renderer is
-// on the HDR display path), each written into its own `TextLabel`. Give
-// the labels a `background` colour for the boxed look. The HUD is toggled
-// on and off at runtime with **F1**.
-//
-// The detailed per-system timing breakdown is not drawn on screen: it is
-// reported by the runtime debug server's `profile` command instead.
+// The `FPS` and `VRAM` chips are shown or hidden from the in-game video
+// settings ("Display performance stats" + per-readout toggles); the `EV` and
+// `EDR` chips appear automatically whenever their feature is active. The
+// per-system timing breakdown, cursor position, and camera pose are on the
+// separate `DebugHud` (F1).
 //
 // `VRAM` is the render device's current allocation; on Apple Silicon's
 // unified memory that is its share of system RAM. Filled on Metal
@@ -148,24 +81,13 @@ fn passes_text(slots: &[PassTiming]) -> String {
 // platform reports an EDR headroom above SDR reference white; the chip
 // stays blank on SDR or when the HDR request fell back.
 //
-// `PASSES` is a multi-line chip listing the top six render-graph passes
-// of the last completed frame in descending GPU-microsecond order
-// (e.g. `main 1.4 ms`, `shadow 380 us`). Filled on Metal when the device
-// exposes `MTLCommonCounterSetTimestamp`; the chip stays blank on
-// DirectX and Vulkan until their per-pass timing pools land. **The
-// values are per-pass attributions, not components of `gpu_frame_us`**:
-// the Apple GPU overlaps fragment work across encoders, so summing
-// these consistently exceeds the whole-frame timer. RenderDoc /
-// Instruments behave the same way; treat each row as standalone.
-//
 // ```jsonl
 // {"type":"Font","name":"hud_font","args":{"size_px":20}}
 // {"type":"TextLabel","name":"fps_chip","args":{"font":"hud_font","x":10,"y":10,"scale":0.7,"color":[1,1,1],"background":[0,0.22,0.08,0.85],"padding":5}}
 // {"type":"TextLabel","name":"vram_chip","args":{"font":"hud_font","x":92,"y":10,"scale":0.7,"color":[1,1,1],"background":[0,0.22,0.08,0.85],"padding":5}}
 // {"type":"TextLabel","name":"ev_chip","args":{"font":"hud_font","x":192,"y":10,"scale":0.7,"color":[1,1,1],"background":[0,0.22,0.08,0.85],"padding":5}}
 // {"type":"TextLabel","name":"edr_chip","args":{"font":"hud_font","x":272,"y":10,"scale":0.7,"color":[1,1,1],"background":[0,0.22,0.08,0.85],"padding":5}}
-// {"type":"TextLabel","name":"passes_chip","args":{"font":"hud_font","x":10,"y":36,"scale":0.6,"color":[1,1,1],"background":[0,0.22,0.08,0.85],"padding":5}}
-// {"type":"StatHud","name":"hud","args":{"fps_label":"fps_chip","vram_label":"vram_chip","ev_label":"ev_chip","edr_label":"edr_chip","passes_label":"passes_chip"}}
+// {"type":"StatHud","name":"hud","args":{"fps_label":"fps_chip","vram_label":"vram_chip","ev_label":"ev_chip","edr_label":"edr_chip"}}
 // ```
 #[derive(Debug)]
 pub struct StatHudSystem {
@@ -173,11 +95,6 @@ pub struct StatHudSystem {
     vram_label: Option<AssetId>,
     ev_label: Option<AssetId>,
     edr_label: Option<AssetId>,
-    passes_label: Option<AssetId>,
-    mouse_label: Option<AssetId>,
-    camera_label: Option<AssetId>,
-    // Whether the HUD is currently shown. Toggled by F1.
-    visible: bool,
     // Start of the current averaging window.
     last_emit: Instant,
     // Frames counted since `last_emit`.
@@ -190,15 +107,6 @@ pub struct StatHudSystem {
     // Most recent panel EDR multiplier; `None` on the SDR path (the chip
     // is then blanked).
     max_edr: Option<f32>,
-    // Most recent per-pass GPU microseconds (a snapshot of
-    // `RenderStats.pass_times_us`); empty when the active backend has
-    // no per-pass timing wired and the chip therefore stays blank.
-    pass_times: Vec<PassTiming>,
-    // Most recent cursor position (window pixels) from `FrameInput`.
-    mouse_pos: (f32, f32),
-    // Most recent live camera pose (position, yaw, pitch); `None` until a
-    // `Camera3D` is seen (a world with no camera leaves the chip blank).
-    camera_pose: Option<([f32; 3], f32, f32)>,
 }
 
 impl StatHudSystem {
@@ -209,18 +117,11 @@ impl StatHudSystem {
             vram_label: config.vram_label,
             ev_label: config.ev_label,
             edr_label: config.edr_label,
-            passes_label: config.passes_label,
-            mouse_label: config.mouse_label,
-            camera_label: config.camera_label,
-            visible: true,
             last_emit: Instant::now(),
             frames: 0,
             vram_bytes: 0,
             ev: None,
             max_edr: None,
-            pass_times: Vec::new(),
-            mouse_pos: (0.0, 0.0),
-            camera_pose: None,
         }
     }
 
@@ -240,65 +141,44 @@ impl StatHudSystem {
 
 impl System for StatHudSystem {
     fn step(&mut self, ctx: &mut PipelineContext) -> StepResult {
-        // F1 toggles the HUD. The per-frame input snapshot is read from the
-        // FrameInput resource GraphicsSystem publishes earlier in the frame; it
-        // also carries the cursor position for the mouse chip.
-        let frame_input = ctx.resource::<FrameInput>();
-        let toggled = frame_input.is_some_and(|input| input.hud_toggle);
-        if let Some(input) = frame_input {
-            self.mouse_pos = (input.mouse_x, input.mouse_y);
-        }
-        if toggled {
-            self.visible = !self.visible;
-            self.frames = 0;
-            self.last_emit = Instant::now();
-        }
-
-        if !self.visible {
-            // Blank chips read as empty content -> the renderer draws neither
-            // text nor the background box, so the HUD fully disappears.
-            Self::write_chip(ctx, self.fps_label, String::new());
-            Self::write_chip(ctx, self.vram_label, String::new());
-            Self::write_chip(ctx, self.ev_label, String::new());
-            Self::write_chip(ctx, self.edr_label, String::new());
-            Self::write_chip(ctx, self.passes_label, String::new());
-            Self::write_chip(ctx, self.mouse_label, String::new());
-            Self::write_chip(ctx, self.camera_label, String::new());
-            return StepResult::Continue;
-        }
+        // Per-chip visibility from the "Display performance stats" video
+        // settings, published each frame by GraphicsSystem. Absent (a HUD-only
+        // unit test with no GraphicsSystem) -> both shown, matching the old
+        // default-visible behavior.
+        let (show_fps, show_vram) = ctx
+            .resource::<HudPrefs>()
+            .map_or((true, true), |p| (p.show_fps, p.show_vram));
 
         self.frames += 1;
         self.vram_bytes = ctx.profile.render.vram_bytes;
         self.ev = ctx.profile.render.auto_exposure_ev;
         self.max_edr = ctx.profile.render.max_edr;
-        // Snapshot the per-pass slots once per frame so the chip refresh
-        // works off a single stable sample instead of racing each
-        // half-second emit against the latest atomic readback.
-        self.pass_times.clear();
-        self.pass_times
-            .extend_from_slice(&ctx.profile.render.pass_times_us);
-        // Live camera pose for the camera chip. Read here (before
-        // Camera3DSystem steps) so a screenshot carries a settled reference
-        // pose; one component read, cheap to refresh every frame.
-        self.camera_pose = ctx
-            .query::<Camera3D>()
-            .next()
-            .map(|c| (c.position, c.yaw, c.pitch));
 
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_emit).as_secs_f32();
         if elapsed >= EMIT_INTERVAL_SECS {
-            Self::write_chip(ctx, self.fps_label, fps_text(self.frames, elapsed));
-            Self::write_chip(ctx, self.vram_label, vram_text(self.vram_bytes));
-            Self::write_chip(ctx, self.ev_label, ev_text(self.ev));
-            Self::write_chip(ctx, self.edr_label, edr_text(self.max_edr));
-            Self::write_chip(ctx, self.passes_label, passes_text(&self.pass_times));
+            // A blank chip reads as empty content -> the renderer draws neither
+            // text nor the background box, so a disabled chip fully disappears.
             Self::write_chip(
                 ctx,
-                self.mouse_label,
-                mouse_text(self.mouse_pos.0, self.mouse_pos.1),
+                self.fps_label,
+                if show_fps {
+                    fps_text(self.frames, elapsed)
+                } else {
+                    String::new()
+                },
             );
-            Self::write_chip(ctx, self.camera_label, camera_text(self.camera_pose));
+            Self::write_chip(
+                ctx,
+                self.vram_label,
+                if show_vram {
+                    vram_text(self.vram_bytes)
+                } else {
+                    String::new()
+                },
+            );
+            Self::write_chip(ctx, self.ev_label, ev_text(self.ev));
+            Self::write_chip(ctx, self.edr_label, edr_text(self.max_edr));
             self.frames = 0;
             self.last_emit = now;
         }
@@ -379,106 +259,6 @@ mod tests {
         assert_eq!(edr_text(Some(f32::INFINITY)), "");
         assert_eq!(edr_text(Some(0.0)), "");
         assert_eq!(edr_text(Some(-1.0)), "");
-    }
-
-    #[test]
-    fn passes_text_blanks_on_all_zero_slots() {
-        // Every slot at the default ("", 0) → DX/Vulkan baseline → chip
-        // stays empty so the HUD doesn't render an orphan "PASSES" header.
-        let slots = vec![("", 0u32); 8];
-        assert_eq!(passes_text(&slots), "");
-    }
-
-    #[test]
-    fn passes_text_lists_top_entries_descending() {
-        // Five recorded passes, three of them above the truncation cutoff
-        // for a Top-N=6 chip. Order is by µs descending, regardless of the
-        // input slot order.
-        let slots = vec![
-            ("shadow", 380),
-            ("", 0),
-            ("main", 1400),
-            ("ssao_kernel", 120),
-            ("composite", 60),
-            ("ssr_resolve", 800),
-            ("", 0),
-        ];
-        let out = passes_text(&slots);
-        // Header first, then six lines for the recorded entries (well
-        // under PASSES_CHIP_TOP_N so no truncation).
-        let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines[0], "PASSES");
-        assert_eq!(lines[1], "main 1.4 ms");
-        assert_eq!(lines[2], "ssr_resolve 800 us");
-        assert_eq!(lines[3], "shadow 380 us");
-        assert_eq!(lines[4], "ssao_kernel 120 us");
-        assert_eq!(lines[5], "composite 60 us");
-        assert_eq!(lines.len(), 6);
-    }
-
-    #[test]
-    fn passes_text_truncates_to_top_n() {
-        // Eight non-empty slots, all distinct microsecond values → the
-        // chip keeps only the top PASSES_CHIP_TOP_N (= 6) and drops the
-        // smallest two.
-        let slots: Vec<PassTiming> = vec![
-            ("a", 80),
-            ("b", 70),
-            ("c", 60),
-            ("d", 50),
-            ("e", 40),
-            ("f", 30),
-            ("g", 20),
-            ("h", 10),
-        ];
-        let out = passes_text(&slots);
-        // Header line + exactly PASSES_CHIP_TOP_N entries.
-        let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines.len(), 1 + PASSES_CHIP_TOP_N);
-        // The two smallest passes are dropped: never appear in the chip.
-        assert!(!out.contains("g "));
-        assert!(!out.contains("h "));
-    }
-
-    #[test]
-    fn passes_text_formats_microseconds_below_one_ms() {
-        // < 1000 µs reads as a bare integer; ≥ 1000 µs reads as a
-        // single-decimal millisecond figure.
-        let slots = vec![
-            ("a", 999u32),
-            ("b", 1000u32),
-            ("c", 1499u32),
-            ("d", 1500u32),
-        ];
-        let out = passes_text(&slots);
-        assert!(out.contains("a 999 us"));
-        assert!(out.contains("b 1.0 ms"));
-        assert!(out.contains("c 1.5 ms"));
-        assert!(out.contains("d 1.5 ms"));
-    }
-
-    #[test]
-    fn mouse_text_rounds_to_whole_pixels() {
-        assert_eq!(mouse_text(0.0, 0.0), "MOUSE 0, 0");
-        // Sub-pixel coordinates round to the nearest whole pixel.
-        assert_eq!(mouse_text(640.4, 360.6), "MOUSE 640, 361");
-    }
-
-    #[test]
-    fn camera_text_formats_pose_in_camera_set_form() {
-        // Position to two decimals, yaw/pitch to three, on two lines so the
-        // chip reads back as the camera-set arguments.
-        let out = camera_text(Some(([3.0, 1.6, 20.0], 1.2, -0.1)));
-        let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines[0], "CAM 3.00 1.60 20.00");
-        assert_eq!(lines[1], "yaw 1.200 pitch -0.100");
-    }
-
-    #[test]
-    fn camera_text_blanks_without_camera() {
-        // No Camera3D in the world: the chip stays empty rather than showing a
-        // stale or zeroed pose.
-        assert_eq!(camera_text(None), "");
     }
 
     // A StatHud component spawns the internal HUD system.

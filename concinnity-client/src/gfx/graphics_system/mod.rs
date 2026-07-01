@@ -58,6 +58,21 @@ pub struct GraphicsSystem {
     // running target for the next frame's start.
     fps_cap: u32,
     next_frame_deadline: Option<Instant>,
+    // Stats-HUD display state (GraphicsSettings perf_stats / show_fps / show_vram;
+    // default shown). `perf_stats` is the master "Display performance stats"
+    // toggle; the per-readout flags gate the FPS / VRAM chips under it. Published
+    // each frame as the `HudPrefs` resource for StatHudSystem, and persisted +
+    // applied live by the settings-menu rows. When the master is off the two
+    // sub-rows are grayed (their captured labels in `perf_sub_row_labels`) and
+    // made inert (the `DisabledSettingRows` resource read by UiInputSystem).
+    perf_stats: bool,
+    show_fps: bool,
+    show_vram: bool,
+    // The TextLabel ids of the show_fps / show_vram rows with their authored
+    // colors, captured at init so the master toggle can gray them and restore
+    // them (the menu's HitRegions are drained after init, so the row -> label map
+    // is captured once rather than re-queried).
+    perf_sub_row_labels: Vec<(AssetId, [f32; 3])>,
     // Whether a menu view was open last frame. The pacer runs before this
     // frame's menu state is known, so it reads the previous frame's value to
     // clamp the frame rate down to `MENU_FPS_CAP` while a menu is up (no need
@@ -87,6 +102,13 @@ pub struct GraphicsSystem {
     // a frame after the input that moved them (the draw list is built before
     // the frame's input is polled).
     cursor_pos: (f32, f32),
+    // Whether the real cursor has left the window (windowed / borderless), so
+    // the in-engine cursor stops drawing instead of lingering at the edge.
+    // Cached from the backend after each poll (the draw list is built before the
+    // poll), like `cursor_pos`. False (inside) in fullscreen, where the backend
+    // confines the cursor to the screen, and on backends without window-bounds
+    // tracking (DX / Vulkan).
+    cursor_outside_window: bool,
     // A togglable menu (a View) coexists with a controlled Camera3D. When set,
     // cursor capture is driven each frame by whether a menu view is active
     // (release while open, capture otherwise) rather than fixed at startup.
@@ -128,6 +150,15 @@ pub struct GraphicsSystem {
     prev_elapsed: f32,
     // Font atlas data, keyed by asset id, built during init().
     loaded_fonts: std::collections::HashMap<AssetId, text::LoadedFont>,
+    // DebugHud chip ids in stack order (cursor, camera, passes), captured at
+    // init. The frame step anchors them to the top-right of the window and
+    // stacks them downward; empty when the world has no DebugHud.
+    debug_hud_chips: Vec<AssetId>,
+    // StatHud chip ids in strip order (fps, vram, ev, edr), captured at init.
+    // The frame step packs them left-to-right from the top-left of the window
+    // with a small gap, skipping blank chips; empty when the world has no
+    // StatHud.
+    stat_hud_chips: Vec<AssetId>,
     // Asset-streaming subsystem for the albedo texture pool. Some only when a
     // StreamingConfig was declared and the backend supports it (Metal); None
     // means every texture was uploaded eagerly at init, as before. Read only
@@ -383,6 +414,10 @@ impl GraphicsSystem {
             frames_in_flight: 2,
             vsync: false,
             fps_cap: 0,
+            perf_stats: true,
+            show_fps: true,
+            show_vram: true,
+            perf_sub_row_labels: Vec::new(),
             next_frame_deadline: None,
             menu_active_prev: false,
             max_frames: None,
@@ -395,6 +430,7 @@ impl GraphicsSystem {
             start_time: None,
             frame_count: 0,
             cursor_pos: (0.0, 0.0),
+            cursor_outside_window: false,
             menu_mode: false,
             render_scale: crate::assets::UpscaleQuality::default(),
             upscale_backend: crate::assets::UpscalerBackend::default(),
@@ -407,6 +443,8 @@ impl GraphicsSystem {
             spawn_cmd_cursor: crate::ecs::EventCursor::default(),
             prev_elapsed: 0.0,
             loaded_fonts: std::collections::HashMap::new(),
+            debug_hud_chips: Vec::new(),
+            stat_hud_chips: Vec::new(),
             texture_streamer: None,
             normal_map_streamer: None,
             mesh_streamer: None,

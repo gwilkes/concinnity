@@ -13,6 +13,18 @@
 use crate::assets::{Key, WindowMode};
 use crate::gfx::keymap::KeyMap;
 
+// Win32 cursor clipping for the fullscreen menu confine. GLFW has no
+// clip-to-window mode for a FREE cursor, so on Windows we reach through the
+// window's HWND and use `ClipCursor` directly -- a hard OS boundary the cursor
+// physically cannot cross -- exactly like the DirectX backend, instead of the
+// per-poll warp-back (which visibly overshoots + fights on a multi-monitor edge).
+#[cfg(target_os = "windows")]
+use windows::Win32::Foundation::{HWND, POINT, RECT};
+#[cfg(target_os = "windows")]
+use windows::Win32::Graphics::Gdi::ClientToScreen;
+#[cfg(target_os = "windows")]
+use windows::Win32::UI::WindowsAndMessaging::{ClipCursor, GetClientRect, GetForegroundWindow};
+
 // Accumulated input state between poll() calls.
 // Snapshotted by GraphicsSystem each step via take_input(); held-key state
 // persists across the call, momentary/accumulated fields reset.
@@ -83,6 +95,23 @@ pub struct GlfwWindow {
     // Camera3D world). When set, Escape routes to the ECS instead of releasing
     // the cursor inline; GraphicsSystem drives capture from the active menu.
     menu_mode: bool,
+    // The current window mode. Tracked so the per-frame cursor confinement knows
+    // whether to confine (Fullscreen) or hide the in-engine arrow on leave
+    // (Windowed / Borderless). Seeded from the creation mode and kept in sync by
+    // `set_window_mode`.
+    window_mode: WindowMode,
+    // Whether the real cursor has left the window content area while the cursor
+    // is free (windowed / borderless). Recomputed each poll by
+    // `update_ui_cursor_confinement`; the renderer hides the in-engine cursor
+    // when set. False while captured or in fullscreen (which confines instead).
+    cursor_outside_window: bool,
+    // Whether the per-poll confinement currently holds a Win32 `ClipCursor` clip
+    // for a fullscreen menu. Tracked so the clip is released exactly once when the
+    // confining condition ends (mode change or capture engaging, which hands the
+    // clip to GLFW's Disabled mode). Windows-only: other platforms fall back to
+    // the per-poll cursor clamp, which holds no OS state.
+    #[cfg(target_os = "windows")]
+    menu_clip_active: bool,
     // The runtime movement key map. The key event arm decodes through it instead
     // of hardcoded keys, so a settings-menu rebind takes effect immediately.
     // Defaults to W/S/A/D/Shift/Space/E. (GLFW delivers Shift as Left/Right Shift
@@ -92,6 +121,37 @@ pub struct GlfwWindow {
 
 // GlfwWindow is only ever used on the thread that created it.
 unsafe impl Send for GlfwWindow {}
+
+// The window's client area in screen coordinates (top-left origin, y down), or
+// None if the rect query fails. The `ClipCursor` bounds for the fullscreen menu
+// confine (mirrors the DirectX `client_screen_rect`).
+#[cfg(target_os = "windows")]
+fn client_screen_rect(hwnd: HWND) -> Option<RECT> {
+    let mut rect = RECT::default();
+    if unsafe { GetClientRect(hwnd, &mut rect) }.is_err() {
+        return None;
+    }
+    let mut tl = POINT {
+        x: rect.left,
+        y: rect.top,
+    };
+    let mut br = POINT {
+        x: rect.right,
+        y: rect.bottom,
+    };
+    unsafe {
+        if ClientToScreen(hwnd, &mut tl).as_bool() && ClientToScreen(hwnd, &mut br).as_bool() {
+            Some(RECT {
+                left: tl.x,
+                top: tl.y,
+                right: br.x,
+                bottom: br.y,
+            })
+        } else {
+            None
+        }
+    }
+}
 
 // Resolve the GLFW cursor mode from the two independent intents. A captured
 // camera locks + hides the cursor (Disabled, raw deltas) and takes precedence;
@@ -288,6 +348,10 @@ impl GlfwWindow {
             cursor_captured: false,
             ui_cursor_hidden: false,
             menu_mode: false,
+            window_mode: *mode,
+            cursor_outside_window: false,
+            #[cfg(target_os = "windows")]
+            menu_clip_active: false,
             keymap: KeyMap::default(),
         })
     }
@@ -357,6 +421,98 @@ impl GlfwWindow {
         }
     }
 
+    // Whether the real cursor has left the window so the renderer should stop
+    // drawing the in-engine UI cursor (windowed / borderless). Recomputed each
+    // `poll`; false while captured or in fullscreen (which confines instead).
+    pub fn cursor_outside_window(&self) -> bool {
+        self.cursor_outside_window
+    }
+
+    // Per-poll bookkeeping for an in-engine UI cursor (a menu), mirroring the
+    // Metal `update_ui_cursor_confinement`: report whether the real cursor has
+    // left the window content area so the renderer can stop drawing the in-engine
+    // cursor in windowed / borderless modes, and confine the cursor to the window
+    // while in fullscreen so it cannot stray onto another display. A no-op while
+    // the cursor is captured (a gameplay camera owns the pointer, in GLFW's
+    // Disabled mode).
+    fn update_ui_cursor_confinement(&mut self) {
+        if self.cursor_captured {
+            // GLFW's Disabled mode owns the OS cursor (and, on Windows, its own
+            // clip); relinquish our menu-clip flag without releasing so we never
+            // fight it (releasing would undo the capture clip).
+            #[cfg(target_os = "windows")]
+            {
+                self.menu_clip_active = false;
+            }
+            self.cursor_outside_window = false;
+            return;
+        }
+        if matches!(self.window_mode, WindowMode::Fullscreen) {
+            // Confine the cursor to the fullscreen window so a menu pointer cannot
+            // wander onto another monitor.
+            self.confine_fullscreen();
+            self.cursor_outside_window = false;
+            return;
+        }
+        // Windowed / borderless: the in-engine cursor shows only while the real
+        // cursor is over the content area. GLFW_HOVERED is the OS-tracked signal
+        // for that, so no manual bounds test is needed. Drop any fullscreen menu
+        // clip first (the mode may have just changed out of fullscreen).
+        #[cfg(target_os = "windows")]
+        self.release_menu_clip();
+        self.cursor_outside_window = !self.window.is_hovered();
+    }
+
+    // Hard-confine the cursor to the fullscreen window. On Windows this is a Win32
+    // `ClipCursor` on the window's HWND -- a continuous OS boundary the cursor
+    // cannot cross, gated on foreground so a backgrounded window never steals the
+    // cursor from the foreground app (mirrors the DirectX backend). The clip is
+    // released once via `release_menu_clip` when the condition ends; capture's
+    // GLFW-Disabled clip is left alone (the captured branch returns early).
+    #[cfg(target_os = "windows")]
+    fn confine_fullscreen(&mut self) {
+        let hwnd = HWND(self.window.get_win32_window());
+        if unsafe { GetForegroundWindow() } == hwnd {
+            if let Some(rect) = client_screen_rect(hwnd) {
+                let _ = unsafe { ClipCursor(Some(&rect)) };
+                self.menu_clip_active = true;
+            }
+        } else {
+            // Windows already dropped our clip on deactivation; clear the flag
+            // without issuing ClipCursor(None), which from the background could
+            // stomp the foreground app's own clip.
+            self.menu_clip_active = false;
+        }
+    }
+
+    // Non-Windows fallback: no clip-to-window mode exists for a free cursor, so
+    // warp the cursor back to the content bounds each poll (best-effort; produces
+    // a slight snap-back at a multi-monitor edge). Gated on input focus: GLFW's
+    // set_cursor_pos no-ops without focus anyway. A single-display fullscreen is
+    // already OS-confined, so the clamp never fires there.
+    #[cfg(not(target_os = "windows"))]
+    fn confine_fullscreen(&mut self) {
+        let (w, h) = self.window.get_size();
+        if self.window.is_focused() && w > 0 && h > 0 {
+            let (cx, cy) = self.window.get_cursor_pos();
+            let clamped_x = cx.clamp(0.0, (w - 1) as f64);
+            let clamped_y = cy.clamp(0.0, (h - 1) as f64);
+            if clamped_x != cx || clamped_y != cy {
+                self.window.set_cursor_pos(clamped_x, clamped_y);
+            }
+        }
+    }
+
+    // Release the fullscreen-menu `ClipCursor` clip if we hold one. Edge-triggered
+    // so it never frees a clip we do not own (capture's GLFW-Disabled clip).
+    #[cfg(target_os = "windows")]
+    fn release_menu_clip(&mut self) {
+        if self.menu_clip_active {
+            self.menu_clip_active = false;
+            let _ = unsafe { ClipCursor(None) };
+        }
+    }
+
     // NOTE: the window mode/size methods below mirror the Metal implementation
     // for cross-backend parity but were written on macOS and have NOT been built
     // or run on Linux/Windows. Verify the glfw crate API (`set_monitor`,
@@ -367,6 +523,9 @@ impl GlfwWindow {
     // Switch windowed / borderless / fullscreen. The framebuffer-size change
     // makes the next present return OUT_OF_DATE, which rebuilds the swapchain.
     pub fn set_window_mode(&mut self, mode: WindowMode) {
+        // Record the mode so the per-frame cursor confinement can tell fullscreen
+        // (confine) from windowed / borderless (hide the arrow on leave).
+        self.window_mode = mode;
         // Disjoint field borrows so the with_primary_monitor closure can drive
         // the window while glfw is borrowed for the monitor lookup.
         let glfw = &mut self.glfw;
@@ -540,6 +699,12 @@ impl GlfwWindow {
                 _ => {}
             }
         }
+
+        // After draining this poll's events, refresh the in-engine cursor's
+        // window-exit / fullscreen-confinement state (mirrors the tail of Metal's
+        // `pump_ns_events`). GraphicsSystem reads `cursor_outside_window` later
+        // this same frame.
+        self.update_ui_cursor_confinement();
 
         should_close
     }

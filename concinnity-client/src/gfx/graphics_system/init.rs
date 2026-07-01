@@ -67,6 +67,35 @@ impl GraphicsSystem {
         if let Some(w) = ctx.drain::<Window>().into_iter().next() {
             self.window_args = w.to_args();
         }
+        // Capture the DebugHud chip ids (cursor, camera, passes stack order) so
+        // the frame step can anchor them to the top-right of the window. Passes
+        // is last because it grows/shrinks with the frame's step count, so
+        // keeping it at the bottom leaves the fixed-height chips unshifted. The
+        // DebugHud component is queried (not drained) by its system, so it is
+        // still present here; absent fields are skipped.
+        self.debug_hud_chips = ctx
+            .query::<crate::assets::DebugHud>()
+            .next()
+            .map(|d| {
+                [d.mouse_label, d.camera_label, d.passes_label]
+                    .into_iter()
+                    .flatten()
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Capture the StatHud chip ids (fps, vram, ev, edr strip order) so the
+        // frame step can pack them tight from the top-left. Like DebugHud the
+        // component is queried (not drained), so it is still present here.
+        self.stat_hud_chips = ctx
+            .query::<crate::assets::StatHud>()
+            .next()
+            .map(|s| {
+                [s.fps_label, s.vram_label, s.ev_label, s.edr_label]
+                    .into_iter()
+                    .flatten()
+                    .collect()
+            })
+            .unwrap_or_default();
         if let Some(m) = user_graphics.window_mode {
             self.window_args.mode = m;
         }
@@ -99,6 +128,18 @@ impl GraphicsSystem {
         // like vsync, so no ceiling clamp.
         if let Some(v) = user_graphics.fps_cap {
             self.fps_cap = v;
+        }
+        // Stats-HUD display toggles (None = shown, the default, so an existing
+        // settings file keeps the FPS / VRAM chips visible). Independent of the
+        // quality preset, like vsync / fps_cap.
+        if let Some(v) = user_graphics.perf_stats {
+            self.perf_stats = v;
+        }
+        if let Some(v) = user_graphics.show_fps {
+            self.show_fps = v;
+        }
+        if let Some(v) = user_graphics.show_vram {
+            self.show_vram = v;
         }
 
         // Shadow quality knobs (GraphicsConfig-sourced). Snapshot the world's
@@ -505,6 +546,10 @@ impl GraphicsSystem {
             self.render_scale,
         );
         let fps_cap_val = self.fps_cap;
+        // Stats-HUD display toggles for the value-label sync (copies, so the
+        // closure below does not borrow self while ctx is borrowed mutably).
+        let (perf_stats_val, show_fps_val, show_vram_val) =
+            (self.perf_stats, self.show_fps, self.show_vram);
         // Display-group toggle states for the value-label sync (copies, so the
         // closure below does not borrow self while ctx is borrowed mutably).
         let (display_upscaling, display_hdr, display_pq) =
@@ -550,6 +595,10 @@ impl GraphicsSystem {
             "temporal_upscaling" => Some(display_upscaling as usize),
             "hdr_display" => Some(display_hdr as usize),
             "hdr_pq" => Some(display_pq as usize),
+            // Stats-HUD display toggles (Off/On), held on self.
+            "perf_stats" => Some(perf_stats_val as usize),
+            "show_fps" => Some(show_fps_val as usize),
+            "show_vram" => Some(show_vram_val as usize),
             // Shadow quality knobs (resolution restart-required, cadence live).
             "shadow_map_size" => Some(crate::gfx::settings::shadow_resolution_index(shadow_size)),
             "shadow_update" => Some(crate::gfx::settings::shadow_update_index(shadow_update_val)),
@@ -593,6 +642,10 @@ impl GraphicsSystem {
         // its dependent rows (and a quality-row change the master row) at runtime,
         // when the HitRegions are gone. Also before UiInputSystem drains them.
         self.init_cycle_value_labels(ctx);
+        // Capture the show_fps / show_vram row labels and apply the initial
+        // gray-out from the resolved "Display performance stats" master toggle.
+        // Before UiInputSystem drains the HitRegions / ScrollPanels.
+        self.capture_perf_sub_rows(ctx);
         // Capture each ScrollPanel's per-element clip bands for the draw path,
         // before UiInputSystem drains the panels (init order: graphics first).
         self.init_clip_rects(ctx);
@@ -2049,6 +2102,18 @@ impl GraphicsSystem {
         if self.backend.is_none() {
             self.failed = true;
             return;
+        }
+
+        // Apply a persisted or authored non-windowed window mode at startup. The
+        // window is always created as a standard titled window, so a Borderless
+        // or Fullscreen choice (set in the settings menu and persisted across
+        // launches) has to be applied here; otherwise the app would always start
+        // windowed regardless of the saved mode. No-op for Windowed and in
+        // embedded mode (the backend owns no window there).
+        if self.window_args.mode != crate::assets::WindowMode::Windowed
+            && let Some(backend) = self.backend.as_deref_mut()
+        {
+            backend.set_window_mode(self.window_args.mode);
         }
 
         // Reflection probes: hand the backend the declared `ReflectionProbe`

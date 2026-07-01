@@ -96,6 +96,7 @@ crate::define_components! {
         Held              => assets::Held,              77,
         Lifetime          => assets::Lifetime,          78,
         Spawner           => assets::Spawner,           79,
+        DebugHud          => assets::DebugHud,          80,
 }
 
 #[cfg(test)]

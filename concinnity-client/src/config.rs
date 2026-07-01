@@ -72,6 +72,17 @@ pub struct GraphicsSettings {
     // it each frame); independent of the quality preset.
     #[serde(default)]
     pub fps_cap: Option<u32>,
+    // Stats-HUD display toggles. `perf_stats` is the master "Display performance
+    // stats" switch; `show_fps` / `show_vram` gate the individual readouts under
+    // it. `None` means shown (the engine default), so an existing settings file
+    // keeps the frame-rate / GPU-memory chips visible. Applied live; with the
+    // master off the per-readout rows stay visible in the menu but grayed out.
+    #[serde(default)]
+    pub perf_stats: Option<bool>,
+    #[serde(default)]
+    pub show_fps: Option<bool>,
+    #[serde(default)]
+    pub show_vram: Option<bool>,
     // Window mode (windowed / borderless / fullscreen). `None` uses the world's
     // `Window.mode`. Applied live.
     #[serde(default)]

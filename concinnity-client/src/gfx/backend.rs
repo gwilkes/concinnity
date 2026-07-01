@@ -448,6 +448,15 @@ pub trait RenderBackend: SceneControl + Send {
         let _ = hidden;
     }
 
+    // Whether the real cursor has left the window, so an in-engine UI cursor
+    // should stop drawing (windowed / borderless). The backend confines the
+    // cursor to the active screen while in fullscreen, so it reports `false`
+    // there. Default `false` (inside): backends without window-bounds tracking
+    // (DX / Vulkan today) always draw the in-engine cursor.
+    fn cursor_outside_window(&self) -> bool {
+        false
+    }
+
     // Tell the backend a togglable menu (a View toggled by an Escape KeyBinding)
     // coexists with a captured camera. In this mode Escape routes to the ECS
     // (so the menu shows/hides) instead of releasing the cursor inline, and a

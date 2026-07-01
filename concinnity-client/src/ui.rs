@@ -430,6 +430,14 @@ impl System for UiInputSystem {
         // A rebind-row click recorded here (setting key + value label) starts a
         // capture after the loop, for the same borrow reason.
         let mut start_capture: Option<(String, Option<AssetId>)> = None;
+        // Setting rows the engine disabled this frame (e.g. show_fps / show_vram
+        // while the "Display performance stats" master is off): inert and grayed,
+        // like the init-time capability gating but driven at runtime. Cloned out
+        // so the resource borrow ends before the mutable region loop.
+        let disabled_rows: std::collections::HashSet<String> = ctx
+            .resource::<crate::ecs::DisabledSettingRows>()
+            .map(|d| d.0.clone())
+            .unwrap_or_default();
         for entry in &mut self.regions {
             // While dragging the scrollbar thumb, no region hovers or fires.
             if thumb_active {
@@ -451,6 +459,15 @@ impl System for UiInputSystem {
             }
             // A scroll-content region whose row is collapsed never hovers/fires.
             if entry.scroll_row.is_some() && entry.hidden {
+                entry.was_hovered = false;
+                continue;
+            }
+            // A setting row the engine disabled at runtime (its labels grayed) is
+            // inert: it never hovers or fires while disabled.
+            if !disabled_rows.is_empty()
+                && let Some(rest) = entry.region.action.strip_prefix("setting:")
+                && disabled_rows.contains(rest.split(':').next().unwrap_or(""))
+            {
                 entry.was_hovered = false;
                 continue;
             }
@@ -1567,6 +1584,41 @@ mod tests {
         assert!(
             produced_setting_commands(&world).is_empty(),
             "a disabled region must not fire its action"
+        );
+    }
+
+    // A row disabled at runtime via the `DisabledSettingRows` resource (e.g. the
+    // show_fps row while the "Display performance stats" master is off) is inert,
+    // even though its HitRegion was enabled at init. This is the runtime twin of
+    // the init-time capability gating above.
+    #[test]
+    fn runtime_disabled_setting_row_does_not_fire() {
+        let mut world = World::new_empty();
+        world.add_component(HitRegion {
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 100.0,
+            label: None,
+            hover_color: None,
+            hover_scale: None,
+            action: "setting:show_fps:next".to_string(),
+            drag_handle: None,
+            view: None,
+            disabled: false,
+        });
+        world.start().unwrap();
+
+        // Master off: the show_fps row is in the runtime-disabled set, so a click
+        // over it fires nothing.
+        world.insert_resource(crate::ecs::DisabledSettingRows(
+            ["show_fps".to_string()].into_iter().collect(),
+        ));
+        world.add_component(make_frame_input(50.0, 50.0, true));
+        world.step();
+        assert!(
+            produced_setting_commands(&world).is_empty(),
+            "a runtime-disabled row must not fire its action"
         );
     }
 

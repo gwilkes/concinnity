@@ -53,6 +53,26 @@ pub enum StepResult {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MenuActive(pub bool);
 
+// Per-frame stats-HUD visibility, published as a resource by GraphicsSystem
+// (which runs first) and read by `StatHudSystem` the same tick. Each field is
+// the effective on/off for that chip: the master "Display performance stats"
+// toggle AND the per-readout toggle from the video settings. Absent (a HUD-only
+// unit test with no GraphicsSystem) is treated as both shown.
+#[derive(Debug, Clone, Copy)]
+pub struct HudPrefs {
+    pub show_fps: bool,
+    pub show_vram: bool,
+}
+
+// Setting rows the engine has disabled at runtime (their keys, e.g. `show_fps`
+// while "Display performance stats" is off). Published each frame by
+// GraphicsSystem and read by `UiInputSystem`, which makes a matching row inert
+// (no hover, no click) while its labels are grayed independently. Distinct from
+// the init-time capability gating (which marks `HitRegion.disabled` before the
+// regions are drained); this drives the same effect after they are drained.
+#[derive(Debug, Clone, Default)]
+pub struct DisabledSettingRows(pub std::collections::HashSet<String>);
+
 // System -- has behavior, receives a PipelineContext each tick. Every system
 // is internal engine code: `World::build_internal_systems` constructs it from
 // world components (via the system's own `new(..)`), so a system is never
@@ -337,6 +357,7 @@ impl World {
         const SCHEDULE: &[fn(&World) -> Option<SystemAsset>] = &[
             World::build_graphics,
             World::build_stat_hud,
+            World::build_debug_hud,
             World::build_physics,
             World::build_camera,
             World::build_fps_counter,
@@ -406,6 +427,15 @@ impl World {
             .next()
             .cloned()
             .map(|cfg| crate::hud::fps_counter::FpsCounterSystem::new(cfg).into())
+    }
+
+    // DebugHud: present whenever the world declares a `DebugHud`; built from that
+    // component (its developer-readout TextLabel refs).
+    fn build_debug_hud(&self) -> Option<SystemAsset> {
+        self.query::<crate::assets::DebugHud>()
+            .next()
+            .cloned()
+            .map(|cfg| crate::hud::debug_hud::DebugHudSystem::new(cfg).into())
     }
 
     // AnimationSystem: present whenever the world declares any `Animation`. It

@@ -43,6 +43,26 @@ fn expand_dim_set(
     dim
 }
 
+// Gray the captured show_fps / show_vram row labels (or restore their authored
+// colors) to match the master "Display performance stats" toggle. A free
+// function taking the captured (id, color) list so it can run inside the
+// settings drain, where `backend` already borrows part of `self`.
+fn apply_perf_stats_gating(
+    ctx: &mut PipelineContext,
+    sub_rows: &[(AssetId, [f32; 3])],
+    grayed: bool,
+) {
+    for &(id, orig) in sub_rows {
+        let color = if grayed { DISABLED_ROW_COLOR } else { orig };
+        for l in ctx.query_mut::<TextLabel>() {
+            if l.asset_id == id {
+                l.color = color;
+                break;
+            }
+        }
+    }
+}
+
 // Reposition the labels owned by every visible `LayoutContainer`. This runs in
 // the frame step because measuring a label needs the loaded font metrics,
 // which live on the GraphicsSystem; the resolved origin is written back into
@@ -79,6 +99,96 @@ fn apply_label_layout(
                 break;
             }
         }
+    }
+}
+
+// Anchor the DebugHud chips to the top-right of the window, stacked downward in
+// id order (cursor, passes, camera). A blank chip (the HUD hidden, or a stat the
+// backend cannot supply) reserves no space. Measured each frame so a chip that
+// changes width -- the multi-line passes chip in particular -- re-anchors
+// flush-right. HUD labels are literal window pixels (no overlay scaling), so
+// this positions in window space directly.
+//
+// Timing: DebugHudSystem writes each chip's content AFTER GraphicsSystem in the
+// schedule, so the content present here is what DebugHudSystem wrote last tick --
+// which is exactly the content the draw list built in this same step renders.
+// Measuring it (rather than this tick's not-yet-written content) is therefore
+// correct: the measured width always matches the content being drawn, so the
+// stack never mismatches within a frame.
+fn position_debug_hud(
+    ctx: &mut PipelineContext,
+    chip_ids: &[AssetId],
+    loaded_fonts: &std::collections::HashMap<AssetId, text::LoadedFont>,
+    win_w: f32,
+) {
+    if chip_ids.is_empty() || win_w <= 0.0 {
+        return;
+    }
+    const MARGIN: f32 = 10.0;
+    const GAP: f32 = 6.0;
+    let mut y = MARGIN;
+    for &id in chip_ids {
+        // Measure the chip's box from its current (last-frame) content; skip a
+        // blank chip so a hidden readout reserves no vertical space.
+        let measured = ctx
+            .query::<TextLabel>()
+            .find(|l| l.asset_id == id && !l.content.is_empty())
+            .and_then(|l| text::measure_label_box(l, loaded_fonts));
+        let Some(b) = measured else {
+            continue;
+        };
+        // Right-anchor the box (its left edge sits `pad` left of the text
+        // origin) and place its top at the running y.
+        let x = (win_w - MARGIN - b.w + b.pad).max(MARGIN);
+        for l in ctx.query_mut::<TextLabel>() {
+            if l.asset_id == id {
+                l.x = x;
+                l.y = y + b.top_inset;
+                break;
+            }
+        }
+        y += b.h + GAP;
+    }
+}
+
+// Pack the StatHud chips (fps, vram, ev, edr) into a tight strip from the
+// top-left of the window, left to right with a small gap. A blank chip (a
+// readout hidden by the video settings, or a stat the world/display does not
+// supply) reserves no width, so the strip stays as narrow as the live content
+// and hidden chips leave no hole. Measured each frame so a chip that changes
+// width re-packs its neighbours. HUD labels are literal window pixels (no
+// overlay scaling), so this positions in window space directly.
+fn position_stat_hud(
+    ctx: &mut PipelineContext,
+    chip_ids: &[AssetId],
+    loaded_fonts: &std::collections::HashMap<AssetId, text::LoadedFont>,
+) {
+    if chip_ids.is_empty() {
+        return;
+    }
+    const MARGIN: f32 = 10.0;
+    const GAP: f32 = 4.0;
+    let mut x = MARGIN;
+    for &id in chip_ids {
+        // Measure the chip's box from its current (last-frame) content; skip a
+        // blank chip so a hidden readout reserves no horizontal space.
+        let measured = ctx
+            .query::<TextLabel>()
+            .find(|l| l.asset_id == id && !l.content.is_empty())
+            .and_then(|l| text::measure_label_box(l, loaded_fonts));
+        let Some(b) = measured else {
+            continue;
+        };
+        // The box's left edge sits `pad` left of the text origin, so offset the
+        // origin by `pad` to line the box up at the running x.
+        for l in ctx.query_mut::<TextLabel>() {
+            if l.asset_id == id {
+                l.x = x + b.pad;
+                l.y = MARGIN + b.top_inset;
+                break;
+            }
+        }
+        x += b.w + GAP;
     }
 }
 
@@ -247,6 +357,10 @@ impl GraphicsSystem {
             // Reposition LayoutContainer-managed labels before measuring them
             // for draw, so a HUD reflows to its live text each frame.
             apply_label_layout(ctx, &self.loaded_fonts);
+            // Anchor the DebugHud chips to the top-right corner, stacked.
+            position_debug_hud(ctx, &self.debug_hud_chips, &self.loaded_fonts, win_w);
+            // Pack the StatHud chips into a tight strip in the top-left corner.
+            position_stat_hud(ctx, &self.stat_hud_chips, &self.loaded_fonts);
             let default_atlas_slot = self.loaded_fonts.values().next().map(|f| f.atlas_slot);
             let sprites: Vec<&Sprite> = ctx.query::<Sprite>().collect();
             let (cursor_sprites, scene_sprites): (Vec<&Sprite>, Vec<&Sprite>) =
@@ -267,16 +381,22 @@ impl GraphicsSystem {
                 &self.clip_rects,
             ));
 
-            // Draw each cursor sprite as an arrow pointer at the latest mouse
-            // position (tip on the pointer), after the text so it sits on top.
-            calls.extend(crate::gfx::cursor::build_cursor_calls(
-                &cursor_sprites,
-                self.cursor_pos,
-                default_atlas_slot,
-                [win_w, win_h],
-            ));
-
-            let want_cursor = cursor_sprites.iter().any(|s| s.visible && s.tint[3] > 0.0);
+            // A menu cursor is present when any visible follow_cursor sprite is
+            // opaque. Draw it (as an arrow pointer at the latest mouse position,
+            // after the text so it sits on top) only while the real cursor is
+            // inside the window: when it leaves in windowed / borderless modes
+            // the arrow is hidden instead of lingering at the edge. The backend
+            // confines the cursor in fullscreen, so it reports "inside" there.
+            let menu_cursor = cursor_sprites.iter().any(|s| s.visible && s.tint[3] > 0.0);
+            let want_cursor = menu_cursor && !self.cursor_outside_window;
+            if want_cursor {
+                calls.extend(crate::gfx::cursor::build_cursor_calls(
+                    &cursor_sprites,
+                    self.cursor_pos,
+                    default_atlas_slot,
+                    [win_w, win_h],
+                ));
+            }
             // A menu is "active" when any view-owned UI element is visible; used
             // to drive cursor capture and to freeze gameplay input below.
             let menu_active = labels.iter().any(|l| l.visible && l.view.is_some())
@@ -973,6 +1093,33 @@ impl GraphicsSystem {
                             cfg.graphics.vsync = Some(self.vsync);
                             Some(opts[next])
                         }
+                        // Stats-HUD display toggles: live via the HudPrefs resource
+                        // (published each frame from these fields). The master
+                        // additionally grays / restores the two sub-rows.
+                        "perf_stats" => {
+                            let next =
+                                settings::cycle(self.perf_stats as usize, opts.len(), cmd.op);
+                            self.perf_stats = next == 1;
+                            cfg.graphics.perf_stats = Some(self.perf_stats);
+                            apply_perf_stats_gating(
+                                ctx,
+                                &self.perf_sub_row_labels,
+                                !self.perf_stats,
+                            );
+                            Some(opts[next])
+                        }
+                        "show_fps" => {
+                            let next = settings::cycle(self.show_fps as usize, opts.len(), cmd.op);
+                            self.show_fps = next == 1;
+                            cfg.graphics.show_fps = Some(self.show_fps);
+                            Some(opts[next])
+                        }
+                        "show_vram" => {
+                            let next = settings::cycle(self.show_vram as usize, opts.len(), cmd.op);
+                            self.show_vram = next == 1;
+                            cfg.graphics.show_vram = Some(self.show_vram);
+                            Some(opts[next])
+                        }
                         "fps_cap" => {
                             let cur = settings::fps_cap_index(self.fps_cap);
                             let next = settings::cycle(cur, opts.len(), cmd.op);
@@ -1365,6 +1512,26 @@ impl GraphicsSystem {
                     }
                 }
 
+                // Publish the stats-HUD state for the systems that run after
+                // GraphicsSystem this tick. Done AFTER the settings drain above so
+                // a "Display performance stats" toggle this frame is reflected the
+                // same frame -- the visibility (StatHudSystem reads HudPrefs) and
+                // the inert/grayed sub-rows (UiInputSystem reads DisabledSettingRows)
+                // stay in lockstep with the gray-out applied in the drain.
+                ctx.insert_resource(crate::ecs::HudPrefs {
+                    show_fps: self.perf_stats && self.show_fps,
+                    show_vram: self.perf_stats && self.show_vram,
+                });
+                let disabled_rows: std::collections::HashSet<String> = if self.perf_stats {
+                    std::collections::HashSet::new()
+                } else {
+                    ["show_fps", "show_vram"]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect()
+                };
+                ctx.insert_resource(crate::ecs::DisabledSettingRows(disabled_rows));
+
                 // advance SceneReel and apply fade / visibility changes, sourcing
                 // visibility from the live per-entity components; the snapshot is
                 // rebuilt each frame the reel exists.
@@ -1600,6 +1767,9 @@ impl GraphicsSystem {
                 // Cache the cursor position for next frame's follow_cursor
                 // sprites (the draw list is built before this poll).
                 self.cursor_pos = (raw.mouse_x, raw.mouse_y);
+                // Cache whether the cursor left the window so next frame's draw
+                // list hides the in-engine cursor (built before this poll).
+                self.cursor_outside_window = backend.cursor_outside_window();
                 // Live viewport for UiInputSystem's overlay hit-testing, so a
                 // scaled menu's HitRegions map back to the cursor consistently.
                 let (vp_w, vp_h) = backend.logical_size();
@@ -1805,6 +1975,47 @@ impl GraphicsSystem {
                 l.color = DISABLED_ROW_COLOR;
             }
         }
+    }
+
+    // Capture the show_fps / show_vram row labels (with their authored colors)
+    // so the master "Display performance stats" toggle can gray them out at
+    // runtime and restore them. Runs once at init while the HitRegions /
+    // ScrollPanels are present (before UiInputSystem drains them), the same
+    // window `apply_capability_gating` and the other init-time row captures use.
+    pub(super) fn capture_perf_sub_rows(&mut self, ctx: &mut PipelineContext) {
+        // Collect the value-label ids of the show_fps / show_vram rows (both
+        // stepper regions of a row reference its value label).
+        let mut anchors: std::collections::HashSet<AssetId> = std::collections::HashSet::new();
+        for r in ctx.query::<HitRegion>() {
+            let Some(rest) = r.action.strip_prefix("setting:") else {
+                continue;
+            };
+            let key = rest.split(':').next().unwrap_or("");
+            if matches!(key, "show_fps" | "show_vram")
+                && let Some(label) = r.label
+            {
+                anchors.insert(label);
+            }
+        }
+        if anchors.is_empty() {
+            self.perf_sub_row_labels = Vec::new();
+            return;
+        }
+        // Expand each anchor to its whole scroll row (background + name + value +
+        // stepper glyphs) so the row grays as a unit, then snapshot each label's
+        // authored color for the restore.
+        let rows: Vec<Vec<AssetId>> = ctx
+            .query::<crate::assets::ScrollPanel>()
+            .flat_map(|p| p.rows.iter().map(|r| r.elements.clone()))
+            .collect();
+        let dim = expand_dim_set(&anchors, &rows);
+        self.perf_sub_row_labels = ctx
+            .query::<TextLabel>()
+            .filter(|l| dim.contains(&l.asset_id))
+            .map(|l| (l.asset_id, l.color))
+            .collect();
+        // Apply the initial gray-out from the resolved master toggle.
+        apply_perf_stats_gating(ctx, &self.perf_sub_row_labels, !self.perf_stats);
     }
 
     // The current user-facing value of a slider setting, derived from the live

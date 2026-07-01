@@ -220,6 +220,8 @@ pub(crate) fn options(key: &str) -> Option<&'static [&'static str]> {
         "temporal_upscaling" | "hdr_display" | "hdr_pq" | "occlusion_two_pass" => {
             Some(&OFF_ON_OPTIONS)
         }
+        // Stats-HUD display toggles: a master and one per readout (Off/On).
+        "perf_stats" | "show_fps" | "show_vram" => Some(&OFF_ON_OPTIONS),
         key if is_quality_toggle(key) => Some(&OFF_ON_OPTIONS),
         _ => None,
     }
@@ -718,6 +720,18 @@ mod tests {
     #[test]
     fn vsync_options_are_off_then_on() {
         assert_eq!(options("vsync"), Some(&["Off", "On"][..]));
+    }
+
+    #[test]
+    fn stats_hud_toggles_are_off_then_on() {
+        // The "Display performance stats" master and its per-readout sub-toggles
+        // are plain Off/On cycle rows (index 0 = Off, 1 = On, like vsync).
+        for key in ["perf_stats", "show_fps", "show_vram"] {
+            assert_eq!(options(key), Some(&["Off", "On"][..]), "{key}");
+            // Both are available regardless of GPU capability (not gated).
+            let caps = crate::gfx::backend::DeviceCapabilities { ray_tracing: false };
+            assert!(setting_available(key, &caps), "{key}");
+        }
     }
 
     #[test]

@@ -1606,7 +1606,12 @@ impl RtAccelData {
         for (slot, &idx) in new_indices.iter().enumerate() {
             let obj = &draw_objects[idx];
             instances.push(tlas_instance(obj.model, slot as u32, new_addrs[slot]));
-            geom_entries.push(geom_entry(obj, self.albedo_count, self.last_tex, self.last_nm));
+            geom_entries.push(geom_entry(
+                obj,
+                self.albedo_count,
+                self.last_tex,
+                self.last_nm,
+            ));
         }
         instances.extend_from_slice(&rebaked_clusters);
         geom_entries.extend_from_slice(&self.cluster_geom);
@@ -1696,10 +1701,8 @@ impl RtAccelData {
                 .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
                 .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
                 .geometries(std::slice::from_ref(&geo));
-            bi.dst_acceleration_structure = fresh_slots[*j]
-                .as_ref()
-                .expect("fresh BLAS present")
-                .accel;
+            bi.dst_acceleration_structure =
+                fresh_slots[*j].as_ref().expect("fresh BLAS present").accel;
             bi.scratch_data = vk::DeviceOrHostAddressKHR {
                 device_address: scratch_addr,
             };

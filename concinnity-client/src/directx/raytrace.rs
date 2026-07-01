@@ -1135,9 +1135,7 @@ impl RtAccelData {
         // the static TLAS FIRST (before the transform path re-reads `object_indices`).
         // The refresh always rebuilds a static TLAS; on the skinned path
         // `rebuild_skinned` below then overlays the skinned tail on top.
-        if topology_dirty
-            && let Err(e) = self.refresh_topology(device, cmd, draw_objects, now)
-        {
+        if topology_dirty && let Err(e) = self.refresh_topology(device, cmd, draw_objects, now) {
             tracing::warn!("RT topology refresh failed (keeping live BVH): {e}");
         }
 

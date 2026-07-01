@@ -73,7 +73,10 @@ pub fn resolve_lut_source(source: &str) -> String {
     if let Some(path) = crate::world::preset::find_in_assets(source) {
         return path;
     }
-    format!("{}/{source}", crate::world::CONCINNITY_ASSETS_DIR)
+    crate::paths::assets_dir()
+        .join(source)
+        .to_string_lossy()
+        .into_owned()
 }
 
 // Validate a LUT edge length against the accepted range. Shared by the

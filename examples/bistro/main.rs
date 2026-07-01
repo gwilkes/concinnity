@@ -15,7 +15,7 @@
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-use example_common::{compile_world, init_logging, run};
+use example_common::{compile_world, init_logging, paths, run};
 
 // The NVIDIA ORCA download. It redirects to the actual archive; ureq follows
 // redirects. Override with BISTRO_URL, or point BISTRO_ARCHIVE at an
@@ -70,6 +70,14 @@ fn main() -> io::Result<()> {
     }
 
     init_logging();
+
+    // Anchor the `.concinnity/` state tree (payload cache, runtime config) to
+    // wherever the command was invoked before the chdir below moves the working
+    // directory. Without this, chdir'ing into the example directory would create
+    // `.concinnity/` there instead of at the invocation point.
+    if let Ok(invocation_dir) = std::env::current_dir() {
+        paths::set_root(invocation_dir);
+    }
 
     // Resolve every relative asset path in world.jsonl against this example's
     // own directory rather than wherever cargo was invoked from.

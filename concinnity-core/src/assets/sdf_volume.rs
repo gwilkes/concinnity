@@ -252,7 +252,12 @@ pub fn resolve_source_path(raw: &str, ctx: &crate::build::BuildCtx<'_>) -> Optio
     if raw_path.is_absolute() {
         candidates.push(raw.to_string());
     } else {
-        candidates.push(format!("{}/{raw}", crate::world::CONCINNITY_ASSETS_DIR));
+        candidates.push(
+            crate::paths::assets_dir()
+                .join(raw)
+                .to_string_lossy()
+                .into_owned(),
+        );
         if raw_path
             .parent()
             .map(|d| d.as_os_str().is_empty())
@@ -341,7 +346,10 @@ pub fn resolve_runtime_source_path(raw: &str) -> String {
         if let Some(path) = crate::world::preset::find_in_assets(raw) {
             return path;
         }
-        return format!("{}/{raw}", crate::world::CONCINNITY_ASSETS_DIR);
+        return crate::paths::assets_dir()
+            .join(raw)
+            .to_string_lossy()
+            .into_owned();
     }
     raw.to_string()
 }

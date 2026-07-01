@@ -137,7 +137,7 @@ fn write_file(path: &str, content: &str) -> Result<String, String> {
     let target = {
         let p = std::path::Path::new(path);
         if p.parent().map(|d| d.as_os_str().is_empty()).unwrap_or(true) {
-            owned = std::path::Path::new(crate::world::CONCINNITY_ASSETS_DIR).join(p);
+            owned = concinnity_core::paths::assets_dir().join(p);
             owned.as_path()
         } else {
             p
@@ -212,7 +212,7 @@ fn validate_shader(source: &str, name: &str) -> Result<String, String> {
 fn fetch_assets(names: &[String], base_url: &str, _account_id: &str) -> Result<String, String> {
     use std::io::Read;
 
-    let assets_dir = std::path::Path::new(crate::world::CONCINNITY_ASSETS_DIR);
+    let assets_dir = concinnity_core::paths::assets_dir();
 
     let mut fetched = Vec::new();
     let mut errors = Vec::new();
@@ -248,7 +248,7 @@ fn fetch_assets(names: &[String], base_url: &str, _account_id: &str) -> Result<S
             continue;
         }
 
-        if let Err(e) = std::fs::create_dir_all(assets_dir) {
+        if let Err(e) = std::fs::create_dir_all(&assets_dir) {
             errors.push(format!("'{name}': could not create assets dir: {e}"));
             continue;
         }

@@ -29,12 +29,16 @@ pub const BLOB_MAGIC: [u8; 4] = *b"CNB\0";
 pub const BLOB_VERSION: u32 = 1;
 pub const HEADER_SIZE: usize = 16; // magic(4) + version(4) + defs_len(8)
 
-pub const PRIMARY_CNB: &str = ".concinnity/data/0";
 pub const LOCK_PATH: &str = "world-lock.json";
 
-// Format a blob file path for a given index
+// Format a blob file path for a given index under `.concinnity/data/`. Blob 0
+// is the primary blob (the def table plus the first payload section); higher
+// indices are overflow payload blobs.
 pub fn blob_path(index: u32) -> String {
-    format!("{}/{}", crate::world::CONCINNITY_DATA_DIR, index)
+    crate::paths::data_dir()
+        .join(index.to_string())
+        .to_string_lossy()
+        .into_owned()
 }
 
 // State of one blob file's payload section.
@@ -280,7 +284,7 @@ fn read_payload_section(path: &str) -> Result<Vec<u8>, CnResult> {
 // (index >= 1) start `Unloaded` and `BlobData::read()` reads each from disk
 // the first time a locator references it.
 pub fn load_raw() -> Result<(Vec<BlobAssetDef>, BlobData), CnResult> {
-    let (defs, _header_end) = read_cnb(PRIMARY_CNB)?;
+    let (defs, _header_end) = read_cnb(&blob_path(0))?;
 
     // determine how many distinct blob indices are referenced so we know
     // which overflow files exist
@@ -314,7 +318,7 @@ pub fn load_raw() -> Result<(Vec<BlobAssetDef>, BlobData), CnResult> {
 // Load defs without resolving (for callers that apply overlays first)
 #[allow(dead_code)]
 pub fn load_defs() -> Result<Vec<BlobAssetDef>, CnResult> {
-    let (defs, _) = read_cnb(PRIMARY_CNB)?;
+    let (defs, _) = read_cnb(&blob_path(0))?;
     Ok(defs)
 }
 

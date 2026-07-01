@@ -111,11 +111,11 @@ fn compile_metal(source: &str, args: &ShaderCompileArgs) -> Result<Vec<u8>, std:
     use std::io::Write;
     use std::process::Stdio;
 
-    let data_dir = crate::world::CONCINNITY_DATA_DIR;
-    let air_path = format!("{}/{}.air", data_dir, args.asset_name);
-    let lib_path = format!("{}/{}.metallib", data_dir, args.asset_name);
+    let data_dir = crate::paths::data_dir();
+    let air_path = format!("{}/{}.air", data_dir.display(), args.asset_name);
+    let lib_path = format!("{}/{}.metallib", data_dir.display(), args.asset_name);
 
-    fs::create_dir_all(data_dir)?;
+    fs::create_dir_all(&data_dir)?;
 
     // Feed the source to `xcrun metal` over stdin (`-x metal` selects the
     // language since stdin has no extension, `-` is the stdin input) so no
@@ -356,9 +356,9 @@ fn compile_hlsl(_source: &str, args: &ShaderCompileArgs) -> Result<Vec<u8>, std:
 // macOS (Metal backend) compiles GLSL by shelling out to glslc.
 #[cfg(backend_metal)]
 fn compile_glsl(args: ShaderCompileArgs) -> Result<Vec<u8>, std::io::Error> {
-    let data_dir = crate::world::CONCINNITY_DATA_DIR;
-    let out_path = format!("{}/{}.spv", data_dir, args.asset_name);
-    std::fs::create_dir_all(data_dir)?;
+    let data_dir = crate::paths::data_dir();
+    let out_path = format!("{}/{}.spv", data_dir.display(), args.asset_name);
+    std::fs::create_dir_all(&data_dir)?;
 
     let output = std::process::Command::new("glslc")
         .args([

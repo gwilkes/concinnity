@@ -15,6 +15,7 @@ pub mod check;
 pub mod ecs;
 pub mod geometry;
 pub mod gfx;
+pub mod paths;
 pub mod result;
 pub mod world;
 

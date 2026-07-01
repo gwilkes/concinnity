@@ -7,16 +7,11 @@ mod find;
 
 pub use find::{WORLD_JSONL, find_world_jsonl};
 
-// Local project state directories created on first fetch.
-
-pub const CONCINNITY_ASSETS_DIR: &str = ".concinnity/assets";
-pub const CONCINNITY_DATA_DIR: &str = ".concinnity/data";
-// Mutable counterpart to CONCINNITY_DATA_DIR: build output is regenerated and
-// immutable, this holds runtime state the user changes (e.g. settings-menu
-// choices) and is never written by a build. A sibling of `data`, so it shares
-// the same project-root anchor in both the CLI (cwd) and the editor FFI (the
-// cwd guard), with no extra path plumbing.
-pub const CONCINNITY_CONFIG_DIR: &str = ".concinnity/config";
+// The local project state directories (`assets`, `data`, `config`, `worlds`,
+// `cache`) all live under `.concinnity/`. Their locations are resolved through
+// `crate::paths`, which anchors the whole tree to a single root (the cwd by
+// default) so a host that chdirs for content resolution can still keep state
+// where the command was invoked.
 
 // An asset entry after $include resolution and type parsing
 #[derive(Clone)]

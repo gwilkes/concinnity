@@ -10,7 +10,7 @@
 // its `crate::{assets,ecs,gfx,geometry,result}` paths. The payload *decoders*
 // and shared payload types live in `concinnity_core::build`; this crate's
 // modules call back into them.
-pub use concinnity_core::{assets, ecs, geometry, gfx, result};
+pub use concinnity_core::{assets, ecs, geometry, gfx, paths, result};
 
 pub mod asset;
 pub mod asset_impls;

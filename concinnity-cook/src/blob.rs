@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use concinnity_core::blob::{BLOB_MAGIC, BLOB_VERSION, HEADER_SIZE, LOCK_PATH, PRIMARY_CNB};
+use concinnity_core::blob::{BLOB_MAGIC, BLOB_VERSION, HEADER_SIZE, LOCK_PATH};
 use concinnity_core::ecs::{BlobAssetDef, PayloadLocator};
 
 // Re-export the read side from core so `crate::blob::{BlobData, load_raw, ...}`
@@ -61,7 +61,7 @@ pub fn write_blobs(
     defs: &[BlobAssetDef],
     blob_payloads: &[Vec<u8>],
 ) -> std::io::Result<PackResult> {
-    fs::create_dir_all(concinnity_core::world::CONCINNITY_DATA_DIR)?;
+    fs::create_dir_all(concinnity_core::paths::data_dir())?;
 
     let mut blob_paths = Vec::new();
 
@@ -73,8 +73,9 @@ pub fn write_blobs(
     }
 
     if blob_payloads.is_empty() {
-        write_cnb(defs, &[], PRIMARY_CNB)?;
-        blob_paths.push(PRIMARY_CNB.to_string());
+        let primary = blob_path(0);
+        write_cnb(defs, &[], &primary)?;
+        blob_paths.push(primary);
     }
 
     Ok(PackResult { blob_paths })

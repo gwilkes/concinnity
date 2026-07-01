@@ -254,7 +254,10 @@ pub fn resolve_source(source: &str) -> String {
     if let Some(found) = concinnity_core::world::preset::find_in_assets(source) {
         return found;
     }
-    format!("{}/{source}", concinnity_core::world::CONCINNITY_ASSETS_DIR)
+    concinnity_core::paths::assets_dir()
+        .join(source)
+        .to_string_lossy()
+        .into_owned()
 }
 
 // A skeleton reordered into parents-before-children order, plus the lookup

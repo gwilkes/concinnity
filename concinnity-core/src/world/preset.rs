@@ -20,25 +20,16 @@ pub fn find_in_assets(filename: &str) -> Option<String> {
         }
         None
     }
-    walk(
-        std::path::Path::new(crate::world::CONCINNITY_ASSETS_DIR),
-        filename,
-    )
-    .map(|p| p.to_string_lossy().into_owned())
+    walk(&crate::paths::assets_dir(), filename).map(|p| p.to_string_lossy().into_owned())
 }
 
 fn find_preset_path(filename: &str, subdir: &str) -> Option<String> {
     if let Some(p) = find_in_assets(filename) {
         return Some(p);
     }
-    let path = format!(
-        "{}/{}/{}",
-        crate::world::CONCINNITY_ASSETS_DIR,
-        subdir,
-        filename
-    );
-    if std::path::Path::new(&path).exists() {
-        return Some(path);
+    let path = crate::paths::assets_dir().join(subdir).join(filename);
+    if path.exists() {
+        return Some(path.to_string_lossy().into_owned());
     }
     None
 }

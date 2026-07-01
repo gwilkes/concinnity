@@ -159,7 +159,10 @@ pub fn resolve_runtime_source_path(raw: &str) -> String {
         if let Some(path) = crate::world::preset::find_in_assets(raw) {
             return path;
         }
-        return format!("{}/{raw}", crate::world::CONCINNITY_ASSETS_DIR);
+        return crate::paths::assets_dir()
+            .join(raw)
+            .to_string_lossy()
+            .into_owned();
     }
     raw.to_string()
 }
@@ -200,7 +203,10 @@ pub fn resolve_source_path_for(raw: &str, ctx: &crate::build::BuildCtx<'_>) -> S
                 return artifact_path;
             }
         }
-        return format!("{}/{raw}", crate::world::CONCINNITY_ASSETS_DIR);
+        return crate::paths::assets_dir()
+            .join(raw)
+            .to_string_lossy()
+            .into_owned();
     }
     raw.to_string()
 }

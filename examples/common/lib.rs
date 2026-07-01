@@ -21,6 +21,12 @@ use concinnity_cook::{build_compiled, check::report_validation_errors, prepare_w
 // compile step's logs are formatted. Re-exported from the runtime crate.
 pub use concinnity_client::app::run::init_logging;
 
+// Project state-root anchor. An example that chdirs so its world's relative
+// asset paths resolve calls `paths::set_root(invocation_dir)` first, so the
+// `.concinnity/` cache and config land where the command was run, not in the
+// example's directory.
+pub use concinnity_cook::paths;
+
 // Compile world.jsonl into a runnable World entirely in memory: validate and
 // expand the declarations, compile each asset's payload, then assemble the
 // components into a World backed by the compiled blob. Source-backed assets are

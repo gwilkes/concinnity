@@ -68,8 +68,6 @@ fn file_content_hash(path: &str) -> Option<[u8; 32]> {
 //    hot texels, so every cached envmap must rebake (build::environment_map).
 const CACHE_FORMAT_VERSION: u32 = 2;
 
-const CACHE_DIR: &str = ".concinnity/cache";
-
 // Compute the cache key for one compiled asset. The key folds in the cache
 // format version, the active backend's shader platform, the component
 // discriminant, the args JSON, and a content hash of every source file the
@@ -133,7 +131,7 @@ pub fn load(key: &str) -> Option<Vec<u8>> {
     if cfg!(test) {
         return None;
     }
-    std::fs::read(Path::new(CACHE_DIR).join(key)).ok()
+    std::fs::read(crate::paths::cache_dir().join(key)).ok()
 }
 
 // Store a compiled payload under `key`. Best-effort: any error is ignored.
@@ -143,7 +141,7 @@ pub fn store(key: &str, bytes: &[u8]) {
     if cfg!(test) {
         return;
     }
-    store_in(Path::new(CACHE_DIR), key, bytes);
+    store_in(&crate::paths::cache_dir(), key, bytes);
 }
 
 // Hash the fixed parts of a key. Split out from `payload_key` so tests can

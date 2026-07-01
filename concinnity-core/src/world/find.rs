@@ -1,4 +1,3 @@
-pub const CONCINNITY_WORLDS_DIR: &str = ".concinnity/worlds";
 pub const WORLD_JSONL: &str = "world.jsonl";
 // Locate a world JSONL file.
 //
@@ -8,7 +7,7 @@ pub const WORLD_JSONL: &str = "world.jsonl";
 // and then walks up parent directories for backward compatibility with
 // development workflows that pre-date the `.concinnity/` layout.
 pub fn find_world_jsonl(name: Option<&str>) -> std::io::Result<String> {
-    let worlds_dir = std::path::Path::new(CONCINNITY_WORLDS_DIR);
+    let worlds_dir = crate::paths::worlds_dir();
 
     if let Some(n) = name {
         let path = worlds_dir.join(format!("{}.jsonl", n));
@@ -24,7 +23,7 @@ pub fn find_world_jsonl(name: Option<&str>) -> std::io::Result<String> {
     // No name given: pick the most recently modified world in .concinnity/worlds/.
     if worlds_dir.is_dir() {
         let mut best: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
-        if let Ok(entries) = std::fs::read_dir(worlds_dir) {
+        if let Ok(entries) = std::fs::read_dir(&worlds_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {

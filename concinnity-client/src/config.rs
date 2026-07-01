@@ -366,7 +366,7 @@ impl Settings {
 fn config_dir() -> PathBuf {
     std::env::var_os(CONFIG_DIR_ENV)
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(concinnity_core::world::CONCINNITY_CONFIG_DIR))
+        .unwrap_or_else(concinnity_core::paths::config_dir)
 }
 
 // Read the legacy `config.json` and lift any graphics/audio/controls sections
@@ -616,10 +616,7 @@ mod tests {
     #[test]
     fn config_dir_defaults_to_project_dir() {
         if std::env::var_os(CONFIG_DIR_ENV).is_none() {
-            assert_eq!(
-                config_dir(),
-                PathBuf::from(concinnity_core::world::CONCINNITY_CONFIG_DIR)
-            );
+            assert_eq!(config_dir(), concinnity_core::paths::config_dir());
         }
     }
 }

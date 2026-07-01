@@ -9,6 +9,8 @@ use crate::assets::{
 };
 use crate::ecs::asset_id::AssetId;
 use crate::ecs::{PipelineContext, StepResult, System};
+use crate::gfx::settings;
+use concinnity_core::gfx::dropdown;
 use concinnity_core::gfx::overlay::OverlayTransform;
 use concinnity_core::gfx::scroll_layout::{self, RowSpec};
 use std::collections::HashMap;
@@ -110,6 +112,51 @@ struct PanelState {
     thumb_h: f32,
 }
 
+// A settings dropdown whose floating option list is open. Owned by
+// UiInputSystem: while set, the list overlays the menu and consumes the frame's
+// input (a pick sends a SetIndex command; an outside click, Escape, or a scroll
+// dismisses it). Published each frame as an `OpenDropdown` resource so
+// GraphicsSystem can draw the list. The style fields mirror the row's value
+// label so the list text matches it.
+#[derive(Debug)]
+struct OpenDropdownState {
+    // The setting the list picks a value for (e.g. `"window_mode"`).
+    setting: String,
+    // The row's value label, forwarded on the pick so GraphicsSystem refreshes
+    // it.
+    value_label: Option<AssetId>,
+    // The control button's rect `[x, y, w, h]` the list anchors to (reference
+    // space for a view-owned row, window pixels otherwise).
+    anchor: [f32; 4],
+    // Option labels, top to bottom.
+    options: Vec<String>,
+    // The currently-applied option (highlighted as selected).
+    selected: usize,
+    // The option under the cursor this frame, if any (highlighted as hovered).
+    hovered: Option<usize>,
+    // The view the row belongs to (drives reference-space vs window hit-testing
+    // and rendering), or `None` for a view-less row.
+    view: Option<AssetId>,
+    // Font / scale / color copied from the row's value label so the list text
+    // matches the row (the un-hovered style, captured at open).
+    font: Option<AssetId>,
+    scale: f32,
+    color: [f32; 3],
+}
+
+// A dropdown-row click captured during the hit-test loop, resolved into an
+// `OpenDropdownState` after the loop (reading the value label's font + current
+// text needs the ctx the loop borrows). The style is the row's un-hovered value
+// style, snapshotted from the region entry at click time.
+struct OpenRequest {
+    setting: String,
+    value_label: Option<AssetId>,
+    anchor: [f32; 4],
+    view: Option<AssetId>,
+    color: Option<[f32; 3]>,
+    scale: Option<f32>,
+}
+
 // An in-progress key rebind: a Controls-tab rebind row was clicked and is
 // waiting for the user to press a key. The next `FrameInput.captured_key` binds
 // it; Escape cancels and restores the row's previous value text.
@@ -151,6 +198,9 @@ pub struct UiInputSystem {
     // While set, the menu consumes the frame for capture: the next pressed key
     // binds it and Escape cancels.
     capturing: Option<Capture>,
+    // The open settings dropdown, or `None`. While set, its floating list
+    // overlays the menu and consumes input until a pick / dismiss.
+    open_dropdown: Option<OpenDropdownState>,
     // Cursor into the Events<ViewCommand> queue. This system both sends (when a
     // `view:*` action fires) and reads ViewCommands, so a command fired this
     // frame is applied on the next, the same one-frame lag the old drain had.
@@ -171,6 +221,7 @@ impl UiInputSystem {
             panels: Vec::new(),
             thumb_drag: None,
             capturing: None,
+            open_dropdown: None,
             view_cmd_cursor: crate::ecs::EventCursor::default(),
         }
     }
@@ -313,6 +364,18 @@ impl System for UiInputSystem {
             None => return StepResult::Continue,
         };
 
+        // An open settings dropdown's floating list overlays the menu and
+        // consumes this frame: hover tracks the option under the cursor, a click
+        // picks it (or, outside the list, dismisses), and Escape / a scroll close
+        // it. Handled before the Escape keybinding + hit-test passes so it takes
+        // priority (Escape closes the list rather than the menu, a click on an
+        // option does not fall through to the row behind it).
+        if self.open_dropdown.is_some() {
+            self.step_open_dropdown(&input, ctx);
+            self.publish_dropdown(ctx);
+            return StepResult::Continue;
+        }
+
         // A pending key rebind (a Controls-tab rebind row was clicked) consumes
         // the whole frame: the next pressed key binds it, Escape cancels (and
         // restores the row's previous text), otherwise it keeps waiting. No
@@ -430,6 +493,10 @@ impl System for UiInputSystem {
         // A rebind-row click recorded here (setting key + value label) starts a
         // capture after the loop, for the same borrow reason.
         let mut start_capture: Option<(String, Option<AssetId>)> = None;
+        // A dropdown-row click recorded here opens its floating list after the
+        // loop (resolving the value label + options needs ctx, borrowed by the
+        // loop).
+        let mut start_open: Option<OpenRequest> = None;
         // Setting rows the engine disabled this frame (e.g. show_fps / show_vram
         // while the "Display performance stats" master is off): inert and grayed,
         // like the init-time capability gating but driven at runtime. Cloned out
@@ -534,6 +601,18 @@ impl System for UiInputSystem {
                     // A rebind row enters capture (started after the loop)
                     // instead of firing an action immediately.
                     start_capture = Some((key.to_string(), r.label));
+                } else if let Some(key) = open_key_from_action(&r.action) {
+                    // A dropdown row opens its floating list (started after the
+                    // loop) instead of firing an action. Snapshot the control
+                    // rect + the row's un-hovered value style now.
+                    start_open = Some(OpenRequest {
+                        setting: key.to_string(),
+                        value_label: r.label,
+                        anchor: [r.x, r.y, r.width, r.height],
+                        view: entry.view,
+                        color: entry.original_color,
+                        scale: entry.original_scale,
+                    });
                 } else if !r.action.is_empty()
                     && let Some(result) = fire_action(&r.action, r.label, ctx)
                 {
@@ -562,6 +641,13 @@ impl System for UiInputSystem {
             });
         }
 
+        // Open a dropdown for a clicked dropdown row: seed its list from the
+        // shared option registry + the value label's current text, then take
+        // over input from the next frame.
+        if let Some(req) = start_open {
+            self.open_dropdown = Self::build_open_dropdown(req, ctx);
+        }
+
         // Apply a recorded group toggle to the active view's panel, then solve
         // every panel so the next frame draws + hit-tests the reflowed layout.
         if let Some(gid) = toggle_group
@@ -572,12 +658,120 @@ impl System for UiInputSystem {
         }
         self.apply_scroll_layout(ctx);
 
+        // Publish the current dropdown state (a just-opened list, or `None` when
+        // closed) for GraphicsSystem to draw next tick.
+        self.publish_dropdown(ctx);
+
         StepResult::Continue
     }
 }
 
 impl UiInputSystem {
+    // Advance an open dropdown for one frame: track the option under the cursor,
+    // and on a click pick it (a SetIndex command) or dismiss (a click outside
+    // the list); Escape or a scroll also dismiss. Clears `open_dropdown` when the
+    // list closes.
+    fn step_open_dropdown(&mut self, input: &FrameInput, ctx: &mut PipelineContext) {
+        let Some(state) = self.open_dropdown.as_mut() else {
+            return;
+        };
+        // View-owned rows hit-test in reference space; a view-less row in window
+        // pixels (matches the region hit-test in `step`).
+        let overlay = OverlayTransform::from_viewport(input.viewport);
+        let (qx, qy) = if state.view.is_some() {
+            overlay.inverse(input.mouse_x, input.mouse_y)
+        } else {
+            (input.mouse_x, input.mouse_y)
+        };
+        let layout = dropdown::layout(state.anchor, state.options.len());
+        state.hovered = dropdown::item_at(&layout, qx, qy);
+
+        // Escape or a scroll dismisses without changing the value.
+        if input.escape || input.scroll_delta != 0.0 {
+            self.open_dropdown = None;
+            return;
+        }
+        if input.left_click {
+            match state.hovered {
+                // Pick the hovered option: send the absolute index, then close.
+                Some(i) => {
+                    let setting = state.setting.clone();
+                    let value_label = state.value_label;
+                    self.open_dropdown = None;
+                    ctx.events_mut::<SettingCommand>().send(SettingCommand {
+                        setting,
+                        op: SettingOp::SetIndex(i),
+                        value_label,
+                        persist: true,
+                    });
+                }
+                // A click outside the list dismisses it (consumed here, so the
+                // row behind it does not also react this frame).
+                None => self.open_dropdown = None,
+            }
+        }
+    }
+
+    // Resolve a captured dropdown-row click into an open list: read the option
+    // labels from the shared registry and the current value from the row's value
+    // label to seed the selection. Returns `None` (stays closed) when the setting
+    // has no registered options.
+    fn build_open_dropdown(
+        req: OpenRequest,
+        ctx: &mut PipelineContext,
+    ) -> Option<OpenDropdownState> {
+        let options: Vec<String> = settings::options(&req.setting)?
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // The value label's font (for the list text) and current content (to
+        // mark the selected option).
+        let (font, current) = req
+            .value_label
+            .and_then(|id| {
+                ctx.query::<TextLabel>()
+                    .find(|l| l.asset_id == id)
+                    .map(|l| (l.font, l.content.clone()))
+            })
+            .unwrap_or((None, String::new()));
+        let selected = options.iter().position(|o| *o == current).unwrap_or(0);
+        Some(OpenDropdownState {
+            setting: req.setting,
+            value_label: req.value_label,
+            anchor: req.anchor,
+            options,
+            selected,
+            hovered: None,
+            view: req.view,
+            font,
+            scale: req.scale.unwrap_or(1.0),
+            color: req.color.unwrap_or([1.0, 1.0, 1.0]),
+        })
+    }
+
+    // Publish the current dropdown state as an `OpenDropdown` resource for
+    // GraphicsSystem to draw next tick (`None` while closed).
+    fn publish_dropdown(&self, ctx: &mut PipelineContext) {
+        let view = self
+            .open_dropdown
+            .as_ref()
+            .map(|s| crate::ecs::DropdownView {
+                anchor: s.anchor,
+                options: s.options.clone(),
+                selected: s.selected,
+                hovered: s.hovered,
+                view: s.view,
+                font: s.font,
+                scale: s.scale,
+                color: s.color,
+            });
+        ctx.insert_resource(crate::ecs::OpenDropdown(view));
+    }
+
     fn apply_view_command(&mut self, cmd: ViewCommand, ctx: &mut PipelineContext) {
+        // A navigation away from the current page dismisses any open dropdown so
+        // its list never lingers over a different view.
+        self.open_dropdown = None;
         // Semantics:
         //   Show(X)     : plain navigation: active=X, prev cleared.
         //   Hide        : restore prev (modal dismiss); both cleared after.
@@ -957,6 +1151,15 @@ fn rebind_key_from_action(action: &str) -> Option<&str> {
     (!key.is_empty()).then_some(key)
 }
 
+// The setting key of a dropdown-open action (`setting:<key>:open`), or `None`
+// for any other action. A region with `Some` here opens a floating option list
+// on click instead of firing an action.
+fn open_key_from_action(action: &str) -> Option<&str> {
+    let rest = action.strip_prefix("setting:")?;
+    let key = rest.strip_suffix(":open")?;
+    (!key.is_empty()).then_some(key)
+}
+
 // The collapsible-group index of a group-toggle action (`group:toggle:<gid>`),
 // or `None`. A region with `Some` here flips its panel's group instead of
 // firing an action.
@@ -1038,11 +1241,13 @@ fn fire_action(
                     persist: true,
                 });
             }
-            // Slider drags and key rebinds are driven by their own passes (the
-            // drag pass and the capture flow), not the click-to-fire path, so
-            // they never reach here from a HitRegion click; recognise them so a
-            // stray binding does not log a false "malformed" warning.
-            Some((key, "drag")) | Some((key, "rebind")) if !key.is_empty() => {}
+            // Slider drags, key rebinds, and dropdown opens are driven by their
+            // own passes (the drag pass, the capture flow, the dropdown pass),
+            // not the click-to-fire path, so they never reach here from a
+            // HitRegion click; recognise them so a stray binding does not log a
+            // false "malformed" warning.
+            Some((key, "drag")) | Some((key, "rebind")) | Some((key, "open"))
+                if !key.is_empty() => {}
             _ => tracing::warn!("UiInputSystem: malformed setting action '{}'", action),
         }
         return None;
@@ -1171,6 +1376,98 @@ mod tests {
             .map(|l| l.color)
             .unwrap();
         assert_eq!(lbl_color_after, [1.0, 1.0, 1.0]);
+    }
+
+    // A view-owned dropdown row (window_mode has three options, so its
+    // `:open` region opens a floating list). Clicking the control opens the list
+    // (published as an OpenDropdown resource, no command yet); clicking an option
+    // sends a SetIndex command and closes.
+    fn dropdown_world() -> (World, AssetId) {
+        let view = AssetId(9);
+        let mut world = World::new_empty();
+        world.add_component(View {
+            asset_id: view,
+            initial: true,
+            ..Default::default()
+        });
+        // The row's value label (view-owned), currently "Windowed" (option 0).
+        world.add_component(TextLabel {
+            asset_id: AssetId(1),
+            font: None,
+            content: "Windowed".to_string(),
+            x: 0.0,
+            y: 0.0,
+            color: [0.85, 0.85, 0.85],
+            scale: 1.0,
+            centered: false,
+            background: [0.0, 0.0, 0.0, 0.0],
+            padding: 0.0,
+            visible: true,
+            view: Some(view),
+        });
+        // The control button whose click opens the list.
+        world.add_component(HitRegion {
+            x: 400.0,
+            y: 100.0,
+            width: 200.0,
+            height: 40.0,
+            label: Some(AssetId(1)),
+            hover_color: Some([1.0, 0.85, 0.3]),
+            hover_scale: Some(1.0),
+            action: "setting:window_mode:open".to_string(),
+            drag_handle: None,
+            view: Some(view),
+            disabled: false,
+        });
+        world.start().unwrap();
+        (world, view)
+    }
+
+    fn dropdown_is_open(world: &World) -> bool {
+        world
+            .resource::<crate::ecs::OpenDropdown>()
+            .and_then(|d| d.0.as_ref())
+            .is_some()
+    }
+
+    #[test]
+    fn dropdown_opens_then_picks_an_option() {
+        let (mut world, _) = dropdown_world();
+
+        // Click the control button (default viewport is identity, so window
+        // coords are reference coords): the list opens, no command yet.
+        world.add_component(make_frame_input(500.0, 120.0, true));
+        world.step();
+        assert!(produced_setting_commands(&world).is_empty());
+        let open = world.resource::<crate::ecs::OpenDropdown>().unwrap();
+        let dv = open.0.as_ref().expect("dropdown should be open");
+        assert_eq!(dv.options.len(), 3);
+        assert_eq!(dv.selected, 0, "current value 'Windowed' is option 0");
+
+        // The list opens below the button (rows at y = 140, 180, 220, height 40).
+        // Click the second option ("Borderless") at y = 200.
+        world.add_component(make_frame_input(500.0, 200.0, true));
+        world.step();
+        let cmds = produced_setting_commands(&world);
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0].setting, "window_mode");
+        assert!(matches!(cmds[0].op, SettingOp::SetIndex(1)));
+        assert!(!dropdown_is_open(&world), "picking closes the list");
+    }
+
+    #[test]
+    fn dropdown_outside_click_dismisses_without_command() {
+        let (mut world, _) = dropdown_world();
+
+        world.add_component(make_frame_input(500.0, 120.0, true));
+        world.step();
+        assert!(dropdown_is_open(&world));
+
+        // Click far from both the list and the button: it dismisses, no command.
+        world.add_component(make_frame_input(50.0, 600.0, true));
+        world.step();
+        assert!(produced_setting_commands(&world).is_empty());
+        assert!(!dropdown_is_open(&world));
     }
 
     // When a region's hover_scale equals its label's scale (what the generated

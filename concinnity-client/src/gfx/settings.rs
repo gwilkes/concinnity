@@ -1,11 +1,13 @@
 // src/gfx/settings.rs
 //
-// The engine-side registry of user-facing settings an OptionSelect row can
-// cycle. Each known setting key maps to its ordered option labels; the labels
-// are what the value TextLabel shows. How a chosen option is applied (which
-// backend call, which persisted field) lives in GraphicsSystem's drain, keyed
-// by the same string. Keeping the option list here (not in world data) means a
-// row can only target a setting the engine actually knows how to apply.
+// The engine-side registry of user-facing settings a cycle row can change. The
+// ordered option labels live in `concinnity_core::gfx::settings` (shared with
+// the build pipeline, which reads a key's label count to pick a stepper vs a
+// dropdown); this module re-exports `options` + `is_quality_toggle` from there
+// and holds the client-only half: how a chosen option index maps to the applied
+// value (the `*_at` / `*_index` pairs), the slider ranges, and the cycle math.
+// How a chosen option is applied (which backend call, which persisted field)
+// lives in GraphicsSystem's drain, keyed by the same string.
 
 use crate::assets::{
     AaMode, ReflectionBlurResolution, SettingOp, ShadowUpdate, SsgiResolution, UpscaleQuality,
@@ -13,27 +15,10 @@ use crate::assets::{
 };
 use crate::gfx::backend::GpuVendor;
 
-// Ordered option labels for `vsync`: index 0 is off, index 1 is on.
-const VSYNC_OPTIONS: [&str; 2] = ["Off", "On"];
-// Shared Off/On labels for the boolean quality toggles. Index 0 is off, 1 on,
-// so `bool as usize` indexes directly.
-const OFF_ON_OPTIONS: [&str; 2] = ["Off", "On"];
-// The quality-feature toggle keys (Video "Quality" group). Each gates a render
-// pass whose GPU resources are built at init, so a change rebuilds those
-// resources (live on Metal; persisted + applied at the next launch elsewhere).
-// `GraphicsSystem` maps each key to the `PostProcessConfig` field it flips.
-pub(crate) const QUALITY_TOGGLE_KEYS: [&str; 5] = [
-    "ssao",
-    "ssr",
-    "ray_traced_reflections",
-    "ssgi",
-    "auto_exposure",
-];
-
-// Whether `key` is one of the boolean quality toggles.
-pub(crate) fn is_quality_toggle(key: &str) -> bool {
-    QUALITY_TOGGLE_KEYS.contains(&key)
-}
+// The shared option-label registry (labels + classification) lives in core so
+// the cook and the client agree on every setting's option count. Re-exported
+// under the historical `settings::*` paths the rest of the client uses.
+pub(crate) use concinnity_core::gfx::settings::{QUALITY_TOGGLE_KEYS, is_quality_toggle, options};
 
 // Whether setting `key` can be changed on a device with the given capabilities.
 // A capability-gated setting (e.g. `ray_traced_reflections`, which needs
@@ -61,94 +46,19 @@ pub(crate) fn setting_available(key: &str, caps: &crate::gfx::backend::DeviceCap
 // the live map is owned by `GraphicsSystem`, so there is nothing to register
 // here; this comment just records the third category for the reader.
 
-// Window mode options, in cycle order. Indices map via `window_mode_at` /
-// `window_mode_index`.
-const WINDOW_MODE_OPTIONS: [&str; 3] = ["Windowed", "Borderless", "Fullscreen"];
-// Render-scale (upscaling quality) options, in cycle order. Indices map via
-// `render_scale_at` / `render_scale_index`.
-const RENDER_SCALE_OPTIONS: [&str; 4] = ["Quality", "Balanced", "Performance", "Ultra"];
-// Upscaler-backend options, in cycle order matching the UpscalerBackend enum
-// (Auto / FSR3 / DLSS / XeSS). Indices map via `upscale_backend_at` /
-// `upscale_backend_index`. DirectX / Vulkan only (Metal uses MetalFX); the cycle
-// skips vendor-locked entries the active GPU does not offer (see
-// `upscale_backend_available`), and the backend's `build_upscaler` still falls
-// back gracefully on an unavailable explicit choice. Restart-required.
-const UPSCALE_BACKEND_OPTIONS: [&str; 4] = ["Auto", "FSR 3", "DLSS", "XeSS"];
-
-// Frame-rate cap options (Video Display group), in cycle order. "Unlimited" is 0
-// (no cap); the rest are target FPS. A CPU-side frame pacer in the render loop
-// enforces them, so they compose with vsync (the more restrictive wins). Indices
-// map via the `fps_cap_*` helpers below (an authored cap off the discrete levels
-// snaps to the nearest). Applied live (the pacer reads the value each frame).
-const FPS_CAP_OPTIONS: [&str; 6] = ["Unlimited", "30", "60", "120", "144", "240"];
+// The discrete numeric levels each `*_at` / `*_index` mapping recovers from an
+// option index (the ordered labels for these live in core's option registry).
+// An authored value off a discrete level snaps to the nearest.
 const FPS_CAP_VALUES: [u32; 6] = [0, 30, 60, 120, 144, 240];
-
-// SSGI gather sub-quality dropdowns. The gather clamps rays to [1,32] and steps
-// to [1,64]; these are the menu's discrete levels, in cycle order. Resolution is
-// finest-first (Full/Half/Quarter), matching the enum. Indices map via the
-// `ssgi_*_at` / `ssgi_*_index` helpers below.
-const SSGI_RESOLUTION_OPTIONS: [&str; 3] = ["Full", "Half", "Quarter"];
-const SSGI_RAYS_OPTIONS: [&str; 4] = ["4", "8", "16", "32"];
 const SSGI_RAYS_COUNTS: [u32; 4] = [4, 8, 16, 32];
-const SSGI_STEPS_OPTIONS: [&str; 4] = ["8", "12", "24", "48"];
 const SSGI_STEPS_COUNTS: [u32; 4] = [8, 12, 24, 48];
-// Reflection blur resolution options, finest-first (matches the enum).
-const REFLECTION_BLUR_OPTIONS: [&str; 3] = ["Full", "Half", "Quarter"];
-
-// Anti-aliasing mode options (Video "Quality" group), in cycle order matching
-// the AaMode enum: Off (no edge smoothing), FXAA (cheap composite edge filter),
-// TAA (temporal accumulation, the cleanest and most expensive). Rides the
-// feature's live-reinit like the other quality cycles. Indices map via the
-// `aa_mode_*` helpers below.
-const AA_MODE_OPTIONS: [&str; 3] = ["Off", "FXAA", "TAA"];
-
-// Shadow-map cascade resolution options (texels), in cycle order. "Off" disables
-// shadows (size 0); the rest are the per-cascade texel dimensions. Indices map
-// via the `shadow_resolution_*` helpers below (an authored size off the discrete
-// levels snaps to the nearest). Restart-required (the shadow map array is sized
-// once at backend init).
-const SHADOW_RESOLUTION_OPTIONS: [&str; 4] = ["Off", "1024", "2048", "4096"];
 const SHADOW_RESOLUTION_SIZES: [u32; 4] = [0, 1024, 2048, 4096];
-// Shadow re-render cadence options, best (most expensive) first: "Every Frame"
-// re-renders every cascade each frame, "Hybrid" amortizes the far cascades.
-// Applied live (the cascade scheduler reads the policy each frame).
-const SHADOW_UPDATE_OPTIONS: [&str; 2] = ["Every Frame", "Hybrid"];
-
-// Shadow-distance options (world units the cascades cover), in cycle order. A
-// larger distance shadows more of the scene but spreads the same resolution over
-// more area. Indices map via the `shadow_distance_*` helpers below (an authored
-// distance off the discrete levels snaps to the nearest). Applied live (the
-// per-frame cascade-split computation reads the distance each draw).
-const SHADOW_DISTANCE_OPTIONS: [&str; 4] = ["40 m", "80 m", "160 m", "320 m"];
 const SHADOW_DISTANCE_VALUES: [u32; 4] = [40, 80, 160, 320];
-
-// Shadow cascade-count options, in cycle order. More cascades keep distant
-// shadows sharper (finer view-range slices) at the cost of an extra shadow-map
-// render each; fewer is cheaper but blockier far away. Indices map via the
-// `shadow_cascades_*` helpers below. Applied live (the per-frame split + schedule
-// read the count each draw); preset-governed.
-const SHADOW_CASCADES_OPTIONS: [&str; 3] = ["2", "3", "4"];
 const SHADOW_CASCADES_VALUES: [u32; 3] = [2, 3, 4];
-
-// Anisotropic-filtering degree options for the scene sampler, in cycle order.
-// "Off" is 1x (plain trilinear); the rest are the max anisotropy degree. Indices
-// map via the `anisotropy_*` helpers below (an authored degree off the discrete
-// levels snaps to the nearest). Restart-required (the sampler is built once at
-// backend init).
-const ANISOTROPY_OPTIONS: [&str; 5] = ["Off", "2x", "4x", "8x", "16x"];
 const ANISOTROPY_LEVELS: [u32; 5] = [1, 2, 4, 8, 16];
-
-// Frame-buffering (ring-buffer depth / frames-in-flight) options, in cycle order.
-// Lower is less latency, higher is smoother pacing. Restart-required (the ring
-// buffers are sized once at init). Indices map via `frames_in_flight_at/_index`.
-const FRAME_BUFFERING_OPTIONS: [&str; 3] = ["1", "2", "3"];
 const FRAME_BUFFERING_COUNTS: [u32; 3] = [1, 2, 3];
-// Texture-quality options: one row drives both the streaming pool size
-// (`texture_cap`, how many high-resolution textures stay resident) and the
-// per-frame upload budget (`texture_budget`, how fast they stream in). Restart-
-// required (the pool is sized once at init). Indices map via
-// `texture_quality_at/_index`; the index is recovered from the pool size.
-const TEXTURE_QUALITY_OPTIONS: [&str; 4] = ["Low", "Medium", "High", "Ultra"];
+// Texture quality: one option index drives both the streaming pool cap (how many
+// high-resolution textures stay resident) and the per-frame upload budget.
 const TEXTURE_QUALITY_CAPS: [u32; 4] = [48, 96, 192, 384];
 const TEXTURE_QUALITY_BUDGETS: [u32; 4] = [2, 4, 8, 12];
 
@@ -165,16 +75,8 @@ pub(crate) const QUALITY_CYCLE_KEYS: [&str; 5] = [
     "reflection_blur_resolution",
 ];
 
-// Master "Graphics Quality" preset options, in cycle order. The labels mirror
-// `QualityPreset::ALL`'s order (locked by `graphics_quality_options_match_preset_order`);
-// `quality_preset::preset_index` / `preset_at` map an index to the live preset.
-// The `Auto` row is relabeled with its resolved tier (e.g. "Auto (High)") by the
-// graphics system, which the static table cannot express.
-const GRAPHICS_QUALITY_OPTIONS: [&str; 6] = ["Auto", "Low", "Medium", "High", "Ultra", "Custom"];
-
-// Master-volume options, in cycle order. Indices map to a linear gain via
-// `master_volume_at` / `master_volume_index`.
-const MASTER_VOLUME_OPTIONS: [&str; 5] = ["Off", "25%", "50%", "75%", "100%"];
+// Master-volume gains, one per option index (the labels live in core). Indices
+// map to a linear gain via `master_volume_at` / `master_volume_index`.
 const MASTER_VOLUME_GAINS: [f32; 5] = [0.0, 0.25, 0.5, 0.75, 1.0];
 // Effective master volume when the user has never chosen one (full gain).
 pub(crate) const DEFAULT_MASTER_VOLUME: f32 = 1.0;
@@ -184,57 +86,6 @@ pub(crate) const DEFAULT_MASTER_VOLUME: f32 = 1.0;
 // is a slider (1..100 -> radians/pixel), not a cycle row; see
 // `MOUSE_SENSITIVITY_RANGE` and `slider_apply_value`.
 pub(crate) const DEFAULT_MOUSE_SENSITIVITY: f32 = 0.0015;
-
-// Window-size presets [label, width, height], in cycle order.
-const WINDOW_SIZE_PRESETS: [(&str, u32, u32); 4] = [
-    ("1280x720", 1280, 720),
-    ("1600x900", 1600, 900),
-    ("1920x1080", 1920, 1080),
-    ("2560x1440", 2560, 1440),
-];
-
-// The option labels for a known setting key, or `None` if the key is unknown.
-pub(crate) fn options(key: &str) -> Option<&'static [&'static str]> {
-    match key {
-        "graphics_quality" => Some(&GRAPHICS_QUALITY_OPTIONS),
-        "vsync" => Some(&VSYNC_OPTIONS),
-        "window_mode" => Some(&WINDOW_MODE_OPTIONS),
-        "render_scale" => Some(&RENDER_SCALE_OPTIONS),
-        "upscale_backend" => Some(&UPSCALE_BACKEND_OPTIONS),
-        "fps_cap" => Some(&FPS_CAP_OPTIONS),
-        "window_size" => Some(&WINDOW_SIZE_LABELS),
-        "master_volume" => Some(&MASTER_VOLUME_OPTIONS),
-        "aa_mode" => Some(&AA_MODE_OPTIONS),
-        "ssgi_resolution" => Some(&SSGI_RESOLUTION_OPTIONS),
-        "ssgi_rays" => Some(&SSGI_RAYS_OPTIONS),
-        "ssgi_steps" => Some(&SSGI_STEPS_OPTIONS),
-        "reflection_blur_resolution" => Some(&REFLECTION_BLUR_OPTIONS),
-        "shadow_map_size" => Some(&SHADOW_RESOLUTION_OPTIONS),
-        "shadow_update" => Some(&SHADOW_UPDATE_OPTIONS),
-        "shadow_distance" => Some(&SHADOW_DISTANCE_OPTIONS),
-        "shadow_cascades" => Some(&SHADOW_CASCADES_OPTIONS),
-        "anisotropy" => Some(&ANISOTROPY_OPTIONS),
-        "frames_in_flight" => Some(&FRAME_BUFFERING_OPTIONS),
-        "texture_quality" => Some(&TEXTURE_QUALITY_OPTIONS),
-        // Display-output / upscaling preference + occlusion toggles (Off/On).
-        "temporal_upscaling" | "hdr_display" | "hdr_pq" | "occlusion_two_pass" => {
-            Some(&OFF_ON_OPTIONS)
-        }
-        // Stats-HUD display toggles: a master and one per readout (Off/On).
-        "perf_stats" | "show_fps" | "show_vram" => Some(&OFF_ON_OPTIONS),
-        key if is_quality_toggle(key) => Some(&OFF_ON_OPTIONS),
-        _ => None,
-    }
-}
-
-// The window-size preset labels, derived once from the preset table so the two
-// never drift.
-const WINDOW_SIZE_LABELS: [&str; 4] = [
-    WINDOW_SIZE_PRESETS[0].0,
-    WINDOW_SIZE_PRESETS[1].0,
-    WINDOW_SIZE_PRESETS[2].0,
-    WINDOW_SIZE_PRESETS[3].0,
-];
 
 // WindowMode for an option index, and the index for a WindowMode. Order matches
 // WINDOW_MODE_OPTIONS, not the enum's declaration order.
@@ -479,8 +330,10 @@ pub(crate) fn texture_quality_index(cap: u32) -> usize {
     nearest_count_index(&TEXTURE_QUALITY_CAPS, cap)
 }
 
-// Window (width, height) for a preset index.
+// Window (width, height) for a preset index. The preset table (label + dims)
+// lives in core so the cook and client agree on the option labels.
 pub(crate) fn window_size_at(index: usize) -> (u32, u32) {
+    use concinnity_core::gfx::settings::WINDOW_SIZE_PRESETS;
     let p = WINDOW_SIZE_PRESETS
         .get(index)
         .unwrap_or(&WINDOW_SIZE_PRESETS[0]);
@@ -489,6 +342,7 @@ pub(crate) fn window_size_at(index: usize) -> (u32, u32) {
 // The preset index whose dimensions match (w, h), or 0 when none match (a
 // custom / asset-authored size that isn't a preset).
 pub(crate) fn window_size_index(w: u32, h: u32) -> usize {
+    use concinnity_core::gfx::settings::WINDOW_SIZE_PRESETS;
     WINDOW_SIZE_PRESETS
         .iter()
         .position(|p| p.1 == w && p.2 == h)
@@ -510,13 +364,16 @@ pub(crate) fn master_volume_index(gain: f32) -> usize {
         .unwrap_or(MASTER_VOLUME_GAINS.len() - 1)
 }
 
-// Advance an option index one step in the given direction, wrapping at the
-// ends. `len` must be non-zero (a known setting always has options). A
-// `SetFraction` op only applies to slider settings and never reaches here.
+// Advance an option index one step in the given direction (wrapping at the
+// ends), or jump straight to a dropdown pick's absolute index. `len` must be
+// non-zero (a known setting always has options). A `SetFraction` op only
+// applies to slider settings and never reaches here.
 pub(crate) fn cycle(index: usize, len: usize, op: SettingOp) -> usize {
     debug_assert!(len > 0);
     match op {
         SettingOp::Prev => (index + len - 1) % len,
+        // A dropdown pick jumps to its option index, clamped to the last option.
+        SettingOp::SetIndex(i) => i.min(len.saturating_sub(1)),
         // Next steps forward; the slider and rebind ops never reach a cycle
         // setting, so treating them as Next is harmless.
         SettingOp::Next | SettingOp::SetFraction(_) | SettingOp::Rebind(_) => (index + 1) % len,
@@ -742,16 +599,14 @@ mod tests {
     #[test]
     fn graphics_quality_options_match_preset_order() {
         use crate::gfx::quality_preset::QualityPreset;
-        // The master row's labels must line up 1:1 with the preset cycle order,
-        // so an index from `preset_index` selects the right label and vice versa.
-        assert_eq!(GRAPHICS_QUALITY_OPTIONS.len(), QualityPreset::ALL.len());
+        // The master row's labels (in core's registry) must line up 1:1 with the
+        // preset cycle order, so an index from `preset_index` selects the right
+        // label and vice versa.
+        let labels = options("graphics_quality").expect("graphics_quality options");
+        assert_eq!(labels.len(), QualityPreset::ALL.len());
         for (i, p) in QualityPreset::ALL.iter().enumerate() {
-            assert_eq!(GRAPHICS_QUALITY_OPTIONS[i], p.name(), "label {i}");
+            assert_eq!(labels[i], p.name(), "label {i}");
         }
-        assert_eq!(
-            options("graphics_quality"),
-            Some(&GRAPHICS_QUALITY_OPTIONS[..])
-        );
     }
 
     #[test]
@@ -814,14 +669,14 @@ mod tests {
             assert_eq!(aa_mode_index(mode), i);
             assert_eq!(aa_mode_at(i), mode);
         }
-        assert_eq!(AA_MODE_OPTIONS.len(), 3);
+        assert_eq!(options("aa_mode").unwrap().len(), 3);
         // An out-of-range index falls back to the FXAA default.
         assert_eq!(aa_mode_at(9), AaMode::Fxaa);
     }
 
     #[test]
     fn fps_cap_round_trips_and_snaps() {
-        assert_eq!(FPS_CAP_OPTIONS.len(), FPS_CAP_VALUES.len());
+        assert_eq!(options("fps_cap").unwrap().len(), FPS_CAP_VALUES.len());
         for (i, &cap) in FPS_CAP_VALUES.iter().enumerate() {
             assert_eq!(fps_cap_index(cap), i);
             assert_eq!(fps_cap_at(i), cap);
@@ -850,6 +705,15 @@ mod tests {
     fn cycle_three_options() {
         assert_eq!(cycle(2, 3, SettingOp::Next), 0);
         assert_eq!(cycle(0, 3, SettingOp::Prev), 2);
+    }
+
+    #[test]
+    fn cycle_set_index_jumps_and_clamps() {
+        // A dropdown pick jumps straight to the chosen index, regardless of the
+        // current one, and clamps to the last option if it is out of range.
+        assert_eq!(cycle(0, 4, SettingOp::SetIndex(2)), 2);
+        assert_eq!(cycle(3, 4, SettingOp::SetIndex(0)), 0);
+        assert_eq!(cycle(1, 4, SettingOp::SetIndex(9)), 3);
     }
 
     #[test]
@@ -1121,7 +985,7 @@ mod tests {
     fn upscale_backend_round_trips_and_vendor_gates() {
         // Every variant round-trips through its index, and the option table lines
         // up with the four variants.
-        assert_eq!(UPSCALE_BACKEND_OPTIONS.len(), 4);
+        assert_eq!(options("upscale_backend").unwrap().len(), 4);
         for b in [
             UpscalerBackend::Auto,
             UpscalerBackend::Fsr3,
@@ -1181,13 +1045,6 @@ mod tests {
         assert_eq!(window_size_at(2), (1920, 1080));
         // A non-preset (asset-authored) size falls back to index 0.
         assert_eq!(window_size_index(1024, 768), 0);
-    }
-
-    #[test]
-    fn window_size_labels_track_the_preset_table() {
-        for (i, (label, _, _)) in WINDOW_SIZE_PRESETS.iter().enumerate() {
-            assert_eq!(WINDOW_SIZE_LABELS[i], *label);
-        }
     }
 
     #[test]

@@ -3,9 +3,10 @@
 use crate::assets::Key;
 use crate::ecs::asset_id::AssetId;
 
-// What a "setting:*" action does to its value: cycle one step (for an
-// OptionSelect row), set an absolute position in [0, 1] (for a Slider row's
-// drag), or bind a key (for a key-rebind row).
+// What a "setting:*" action does to its value: cycle one step (for a stepper
+// row), jump to an absolute option index (for a dropdown pick), set an absolute
+// position in [0, 1] (for a Slider row's drag), or bind a key (for a key-rebind
+// row).
 //
 // Eq is intentionally not derived: SetFraction carries an f32.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -13,6 +14,9 @@ pub enum SettingOp {
     #[default]
     Next,
     Prev,
+    // Jump straight to this option index (clamped to the option count). Sent
+    // once when the user picks an entry from an open dropdown list.
+    SetIndex(usize),
     // Set the value to this fraction of its range, 0.0..=1.0. Sent each frame
     // while a slider is dragged.
     SetFraction(f32),

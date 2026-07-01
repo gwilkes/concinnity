@@ -258,14 +258,101 @@ fn pace_deadline(now: Instant, prev: Option<Instant>, target: Duration) -> (Inst
     (wait_until, wait_until + target)
 }
 
-// The setting key of a cycle row's forward stepper (`setting:<key>:next`), or
-// `None`. A cycle row emits a matching `:prev` region with the same value label,
-// so capturing the `:next` region alone maps each cycle key once.
+// The setting key of a cycle row's value-carrying region, or `None`. A stepper
+// row emits a `:next` region (with a matching `:prev` sharing the same value
+// label, so capturing `:next` alone maps the key once); a dropdown row emits a
+// single `:open` region. Both carry the value label, so matching either maps
+// each cycle key to its value label exactly once.
 fn cycle_next_key_of(action: &str) -> Option<&str> {
-    action
-        .strip_prefix("setting:")?
-        .strip_suffix(":next")
+    let rest = action.strip_prefix("setting:")?;
+    rest.strip_suffix(":next")
+        .or_else(|| rest.strip_suffix(":open"))
         .filter(|k| !k.is_empty())
+}
+
+// Build the transient overlay Sprites + TextLabels for an open dropdown list.
+// These are fed through the same sprite / text shapers as the menu but with no
+// clip bands, so the list draws unclipped on top of the menu (escaping the
+// scroll band's scissor). Geometry is reference space for a view-owned row (and
+// window pixels otherwise), matching the input hit-test in `ui`.
+fn build_dropdown_overlay(
+    view: &crate::ecs::DropdownView,
+    loaded_fonts: &std::collections::HashMap<AssetId, text::LoadedFont>,
+) -> (Vec<Sprite>, Vec<TextLabel>) {
+    // Panel fill (near-opaque so rows behind it do not show through), a framing
+    // border, and the selected / hovered row highlights.
+    const PANEL_BG: [f32; 4] = [0.06, 0.08, 0.14, 0.98];
+    const BORDER: [f32; 4] = [0.28, 0.34, 0.52, 1.0];
+    const SELECTED_BG: [f32; 4] = [0.14, 0.20, 0.34, 1.0];
+    const HOVER_BG: [f32; 4] = [0.22, 0.30, 0.48, 1.0];
+    const TEXT_PAD: f32 = 10.0;
+    const BORDER_PX: f32 = 2.0;
+
+    let layout = concinnity_core::gfx::dropdown::layout(view.anchor, view.options.len());
+    let mut sprites: Vec<Sprite> = Vec::new();
+    let mk_sprite = |rect: [f32; 4], tint: [f32; 4]| Sprite {
+        asset_id: AssetId::default(),
+        x: rect[0],
+        y: rect[1],
+        width: rect[2],
+        height: rect[3],
+        texture: None,
+        tint,
+        follow_cursor: false,
+        visible: true,
+        view: view.view,
+    };
+
+    // Border quad (a little larger, drawn first) then the panel fill on top.
+    let [lx, ly, lw, lh] = layout.list;
+    sprites.push(mk_sprite(
+        [
+            lx - BORDER_PX,
+            ly - BORDER_PX,
+            lw + 2.0 * BORDER_PX,
+            lh + 2.0 * BORDER_PX,
+        ],
+        BORDER,
+    ));
+    sprites.push(mk_sprite(layout.list, PANEL_BG));
+    // The currently-applied option, then the hovered one on top of it.
+    if let Some(rect) = layout.items.get(view.selected) {
+        sprites.push(mk_sprite(*rect, SELECTED_BG));
+    }
+    if let Some(h) = view.hovered
+        && let Some(rect) = layout.items.get(h)
+    {
+        sprites.push(mk_sprite(*rect, HOVER_BG));
+    }
+
+    // One text label per option, vertically centered in its row (the text draws
+    // after the sprites, so it sits over the highlights).
+    let line_h = view
+        .font
+        .and_then(|f| loaded_fonts.get(&f))
+        .map(|f| f.size_px * view.scale)
+        .unwrap_or(0.0);
+    let labels: Vec<TextLabel> = view
+        .options
+        .iter()
+        .zip(&layout.items)
+        .map(|(opt, rect)| TextLabel {
+            asset_id: AssetId::default(),
+            font: view.font,
+            content: opt.clone(),
+            x: rect[0] + TEXT_PAD,
+            y: rect[1] + (rect[3] - line_h) / 2.0,
+            color: view.color,
+            scale: view.scale,
+            centered: false,
+            background: [0.0, 0.0, 0.0, 0.0],
+            padding: 0.0,
+            visible: true,
+            view: view.view,
+        })
+        .collect();
+
+    (sprites, labels)
 }
 
 impl GraphicsSystem {
@@ -380,6 +467,33 @@ impl GraphicsSystem {
                 win_h,
                 &self.clip_rects,
             ));
+
+            // A settings dropdown's open list draws on top of the menu (after the
+            // clipped row text, before the cursor) and unclipped, so it escapes
+            // the scroll band's scissor. Built as transient overlay Sprites +
+            // TextLabels fed through the same shapers (with no clip bands).
+            if let Some(view) = ctx
+                .resource::<crate::ecs::OpenDropdown>()
+                .and_then(|d| d.0.clone())
+            {
+                let no_clips = std::collections::HashMap::new();
+                let (sprites, dl_labels) = build_dropdown_overlay(&view, &self.loaded_fonts);
+                let sprite_refs: Vec<&Sprite> = sprites.iter().collect();
+                calls.extend(gfx_sprite::build_sprite_calls(
+                    &sprite_refs,
+                    default_atlas_slot,
+                    [win_w, win_h],
+                    &no_clips,
+                ));
+                let label_refs: Vec<&TextLabel> = dl_labels.iter().collect();
+                calls.extend(text::build_text_calls(
+                    &label_refs,
+                    &self.loaded_fonts,
+                    win_w,
+                    win_h,
+                    &no_clips,
+                ));
+            }
 
             // A menu cursor is present when any visible follow_cursor sprite is
             // opaque. Draw it (as an arrow pointer at the latest mouse position,

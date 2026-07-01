@@ -499,7 +499,7 @@ fn emit_settings_tab(
                 out.push(option_select_row(
                     &name, setting, label, font, content_x, base_y, content_w, row_scale, style,
                 ));
-                (super::option_select::element_names(&name), group)
+                (super::option_select::element_names(&name, setting), group)
             }
             BodyRow::Slider(setting, label, group) => {
                 let name = format!("{}_sld_{}", view, setting);

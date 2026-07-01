@@ -1,6 +1,12 @@
 // src/world/option_select.rs
-// Build-time expansion: OptionSelect -> a name TextLabel + a value TextLabel +
-// a HitRegion that fires a "setting:<key>:next" action.
+// Build-time expansion of an OptionSelect settings row. A setting with more than
+// two options expands to a dropdown (name + current value + a downward chevron
+// under one click region firing "setting:<key>:open", which opens a floating
+// option list at runtime); a setting with two options (an Off/On toggle) expands
+// to a `<`/`>` stepper (name + `<` + value + `>` over two regions firing
+// "setting:<key>:prev" / ":next"). The option count is read from the shared
+// registry in `concinnity_core::gfx::settings`, so the row form always matches
+// the setting the engine will apply.
 //
 // The value label shows a placeholder here; the runtime corrects it to the live
 // value on the first frame. Names are prefixed with the OptionSelect's own name
@@ -11,6 +17,13 @@ use std::collections::HashMap;
 
 use super::expand::{asset_name, type_norm};
 use crate::assets::{Font, OptionSelect};
+
+// Whether a setting row expands to a dropdown (more than two options) rather
+// than a `<`/`>` stepper. An unknown key (no registered options) falls back to
+// the stepper form.
+fn is_dropdown(setting: &str) -> bool {
+    concinnity_core::gfx::settings::options(setting).is_some_and(|o| o.len() > 2)
+}
 
 // Where the control group (the `<` button + value + `>`) starts, as a fraction
 // of the row width. The name occupies the left part, the control the right.
@@ -69,17 +82,27 @@ pub(crate) fn expand_option_selects(assets: &mut Vec<serde_json::Value>) -> Resu
     Ok(())
 }
 
-// The Sprite/TextLabel child names an OptionSelect named `base` expands to (the
-// elements a scroll panel reflows + clips with its row). The HitRegions are
-// excluded: they have no asset id and are reflowed by position. Locked to the
-// expansion output by `element_names_match_expansion`.
-pub(crate) fn element_names(base: &str) -> Vec<String> {
-    vec![
-        format!("{base}_label"),
-        format!("{base}_prev_glyph"),
-        format!("{base}_value"),
-        format!("{base}_next_glyph"),
-    ]
+// The Sprite/TextLabel child names an OptionSelect named `base` (for `setting`)
+// expands to (the elements a scroll panel reflows + clips with its row). The
+// HitRegions are excluded: they have no asset id and are reflowed by position.
+// The child set depends on the row form (dropdown vs stepper), so it takes the
+// setting key too. Locked to the expansion output by
+// `element_names_match_expansion`.
+pub(crate) fn element_names(base: &str, setting: &str) -> Vec<String> {
+    if is_dropdown(setting) {
+        vec![
+            format!("{base}_label"),
+            format!("{base}_value"),
+            format!("{base}_chevron"),
+        ]
+    } else {
+        vec![
+            format!("{base}_label"),
+            format!("{base}_prev_glyph"),
+            format!("{base}_value"),
+            format!("{base}_next_glyph"),
+        ]
+    }
 }
 
 fn expand_one(name: &str, s: &OptionSelect, font_px: f32) -> Vec<serde_json::Value> {
@@ -87,18 +110,69 @@ fn expand_one(name: &str, s: &OptionSelect, font_px: f32) -> Vec<serde_json::Val
     let text_y = s.y + (s.height - line_h) / 2.0;
     let value_name = format!("{}_value", name);
 
-    // Layout, left to right: the name fills the left part; then a `<` button,
-    // the value (left-aligned and display-only), and a `>` at the far right.
-    // Two non-overlapping click regions only -- `<` cycles to the previous
-    // option, and everything to its right (value + `>`) cycles to the next.
-    // Overlapping regions must be avoided: UiInputSystem keeps scanning after a
-    // setting action fires (it returns no StepResult), so two regions hit by
-    // one click would both fire and cancel out.
-    let sw = s.stepper_width;
     let glyph_w = font_px * AVG_ADVANCE_RATIO * s.text_scale;
     let ctrl_x = (s.x + s.width * CONTROL_FRAC).max(s.x + s.width - MAX_CONTROL_WIDTH);
-    let next_x = ctrl_x + sw;
     let right = s.x + s.width;
+
+    // A setting with more than two options expands to a dropdown: the name, the
+    // current value left-aligned in the control column, and a downward chevron
+    // at the far right, all under one region that opens the floating list. The
+    // chevron is an ASCII `v` (the built-in font atlas is ASCII-only).
+    if is_dropdown(&s.setting) {
+        return vec![
+            // Name (left).
+            label_value(
+                &format!("{}_label", name),
+                &s.label,
+                &s.font,
+                s.x,
+                text_y,
+                s.text_color,
+                s.text_scale,
+            ),
+            // Current value, left-aligned at the start of the control column.
+            label_value(
+                &value_name,
+                VALUE_PLACEHOLDER,
+                &s.font,
+                ctrl_x + GLYPH_PAD,
+                text_y,
+                s.value_color,
+                s.text_scale,
+            ),
+            // Downward chevron flush to the right edge (mirrors the stepper `>`).
+            label_value(
+                &format!("{}_chevron", name),
+                "v",
+                &s.font,
+                right - glyph_w,
+                text_y,
+                s.value_color,
+                s.text_scale,
+            ),
+            // One click region over the whole control column opens the list.
+            region(
+                &format!("{}_open", name),
+                ctrl_x,
+                s.y,
+                right - ctrl_x,
+                s.height,
+                &value_name,
+                s,
+                &format!("setting:{}:open", s.setting),
+            ),
+        ];
+    }
+
+    // Two options: a `<`/`>` stepper. Layout, left to right: the name fills the
+    // left part; then a `<` button, the value (left-aligned and display-only),
+    // and a `>` at the far right. Two non-overlapping click regions only -- `<`
+    // cycles to the previous option, and everything to its right (value + `>`)
+    // cycles to the next. Overlapping regions must be avoided: UiInputSystem
+    // keeps scanning after a setting action fires (it returns no StepResult), so
+    // two regions hit by one click would both fire and cancel out.
+    let sw = s.stepper_width;
+    let next_x = ctrl_x + sw;
 
     vec![
         // Name (left).
@@ -318,21 +392,62 @@ mod tests {
         assert!(expand_option_selects(&mut assets).is_err());
     }
 
-    // `element_names` must list exactly the Sprite/TextLabel children the
-    // expansion emits (a scroll panel relies on these to reflow + clip the row).
+    // A setting with more than two options (window_mode has three) expands to a
+    // dropdown: name + value + chevron under a single open region, no `<`/`>`.
     #[test]
-    fn element_names_match_expansion() {
+    fn expands_to_dropdown_with_open_region() {
         let mut assets = vec![serde_json::json!({
-            "name": "opt", "type": "OptionSelect",
-            "args": { "setting": "vsync", "label": "Vsync" }
+            "name": "opt_wm",
+            "type": "OptionSelect",
+            "args": {
+                "setting": "window_mode", "label": "Window Mode",
+                "x": 100.0, "y": 200.0, "width": 300.0
+            }
         })];
         expand_option_selects(&mut assets).unwrap();
-        let emitted: std::collections::HashSet<String> = assets
-            .iter()
-            .filter(|v| matches!(type_norm(v).as_str(), "textlabel" | "sprite"))
-            .map(asset_name)
-            .collect();
-        let listed: std::collections::HashSet<String> = element_names("opt").into_iter().collect();
-        assert_eq!(listed, emitted, "element_names drifted from the expansion");
+
+        assert_eq!(
+            by_name(&assets, "opt_wm_label")["args"]["content"],
+            "Window Mode"
+        );
+        assert_eq!(
+            by_name(&assets, "opt_wm_value")["args"]["content"],
+            VALUE_PLACEHOLDER
+        );
+        // ASCII chevron (the built-in atlas is ASCII-only), and no stepper glyphs.
+        assert_eq!(by_name(&assets, "opt_wm_chevron")["args"]["content"], "v");
+        assert!(!assets.iter().any(|v| asset_name(v) == "opt_wm_prev_glyph"));
+        assert!(!assets.iter().any(|v| asset_name(v) == "opt_wm_next_glyph"));
+
+        // A single click region opens the floating list; no prev/next regions.
+        let open = by_name(&assets, "opt_wm_open");
+        assert_eq!(open["type"], "HitRegion");
+        assert_eq!(open["args"]["action"], "setting:window_mode:open");
+        assert_eq!(open["args"]["label"], "opt_wm_value");
+        assert!(!assets.iter().any(|v| asset_name(v) == "opt_wm_prev"));
+        assert!(!assets.iter().any(|v| asset_name(v) == "opt_wm_next"));
+    }
+
+    // `element_names` must list exactly the Sprite/TextLabel children the
+    // expansion emits (a scroll panel relies on these to reflow + clip the row),
+    // for both the stepper (vsync, two options) and dropdown (window_mode, three)
+    // forms.
+    #[test]
+    fn element_names_match_expansion() {
+        for (setting, label) in [("vsync", "Vsync"), ("window_mode", "Window Mode")] {
+            let mut assets = vec![serde_json::json!({
+                "name": "opt", "type": "OptionSelect",
+                "args": { "setting": setting, "label": label }
+            })];
+            expand_option_selects(&mut assets).unwrap();
+            let emitted: std::collections::HashSet<String> = assets
+                .iter()
+                .filter(|v| matches!(type_norm(v).as_str(), "textlabel" | "sprite"))
+                .map(asset_name)
+                .collect();
+            let listed: std::collections::HashSet<String> =
+                element_names("opt", setting).into_iter().collect();
+            assert_eq!(listed, emitted, "element_names drifted for '{setting}'");
+        }
     }
 }

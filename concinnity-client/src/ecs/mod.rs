@@ -73,6 +73,31 @@ pub struct HudPrefs {
 #[derive(Debug, Clone, Default)]
 pub struct DisabledSettingRows(pub std::collections::HashSet<String>);
 
+// A settings dropdown's open floating option list, or `None` when none is open.
+// `UiInputSystem` owns the interaction state (open on a `setting:<key>:open`
+// click, close on a pick / outside click / Escape / scroll) and publishes this
+// each frame; GraphicsSystem reads it the next tick to draw the list on top of
+// the menu. GraphicsSystem runs first, so the list appears one frame after the
+// row is clicked (the same lag the cursor + cycle labels already carry).
+#[derive(Debug, Clone, Default)]
+pub struct OpenDropdown(pub Option<DropdownView>);
+
+// What GraphicsSystem needs to draw an open dropdown list: the anchor control
+// rect (reference space), the option labels top-to-bottom, the selected +
+// hovered indices to highlight, and the row value label's font / scale / color
+// so the list text matches the row it drops from.
+#[derive(Debug, Clone)]
+pub struct DropdownView {
+    pub anchor: [f32; 4],
+    pub options: Vec<String>,
+    pub selected: usize,
+    pub hovered: Option<usize>,
+    pub view: Option<asset_id::AssetId>,
+    pub font: Option<asset_id::AssetId>,
+    pub scale: f32,
+    pub color: [f32; 3],
+}
+
 // System -- has behavior, receives a PipelineContext each tick. Every system
 // is internal engine code: `World::build_internal_systems` constructs it from
 // world components (via the system's own `new(..)`), so a system is never
@@ -293,6 +318,13 @@ impl World {
     #[cfg(test)]
     pub fn insert_resource<T: std::any::Any>(&mut self, value: T) {
         self.resources.insert(value);
+    }
+
+    // Borrow a resource a system published this run, for assertions in system
+    // tests (e.g. the `OpenDropdown` UiInputSystem publishes each step).
+    #[cfg(test)]
+    pub fn resource<T: std::any::Any>(&self) -> Option<&T> {
+        self.resources.get::<T>()
     }
 
     // Mutable view of the active systems. Mirror of `systems()`; lets the

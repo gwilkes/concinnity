@@ -9,6 +9,7 @@
 pub mod auto_exposure;
 pub mod camera;
 pub mod chunk_coord;
+pub mod dropdown;
 pub mod frustum;
 pub mod lod;
 pub mod mesh_payload;
@@ -19,6 +20,7 @@ pub mod range_alloc;
 pub mod render_types;
 pub mod rt_reflections;
 pub mod scroll_layout;
+pub mod settings;
 pub mod skinning;
 pub mod ssao;
 pub mod ssgi;

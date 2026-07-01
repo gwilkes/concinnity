@@ -64,9 +64,11 @@ struct ViewRegistry {
     known: std::collections::HashSet<AssetId>,
     // Currently-active view (single slot, no stacking).
     active: Option<AssetId>,
-    // Previously-active view saved on each Show; restored on Hide. Lets a
-    // modal-style overlay (pause, options) dismiss back to the page the user
-    // was on without scene tracking.
+    // The view to return to when the active view is dismissed (a Hide, or a
+    // Toggle of the already-active view). Navigation (Show, and a Toggle that
+    // opens a view) clears it rather than saving the outgoing view, so a
+    // dismiss returns to the world (no active view) instead of a sub-view the
+    // user navigated through.
     prev: Option<AssetId>,
 }
 
@@ -506,36 +508,39 @@ impl System for UiInputSystem {
             .map(|d| d.0.clone())
             .unwrap_or_default();
         for entry in &mut self.regions {
-            // While dragging the scrollbar thumb, no region hovers or fires.
-            if thumb_active {
-                entry.was_hovered = false;
-                continue;
-            }
-            // Slider regions are driven by the drag pass above, not by clicks.
-            if entry.slider_key.is_some() {
-                entry.was_hovered = false;
-                continue;
-            }
-            // Filter by active view: when a view is shown, only its regions
-            // fire; otherwise only view-less regions fire.
-            if entry.view != active_view {
-                // Also clear stale hover state so a label doesn't keep its
-                // hover styling while behind an overlay.
-                entry.was_hovered = false;
-                continue;
-            }
-            // A scroll-content region whose row is collapsed never hovers/fires.
-            if entry.scroll_row.is_some() && entry.hidden {
-                entry.was_hovered = false;
-                continue;
-            }
-            // A setting row the engine disabled at runtime (its labels grayed) is
-            // inert: it never hovers or fires while disabled.
-            if !disabled_rows.is_empty()
-                && let Some(rest) = entry.region.action.strip_prefix("setting:")
-                && disabled_rows.contains(rest.split(':').next().unwrap_or(""))
-            {
-                entry.was_hovered = false;
+            // A region is inert this frame when it cannot hover or fire:
+            //   - the scrollbar thumb is being dragged (no region reacts),
+            //   - it is a slider track (driven by the drag pass above),
+            //   - its view is not the active one (behind an overlay, or view-less
+            //     while a view is shown),
+            //   - its scroll-content row is collapsed, or
+            //   - the engine disabled its setting row at runtime (grayed).
+            // Restore any hover styling first so a region hovered when it goes
+            // inert (e.g. the clicked button whose view is being hidden) does not
+            // strand its hover color, then clear the hover flag and skip it.
+            let disabled = !disabled_rows.is_empty()
+                && entry
+                    .region
+                    .action
+                    .strip_prefix("setting:")
+                    .is_some_and(|rest| {
+                        disabled_rows.contains(rest.split(':').next().unwrap_or(""))
+                    });
+            let inert = thumb_active
+                || entry.slider_key.is_some()
+                || entry.view != active_view
+                || (entry.scroll_row.is_some() && entry.hidden)
+                || disabled;
+            if inert {
+                if entry.was_hovered {
+                    set_label_style(
+                        ctx,
+                        entry.region.label,
+                        entry.original_color,
+                        entry.original_scale,
+                    );
+                    entry.was_hovered = false;
+                }
                 continue;
             }
 
@@ -557,37 +562,12 @@ impl System for UiInputSystem {
                 hovered = hovered && point_in_rect(qx, qy, *band);
             }
 
-            // Apply / restore hover styling on the referenced label.
-            if let Some(label_id) = r.label {
-                if hovered && !entry.was_hovered {
-                    let hover_color = r.hover_color;
-                    let hover_scale = r.hover_scale;
-                    for lbl in ctx.query_mut::<TextLabel>() {
-                        if lbl.asset_id == label_id {
-                            if let Some(c) = hover_color {
-                                lbl.color = c;
-                            }
-                            if let Some(s) = hover_scale {
-                                lbl.scale = s;
-                            }
-                            break;
-                        }
-                    }
-                } else if !hovered && entry.was_hovered {
-                    let orig_color = entry.original_color;
-                    let orig_scale = entry.original_scale;
-                    for lbl in ctx.query_mut::<TextLabel>() {
-                        if lbl.asset_id == label_id {
-                            if let Some(c) = orig_color {
-                                lbl.color = c;
-                            }
-                            if let Some(s) = orig_scale {
-                                lbl.scale = s;
-                            }
-                            break;
-                        }
-                    }
-                }
+            // Apply hover styling on hover-in, restore the captured style on
+            // hover-out.
+            if hovered && !entry.was_hovered {
+                set_label_style(ctx, r.label, r.hover_color, r.hover_scale);
+            } else if !hovered && entry.was_hovered {
+                set_label_style(ctx, r.label, entry.original_color, entry.original_scale);
             }
 
             entry.was_hovered = hovered;
@@ -773,13 +753,17 @@ impl UiInputSystem {
         // its list never lingers over a different view.
         self.open_dropdown = None;
         // Semantics:
-        //   Show(X)     : plain navigation: active=X, prev cleared.
-        //   Hide        : restore prev (modal dismiss); both cleared after.
-        //   Toggle(X)   : if active==X, dismiss back to prev; else open X
-        //                 modally, saving current active as prev.
+        //   Show(X)     : navigate to X.
+        //   Hide        : dismiss the active view, returning to `prev`.
+        //   Toggle(X)   : if X is active, dismiss it (returning to `prev`);
+        //                 otherwise navigate to X.
         //
-        // Only Toggle saves prev, so navigation (Show) doesn't pollute the
-        // pause-restore slot.
+        // Navigation (Show, and a Toggle that opens a view) never records the
+        // outgoing view as `prev`, so dismissing a view never walks back into
+        // one the user navigated away from. This keeps an Escape-toggled menu
+        // dismissing to the world: pressing Escape from a Settings sub-view up
+        // to the menu, then Escape again, returns to the world rather than back
+        // into Settings.
         let (new_active, new_prev) = match cmd {
             ViewCommand::Hide => (self.views.prev, None),
             ViewCommand::Show(id) => {
@@ -800,7 +784,7 @@ impl UiInputSystem {
                 if self.views.active == Some(id) {
                     (self.views.prev, None)
                 } else {
-                    (Some(id), self.views.active)
+                    (Some(id), None)
                 }
             }
         };
@@ -1172,6 +1156,32 @@ fn point_in_rect(x: f32, y: f32, rect: [f32; 4]) -> bool {
     x >= rect[0] && x < rect[0] + rect[2] && y >= rect[1] && y < rect[1] + rect[3]
 }
 
+// Write the given color + scale onto a region's referenced label, if any.
+// Drives hover-in (hover style), hover-out (captured style), and the restore
+// applied when a hovered region goes inert (its view hides, its row collapses,
+// or it is disabled) so its hover styling never strands on the label.
+fn set_label_style(
+    ctx: &mut PipelineContext,
+    label: Option<AssetId>,
+    color: Option<[f32; 3]>,
+    scale: Option<f32>,
+) {
+    let Some(label_id) = label else {
+        return;
+    };
+    for lbl in ctx.query_mut::<TextLabel>() {
+        if lbl.asset_id == label_id {
+            if let Some(c) = color {
+                lbl.color = c;
+            }
+            if let Some(s) = scale {
+                lbl.scale = s;
+            }
+            break;
+        }
+    }
+}
+
 // Parse and execute an action string. Returns Some(StepResult) when the
 // action produces an engine-level result (e.g. Quit), None otherwise. `label`
 // is the firing region's referenced TextLabel (the value display for a
@@ -1376,6 +1386,81 @@ mod tests {
             .map(|l| l.color)
             .unwrap();
         assert_eq!(lbl_color_after, [1.0, 1.0, 1.0]);
+    }
+
+    // Clicking a menu button hovers its label (hover color) and switches away to
+    // another view the same frame. The next frame the button's view is hidden;
+    // its hover color must be restored, not stranded, so it is not still
+    // highlighted when its view is shown again.
+    #[test]
+    fn hover_style_restored_when_region_view_is_hidden() {
+        let mut world = World::new_empty();
+        let menu = AssetId(80);
+        let settings = AssetId(81);
+        world.add_component(View {
+            asset_id: menu,
+            initial: true,
+            fade_in_secs: 0.0,
+        });
+        world.add_component(View {
+            asset_id: settings,
+            initial: false,
+            fade_in_secs: 0.0,
+        });
+        // The menu's "Settings" label + its hit region (view-owned).
+        world.add_component(TextLabel {
+            asset_id: AssetId(1),
+            font: None,
+            content: "Settings".to_string(),
+            x: 0.0,
+            y: 0.0,
+            color: [1.0, 1.0, 1.0],
+            scale: 1.0,
+            centered: false,
+            background: [0.0, 0.0, 0.0, 0.0],
+            padding: 0.0,
+            visible: true,
+            view: Some(menu),
+        });
+        world.add_component(HitRegion {
+            x: 10.0,
+            y: 10.0,
+            width: 100.0,
+            height: 40.0,
+            label: Some(AssetId(1)),
+            hover_color: Some([1.0, 0.85, 0.3]),
+            hover_scale: Some(1.0),
+            action: "view:show:81".to_string(),
+            drag_handle: None,
+            view: Some(menu),
+            disabled: false,
+        });
+        world.start().unwrap();
+
+        // Hover + click the Settings button (identity overlay at viewport [0,0]):
+        // the label takes the hover color and the click sends Show(settings).
+        world.add_component(FrameInput {
+            mouse_x: 50.0,
+            mouse_y: 30.0,
+            left_click: true,
+            ..Default::default()
+        });
+        world.step();
+        assert_eq!(
+            label_field(&world, AssetId(1), |l| l.color),
+            [1.0, 0.85, 0.3],
+            "hovered button takes the hover color"
+        );
+
+        // Next frame applies Show(settings): the menu (and its Settings label) is
+        // hidden. The hover color must be restored despite the view being hidden.
+        world.add_component(FrameInput::default());
+        world.step();
+        assert_eq!(
+            label_field(&world, AssetId(1), |l| l.color),
+            [1.0, 1.0, 1.0],
+            "hover color restored when the region's view is hidden"
+        );
     }
 
     // A view-owned dropdown row (window_mode has three options, so its
@@ -2278,6 +2363,92 @@ mod tests {
 
         let cmd = produced_view_command(&world);
         assert!(matches!(cmd, Some(ViewCommand::Toggle(AssetId(50)))));
+    }
+
+    // Escape toggles the menu; Settings is reached by a Show (a sub-view). After
+    // visiting Settings, escaping back to the menu and escaping again must return
+    // to the world, not back into Settings: a Toggle that opens a view must not
+    // record the outgoing view as the dismiss target.
+    #[test]
+    fn escape_from_menu_returns_to_world_after_visiting_a_subview() {
+        let mut world = World::new_empty();
+        let menu = AssetId(60);
+        let settings = AssetId(61);
+        world.add_component(View {
+            asset_id: menu,
+            initial: false,
+            fade_in_secs: 0.0,
+        });
+        world.add_component(View {
+            asset_id: settings,
+            initial: false,
+            fade_in_secs: 0.0,
+        });
+        // One sprite per view, to observe which view is active by visibility.
+        for (id, view) in [(70u32, menu), (71u32, settings)] {
+            world.add_component(Sprite {
+                asset_id: AssetId(id),
+                x: 0.0,
+                y: 0.0,
+                width: 10.0,
+                height: 10.0,
+                texture: None,
+                tint: [0.0, 0.0, 0.0, 1.0],
+                follow_cursor: false,
+                visible: false,
+                view: Some(view),
+            });
+        }
+        world.add_component(KeyBinding {
+            key: "Escape".to_string(),
+            action: "view:toggle:60".to_string(),
+        });
+        world.start().unwrap();
+
+        let shown = |w: &World, id: u32| {
+            w.query::<Sprite>()
+                .find(|s| s.asset_id == AssetId(id))
+                .map(|s| s.visible)
+                .unwrap()
+        };
+        // A frame that presses Escape (fires the toggle keybinding).
+        fn esc(w: &mut World) {
+            w.add_component(FrameInput {
+                escape: true,
+                ..Default::default()
+            });
+            w.step();
+        }
+        // A frame that applies the view command queued the previous frame.
+        fn settle(w: &mut World) {
+            w.add_component(FrameInput::default());
+            w.step();
+        }
+
+        // World -> Escape -> menu.
+        esc(&mut world);
+        settle(&mut world);
+        assert!(shown(&world, 70) && !shown(&world, 71), "menu opens");
+
+        // Menu -> click Settings (a Show) -> settings sub-view.
+        world
+            .events_mut::<ViewCommand>()
+            .send(ViewCommand::Show(settings));
+        settle(&mut world);
+        assert!(!shown(&world, 70) && shown(&world, 71), "settings shown");
+
+        // Settings -> Escape -> back to the menu.
+        esc(&mut world);
+        settle(&mut world);
+        assert!(shown(&world, 70) && !shown(&world, 71), "back to the menu");
+
+        // Menu -> Escape -> world (regression: previously returned to Settings).
+        esc(&mut world);
+        settle(&mut world);
+        assert!(
+            !shown(&world, 70) && !shown(&world, 71),
+            "escape from the menu returns to the world, not back into Settings"
+        );
     }
 
     // A gating component (here a View) spawns the internal UiInputSystem.

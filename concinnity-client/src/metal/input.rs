@@ -123,24 +123,15 @@ impl MtlContext {
         if !self.pump_events {
             return;
         }
-        let Some(window) = self.host_window() else {
+        if self.host_window().is_none() {
             return;
-        };
-        NSCursor::hide();
-        // Decouple cursor position from movement so deltaX/deltaY are pure
-        // hardware deltas. Without this, CGWarpMouseCursorPosition generates
-        // a spurious event with the warp distance as its delta, causing a
-        // camera snap on first mouse move.
-        unsafe { CGAssociateMouseAndMouseCursorPosition(0) };
-        // Warp once to centre so the cursor is in a known position.
-        if let Some(screen) = window.screen() {
-            let frame = window.frame();
-            let centre = NSPoint::new(
-                frame.origin.x + frame.size.width * 0.5,
-                screen.frame().size.height - (frame.origin.y + frame.size.height * 0.5),
-            );
-            unsafe { CGWarpMouseCursorPosition(centre) };
         }
+        NSCursor::hide();
+        // Decouple cursor position from hardware movement so deltaX/deltaY are
+        // pure hardware deltas and the OS cursor stays frozen where the user
+        // last left it. release_cursor reads that frozen position back, so the
+        // menu cursor reappears there instead of snapping on the first move.
+        unsafe { CGAssociateMouseAndMouseCursorPosition(0) };
         // Drop any deltas already accumulated before capture, and arm a
         // one-shot discard so the first motion event pumped after capture
         // (which may have been queued during init, before the OS settled
@@ -249,6 +240,13 @@ impl MtlContext {
         self.recapture_on_click = true;
         unsafe { CGAssociateMouseAndMouseCursorPosition(1) };
         NSCursor::unhide();
+        // Seed the tracked UI cursor from the OS cursor's real position (frozen
+        // at the pre-capture location while decoupled). Without this the tracked
+        // position is stale from before capture, so the first mouse move after a
+        // menu opens snaps the in-engine cursor to wherever the OS cursor sits.
+        let (mx, my) = self.cursor_in_content();
+        self.keys.mouse_x = mx;
+        self.keys.mouse_y = my;
     }
 
     // A togglable menu coexists with a captured camera; see

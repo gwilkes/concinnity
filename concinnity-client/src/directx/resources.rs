@@ -658,6 +658,10 @@ impl DxContext {
         };
         self.ensure_always_draw(new_idx);
         self.clone.slot_by_draw_idx.insert(new_idx, clone_offset);
+        // The cloned prop joins the RT-relevant draw set; the next RT update folds
+        // it into the BVH (it reuses the source mesh's geometry slice, so only
+        // this clone's BLAS is built).
+        self.rt_topology_dirty = true;
         Ok(new_idx)
     }
 
@@ -1253,6 +1257,9 @@ impl DxContext {
                 prev[draw_idx] = model;
             }
         }
+        // A new resident chunk changes the RT-relevant draw set; the next RT
+        // update folds it into the BVH (building just this chunk's BLAS).
+        self.rt_topology_dirty = true;
         Ok(draw_idx)
     }
 
@@ -1281,6 +1288,9 @@ impl DxContext {
         obj.visible = false;
         obj.resident = false;
         self.draw_slots.free(draw_idx);
+        // The removed chunk leaves the RT-relevant draw set; the next RT update
+        // drops its BLAS (deferred-freed once in-flight traces retire).
+        self.rt_topology_dirty = true;
         Ok(())
     }
 

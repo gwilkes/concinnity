@@ -969,6 +969,13 @@ pub struct VkContext {
     // How the TLAS is kept current when props move (`CN_RT_DYNAMIC`); read by the
     // per-frame `rt_dynamic_update`. Inert when `rt_accel` is `None`.
     pub(super) rt_dynamic_mode: crate::vulkan::raytrace::RtDynamicMode,
+    // Set when a runtime change altered the RT-relevant draw set (a cloned prop, a
+    // streamed chunk added/removed) since the last update. Consumed once per frame
+    // by `rt_dynamic_update`, which folds the change into the BLAS head
+    // (`RtAccelData::refresh_topology`) -- reusing every unchanged BLAS and building
+    // only the new ones -- rather than ignoring it (the `Auto` dirty check only
+    // watches transforms of the prior set) or rebuilding every BLAS.
+    pub(super) rt_topology_dirty: bool,
     // Whether the device is RT-capable (the ray-query extensions + features were
     // enabled at device creation, and XeSS is not active). Enabled whenever
     // capable -- independent of whether RT is on at launch -- so a live

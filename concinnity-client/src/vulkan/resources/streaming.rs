@@ -240,6 +240,9 @@ impl VkContext {
         {
             gb.prev_models[draw_idx] = model;
         }
+        // A new resident chunk changes the RT-relevant draw set; the next RT
+        // update folds it into the BVH (building just this chunk's BLAS).
+        self.rt_topology_dirty = true;
         Ok(draw_idx)
     }
 
@@ -260,6 +263,9 @@ impl VkContext {
         obj.visible = false;
         obj.resident = false;
         self.draw_slots.free(draw_idx);
+        // The removed chunk leaves the RT-relevant draw set; the next RT update
+        // drops its BLAS (deferred-freed once in-flight traces retire).
+        self.rt_topology_dirty = true;
         Ok(())
     }
 

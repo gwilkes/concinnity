@@ -861,6 +861,13 @@ pub struct DxContext {
     // How the acceleration structure is kept current as props move (read once
     // from `CN_RT_DYNAMIC` at init; `Auto` by default).
     pub(super) rt_dynamic_mode: super::raytrace::RtDynamicMode,
+    // Set when a runtime change altered the RT-relevant draw set (a cloned prop,
+    // a streamed chunk added/removed) since the last update. Consumed once per
+    // frame by `rt_dynamic_update`, which folds the change into the BLAS head
+    // (`RtAccelData::refresh_topology`) -- reusing every unchanged BLAS and
+    // building only the new ones -- rather than ignoring it (the `Auto` dirty
+    // check only watches transforms of the prior set) or rebuilding every BLAS.
+    pub(super) rt_topology_dirty: bool,
 
     // Projected decals. See [`DecalState`].
     pub(super) decal: DecalState,

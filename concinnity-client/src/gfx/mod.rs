@@ -82,6 +82,12 @@ pub(crate) mod quality_preset;
 // barrier + aliasing path consumes the full set.
 #[allow(dead_code)]
 pub(crate) mod render_graph;
+// Backend-agnostic planner for the incremental RT acceleration-structure
+// topology refresh (reuse-unchanged / build-new / retire-orphan). Consumed by
+// the DirectX + Vulkan backends; the Metal backend keeps its own equivalent
+// copy, so this module is unreferenced on a macOS build.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub(crate) mod rt_topology;
 pub mod scene_reel;
 pub(crate) mod settings;
 // Cross-backend cascade re-render scheduling for the cascaded shadow map

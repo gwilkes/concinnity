@@ -932,6 +932,12 @@ impl VkContext {
         cmd: vk::CommandBuffer,
         frame_idx: usize,
     ) {
+        // Consumed by the accel's `dynamic_update`, which folds a runtime draw-set
+        // change (cloned prop, streamed chunk added/removed) into the BLAS head.
+        // (Vulkan builds `rt_accel` + `rt_reflections` together, so an RT-enabled
+        // scene that was empty at build time has both `None` and RT stays off until
+        // a quality re-toggle rebuilds the pass; there is no seed-from-empty here.)
+        let topology_dirty = std::mem::take(&mut self.rt_topology_dirty);
         if self.rt_accel.is_none() || self.rt_reflections.is_none() {
             return;
         }
@@ -986,6 +992,7 @@ impl VkContext {
                 mode,
                 frame_idx,
                 skinned,
+                topology_dirty,
             );
             self.rt_accel = Some(accel);
         }

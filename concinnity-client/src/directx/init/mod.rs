@@ -2111,6 +2111,7 @@ impl DxContext {
             rt_reflections,
             rt_accel,
             rt_dynamic_mode,
+            rt_topology_dirty: false,
             decal: super::context::DecalState {
                 state: decals_state,
                 records: decals_init,

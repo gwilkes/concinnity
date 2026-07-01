@@ -3440,6 +3440,7 @@ impl VkContext {
             rt_reflections: rt_opt,
             rt_accel: rt_accel_opt,
             rt_dynamic_mode,
+            rt_topology_dirty: false,
             rt_capable,
             rt_static_vertex_count: vertices.len(),
             decals_state,

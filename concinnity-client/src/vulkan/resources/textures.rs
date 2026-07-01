@@ -567,6 +567,10 @@ impl VkContext {
         };
         self.ensure_always_draw(new_idx);
         self.clone_slot_by_draw_idx.insert(new_idx, clone_offset);
+        // The cloned prop joins the RT-relevant draw set; the next RT update folds
+        // it into the BVH (it reuses the source mesh's geometry slice, so only
+        // this clone's BLAS is built).
+        self.rt_topology_dirty = true;
         Ok(new_idx)
     }
 }

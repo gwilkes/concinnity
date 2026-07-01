@@ -95,6 +95,10 @@ impl DxContext {
         // Scene-sampler max anisotropy (GraphicsConfig.anisotropy), clamped to the
         // D3D12 1..16 range where the sampler is built below.
         anisotropy: u32,
+        // Distinct planar-reflection plane budget from the quality preset / GPU tier
+        // ceiling. Passed to `assign_planar_slots` below (clamped to the capacity
+        // ceiling); panes past it fall back to the probe cube. Restart-required.
+        planar_planes: usize,
         text_atlases: Vec<(u32, u32, Vec<u8>)>,
         // Serialised EnvironmentMap payload (irradiance + prefilter cubemaps).
         // None disables IBL; the runtime binds 1×1 grey fallback cubes and
@@ -450,10 +454,11 @@ impl DxContext {
             .iter()
             .map(|p| crate::directx::planar::pane_plane(p.normal, p.centre))
             .collect();
-        let planar_assignment = crate::gfx::planar_reflection::assign_planar_slots(
-            &planar_panes,
-            crate::directx::planar::MAX_PLANAR_PLANES,
-        );
+        // Cap at the capacity ceiling the reserved planar resolve SRVs are sized to,
+        // so a stale/over-large preset value can never over-allocate.
+        let planar_budget = planar_planes.min(crate::directx::planar::MAX_PLANAR_PLANES);
+        let planar_assignment =
+            crate::gfx::planar_reflection::assign_planar_slots(&planar_panes, planar_budget);
         let planar_resolve_srv_extra = planar_assignment.representatives.len();
 
         let heap_layout::SrvHeapLayout {

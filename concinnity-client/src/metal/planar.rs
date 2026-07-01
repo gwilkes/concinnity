@@ -42,18 +42,15 @@ use super::context::MtlContext;
 // geometry exactly on the surface is not lost to near-plane precision.
 const PLANAR_CLIP_BIAS: f32 = 0.02;
 
-// The maximum number of distinct reflection planes that render a mirror pass each
-// frame (water surfaces + glass panes combined). Each plane is a full scene
-// re-render into its own render-resolution MSAA target set, so this caps both the
-// per-frame GPU cost and the planar VRAM. Reflectors whose plane is the
-// (budget+1)th distinct plane fall back to the box-projected probe cube (logged at
-// init). Memory + cost scale with the planes ACTUALLY present, capped here -- a
-// scene with a single reflector still pays for one plane. 4 covers a typical AAA
-// composition (a polished floor plus a few distinct wall mirrors / glass fronts)
-// before the probe fallback; near-coplanar reflectors already share one slot. Kept
-// in lockstep with `directx::planar` / `vulkan::planar` so the three backends pick
-// the same reflectors.
-pub(in crate::metal) const MAX_PLANAR_PLANES: usize = 4;
+// The engine capacity ceiling for distinct reflection planes (water + glass): the
+// count the mirror-target set + mirror ICB slots below are sized to. Single-sourced
+// from `gfx::planar_reflection` so the three backends stay in lockstep by
+// construction. The per-frame budget passed to `assign_planar_slots` at init can be
+// lower under a quality preset / GPU tier (fewer full-res mirror passes on weaker
+// hardware), never higher; reflectors past the active budget fall back to the
+// box-projected probe cube.
+pub(in crate::metal) const MAX_PLANAR_PLANES: usize =
+    crate::gfx::planar_reflection::MAX_PLANAR_PLANES;
 
 // Per-frame planar reflection render targets for one plane, sized to the render
 // resolution. MSAA colour + depth (rendered into, then resolved) plus a

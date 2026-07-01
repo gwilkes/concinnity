@@ -72,6 +72,10 @@ impl VkContext {
         // Scene-sampler max anisotropy (GraphicsConfig.anisotropy), clamped to the
         // device limit where the sampler is built below.
         anisotropy: u32,
+        // Distinct planar-reflection plane budget from the quality preset / GPU tier
+        // ceiling. Passed to `assign_planar_slots` below (clamped to the capacity
+        // ceiling); panes past it fall back to the probe cube. Restart-required.
+        planar_planes: usize,
         text_atlases: Vec<(u32, u32, Vec<u8>)>,
         // Serialised `EnvironmentMap` payload; `None` binds 1×1 grey fallback
         // cubes and disables IBL via `prefilter_mip_count = 0`.
@@ -3029,14 +3033,15 @@ impl VkContext {
         // build one render-resolution mirror target per distinct plane. Built
         // before glass so each pane's planar binding can point at its plane's
         // target. `slots[i]` is pane `i`'s target slot (or `None`).
-        let planar_planes: Vec<[f32; 4]> = glass_panels
+        let planar_reflectors: Vec<[f32; 4]> = glass_panels
             .iter()
             .map(|p| crate::vulkan::planar::pane_plane(p.normal, p.centre))
             .collect();
-        let planar_assignment = crate::gfx::planar_reflection::assign_planar_slots(
-            &planar_planes,
-            crate::vulkan::planar::MAX_PLANAR_PLANES,
-        );
+        // Cap at the capacity ceiling the reserved planar targets are sized to, so a
+        // stale/over-large preset value can never over-allocate.
+        let planar_budget = planar_planes.min(crate::vulkan::planar::MAX_PLANAR_PLANES);
+        let planar_assignment =
+            crate::gfx::planar_reflection::assign_planar_slots(&planar_reflectors, planar_budget);
         // The reflected-frustum mirror cull is bindless-only (it needs the GPU cull
         // set layout + the per-frame object/draw-args SSBOs); a non-bindless world
         // has no `cull_set_layout`, so planar is skipped and its panes keep the

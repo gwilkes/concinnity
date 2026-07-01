@@ -110,6 +110,10 @@ impl MtlContext {
         // Scene-sampler max anisotropy (GraphicsConfig.anisotropy), clamped to
         // Metal's guaranteed 1..16 range where it is used below.
         anisotropy: u32,
+        // Distinct planar-reflection plane budget from the quality preset / GPU tier
+        // ceiling. Passed to `assign_planar_slots` below (clamped to the capacity
+        // ceiling); reflectors past it fall back to the probe cube. Restart-required.
+        planar_planes: usize,
         text_atlases: Vec<(u32, u32, Vec<u8>)>,
         // serialised EnvironmentMap payload (irradiance + prefilter cubemaps).
         // None → IBL disabled; the runtime binds 1x1 grey fallback cubes and
@@ -817,10 +821,12 @@ impl MtlContext {
                 let d = -(n[0] * g.centre[0] + n[1] * g.centre[1] + n[2] * g.centre[2]);
                 planes.push([n[0], n[1], n[2], d]);
             }
-            let assignment = crate::gfx::planar_reflection::assign_planar_slots(
-                &planes,
-                super::planar::MAX_PLANAR_PLANES,
-            );
+            // The budget is capped at the capacity ceiling the mirror targets + ICB
+            // slots are sized to, so a stale/over-large preset value can never
+            // over-allocate.
+            let planar_budget = planar_planes.min(super::planar::MAX_PLANAR_PLANES);
+            let assignment =
+                crate::gfx::planar_reflection::assign_planar_slots(&planes, planar_budget);
             // Record each reflector's slot (water first, then glass, matching the
             // push order above).
             for (rec, slot) in water_records.iter_mut().zip(assignment.slots.iter()) {
@@ -839,7 +845,7 @@ impl MtlContext {
                     "planar reflection: {} reflector plane(s) exceed the budget of {} \
                      and fall back to the box-projected probe cube",
                     overflow,
-                    super::planar::MAX_PLANAR_PLANES
+                    planar_budget
                 );
             }
             if assignment.representatives.is_empty() {

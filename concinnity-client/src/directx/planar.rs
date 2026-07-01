@@ -40,11 +40,14 @@ use super::texture::{
     create_uav_buffer, transition_barrier, write_hdr_srv,
 };
 
-// Maximum number of distinct reflection planes that render a mirror pass each
-// frame. Each plane is a full scene re-render, so this caps the per-frame cost;
-// panes past the budget fall back to the box-projected probe cube. Matches
-// `metal::planar::MAX_PLANAR_PLANES`.
-pub(in crate::directx) const MAX_PLANAR_PLANES: usize = 4;
+// The engine capacity ceiling for distinct reflection planes: the count the
+// reserved planar targets + resolve SRVs are sized to. Single-sourced from
+// `gfx::planar_reflection` so the three backends stay in lockstep by construction.
+// The per-frame budget passed to `assign_planar_slots` at init can be lower under a
+// quality preset / GPU tier, never higher; panes past it fall back to the
+// box-projected probe cube.
+pub(in crate::directx) const MAX_PLANAR_PLANES: usize =
+    crate::gfx::planar_reflection::MAX_PLANAR_PLANES;
 
 // Clip the reflection a hair toward the kept (camera) side of the plane so
 // geometry exactly on the surface is not lost to near-plane precision. Matches
@@ -568,10 +571,14 @@ mod tests {
     }
 
     #[test]
-    fn planar_budget_matches_backends() {
-        // The reserved planar-resolve heap block + the per-frame mirror-render cost
-        // are sized off this; keep it in lockstep with `metal::planar` /
-        // `vulkan::planar` so the three backends pick the same reflectors.
+    fn planar_capacity_is_four() {
+        // The reserved planar-resolve heap block is sized off this. It now aliases
+        // the single `gfx::planar_reflection` source, so this guards that the shared
+        // capacity the heap layout assumes is still 4.
         assert_eq!(MAX_PLANAR_PLANES, 4);
+        assert_eq!(
+            MAX_PLANAR_PLANES,
+            crate::gfx::planar_reflection::MAX_PLANAR_PLANES
+        );
     }
 }

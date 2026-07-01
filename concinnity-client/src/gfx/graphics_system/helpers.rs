@@ -245,6 +245,12 @@ pub(super) fn init_backend(
     // builds its albedo / normal-map sampler with this (clamped to the GPU's
     // 1..16 range) at init; restart-required.
     anisotropy: u32,
+    // Distinct planar-reflection plane budget, resolved from the GPU tier / quality
+    // preset ceiling. Each backend passes it to `assign_planar_slots` at init
+    // (clamped to its capacity ceiling); reflectors past it fall back to the
+    // box-projected probe cube. Restart-required -- the mirror targets are allocated
+    // once at init.
+    planar_planes: usize,
     // glyph atlas textures for text rendering; empty = no text support
     text_atlases: Vec<(u32, u32, Vec<u8>)>,
     // serialised EnvironmentMap payload (irradiance + prefilter cubemaps).
@@ -387,6 +393,7 @@ pub(super) fn init_backend(
             shadow_distance,
             shadow_cascades,
             anisotropy,
+            planar_planes,
             text_atlases,
             env_map_bytes,
             post_process,
@@ -450,6 +457,7 @@ pub(super) fn init_backend(
             shadow_distance,
             shadow_cascades,
             anisotropy,
+            planar_planes,
             text_atlases,
             env_map_bytes,
             post_process,
@@ -512,6 +520,7 @@ pub(super) fn init_backend(
             shadow_distance,
             shadow_cascades,
             anisotropy,
+            planar_planes,
             text_atlases,
             env_map_bytes,
             post_process,

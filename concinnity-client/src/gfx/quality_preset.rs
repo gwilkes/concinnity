@@ -91,6 +91,15 @@ pub(crate) struct QualityCeiling {
     // maximum), so a world's authored count always stands. A lower tier renders
     // fewer cascades (one shadow-map render saved per dropped cascade).
     pub shadow_cascades: u32,
+    // Cap on the number of distinct planar reflection planes that render a mirror
+    // pass each frame (restart-required -- the mirror targets are allocated at
+    // backend init). There is no world-authored value: the engine baseline is the
+    // capacity maximum (`PLANAR_PLANES_MAX`), so this cap is the effective budget
+    // directly. The no-ceiling value is the maximum, so a full-budget world stands.
+    // A lower tier renders fewer full render-res MSAA mirror passes (saving VRAM +
+    // GPU cost); reflectors past the budget fall back to the box-projected probe
+    // cube.
+    pub planar_reflection_planes: u32,
 }
 
 // The coarser (higher render-resolution divisor) of two SSGI resolutions, the
@@ -156,6 +165,10 @@ const SHADOW_DIST_MAX: u32 = u32::MAX;
 // `4` is the no-cap shadow cascade count (the engine maximum = NUM_SHADOW_CASCADES):
 // a world's authored count always stands smaller-or-equal under it.
 const SHADOW_CASCADES_MAX: u32 = 4;
+// The no-cap planar reflection plane budget: the engine capacity ceiling every
+// backend sizes its mirror allocations to. Sourced from the single
+// `gfx::planar_reflection` constant so a capacity bump flows here automatically.
+const PLANAR_PLANES_MAX: u32 = crate::gfx::planar_reflection::MAX_PLANAR_PLANES as u32;
 
 // The coarser (smaller) of two shadow-map resolutions, the shadow analogue of
 // the SSGI / reflection-blur clamp helpers. Used to clamp a world's authored
@@ -215,6 +228,7 @@ const NONE: QualityCeiling = QualityCeiling {
     anisotropy: ANISO_MAX,
     shadow_distance: SHADOW_DIST_MAX,
     shadow_cascades: SHADOW_CASCADES_MAX,
+    planar_reflection_planes: PLANAR_PLANES_MAX,
 };
 const LOW: QualityCeiling = QualityCeiling {
     aa_mode: AaMode::Fxaa,
@@ -233,6 +247,9 @@ const LOW: QualityCeiling = QualityCeiling {
     anisotropy: 4,
     shadow_distance: 40,
     shadow_cascades: 2,
+    // Integrated / weakest tier: keep only the two most impactful mirror planes
+    // (e.g. a floor plus one wall); further reflectors take the probe cube.
+    planar_reflection_planes: 2,
 };
 const MEDIUM: QualityCeiling = QualityCeiling {
     aa_mode: AaMode::Taa,
@@ -251,6 +268,8 @@ const MEDIUM: QualityCeiling = QualityCeiling {
     anisotropy: 8,
     shadow_distance: 80,
     shadow_cascades: 3,
+    // Entry discrete: one more mirror plane than Low before the probe fallback.
+    planar_reflection_planes: 3,
 };
 const HIGH: QualityCeiling = QualityCeiling {
     aa_mode: AaMode::Taa,
@@ -269,6 +288,9 @@ const HIGH: QualityCeiling = QualityCeiling {
     anisotropy: 16,
     shadow_distance: 160,
     shadow_cascades: 4,
+    // Mid discrete and up run the full mirror-plane budget, matching the flat
+    // pre-scaling default, so a capable GPU is never downgraded.
+    planar_reflection_planes: PLANAR_PLANES_MAX,
 };
 const ULTRA: QualityCeiling = QualityCeiling {
     aa_mode: AaMode::Taa,
@@ -287,6 +309,7 @@ const ULTRA: QualityCeiling = QualityCeiling {
     anisotropy: ANISO_MAX,
     shadow_distance: SHADOW_DIST_MAX,
     shadow_cascades: SHADOW_CASCADES_MAX,
+    planar_reflection_planes: PLANAR_PLANES_MAX,
 };
 
 // The active ceiling for the persisted preset and detected GPU. `Auto` maps the
@@ -539,6 +562,11 @@ mod tests {
                 lo.shadow_cascades <= hi.shadow_cascades,
                 "shadow_cascades cap dropped"
             );
+            // The planar reflection plane budget rises (or holds) with the tier too.
+            assert!(
+                lo.planar_reflection_planes <= hi.planar_reflection_planes,
+                "planar plane budget cap dropped"
+            );
         }
     }
 
@@ -609,6 +637,32 @@ mod tests {
         assert_eq!(clamp_shadow_cascades(1, &low), 1);
         let medium = resolve_ceiling(QualityPreset::Medium, &GpuProfile::UNKNOWN);
         assert_eq!(clamp_shadow_cascades(4, &medium), 3);
+    }
+
+    #[test]
+    fn planar_plane_budget_scales_with_tier_within_capacity() {
+        // No ceiling (Custom / Ultra) permits the full engine capacity, matching
+        // the flat pre-scaling default so capable GPUs are never downgraded.
+        let none = resolve_ceiling(QualityPreset::Custom, &GpuProfile::UNKNOWN);
+        assert_eq!(none.planar_reflection_planes, PLANAR_PLANES_MAX);
+        let ultra = resolve_ceiling(QualityPreset::Ultra, &GpuProfile::UNKNOWN);
+        assert_eq!(ultra.planar_reflection_planes, PLANAR_PLANES_MAX);
+        // High (mid discrete under Auto) also runs the full budget.
+        let high = resolve_ceiling(QualityPreset::High, &GpuProfile::UNKNOWN);
+        assert_eq!(high.planar_reflection_planes, PLANAR_PLANES_MAX);
+        // Lower tiers reduce the budget but keep at least one sharp mirror plane,
+        // and never exceed the capacity every backend's allocation is sized to.
+        for preset in [QualityPreset::Low, QualityPreset::Medium] {
+            let c = resolve_ceiling(preset, &GpuProfile::UNKNOWN);
+            assert!(
+                c.planar_reflection_planes >= 1,
+                "{preset:?} dropped all planes"
+            );
+            assert!(
+                c.planar_reflection_planes < PLANAR_PLANES_MAX,
+                "{preset:?} did not reduce the budget"
+            );
+        }
     }
 
     #[test]

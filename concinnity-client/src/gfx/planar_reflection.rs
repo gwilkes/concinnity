@@ -15,6 +15,17 @@
 type Mat4 = [[f32; 4]; 4];
 type Vec4 = [f32; 4];
 
+// The engine-wide capacity ceiling for distinct reflection planes (water surfaces
+// + glass panes combined). Each plane is a full render-resolution MSAA scene
+// re-render, so this bounds the per-frame planar cost and the reserved mirror
+// target VRAM; reflectors past the active budget fall back to the box-projected
+// probe cube. This is the CAPACITY every backend sizes its mirror targets / ICB
+// slots / resolve SRVs against, so the three `planar::MAX_PLANAR_PLANES` alias it
+// and stay in lockstep by construction. The per-frame budget passed to
+// `assign_planar_slots` can be lower (scaled down under a quality preset / GPU
+// tier) but never higher.
+pub(crate) const MAX_PLANAR_PLANES: usize = 4;
+
 fn mul(a: Mat4, b: Mat4) -> Mat4 {
     let mut out = [[0.0f32; 4]; 4];
     for col in 0..4 {

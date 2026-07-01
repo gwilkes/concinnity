@@ -2043,6 +2043,14 @@ impl GraphicsSystem {
             )
         };
 
+        // Planar reflection plane budget: there is no world-authored value, so the
+        // engine capacity is the baseline, scaled down under the quality preset /
+        // GPU tier ceiling. A lower tier renders fewer full render-res mirror passes
+        // (VRAM + GPU savings); reflectors past the budget take the probe cube.
+        // Restart-required like anisotropy above -- the mirror targets are allocated
+        // once at backend init below.
+        let planar_reflection_planes = quality_ceiling.planar_reflection_planes as usize;
+
         self.backend = init_backend(
             &self.window_args,
             validation,
@@ -2072,6 +2080,7 @@ impl GraphicsSystem {
             self.shadow_distance,
             self.shadow_cascades,
             self.anisotropy,
+            planar_reflection_planes,
             text_atlas_data,
             env_map_bytes.as_deref(),
             post_process,

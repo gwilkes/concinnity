@@ -76,19 +76,19 @@ const BANNER: &str = r#"
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    // Create a new app in the current directory
+    /// Create a new app in the current directory
     #[command(name = "init")]
     Init,
 
-    // Create a new app in a new directory
+    /// Create a new app in a new directory
     #[command(name = "new")]
     New(NewArgs),
 
-    // Build a world from .concinnity/worlds/ into binary blobs
+    /// Build a world from .concinnity/worlds/ into binary blobs
     #[command(name = "build")]
     Build(BuildArgs),
 
-    // Run a compiled world: loads the binary blobs written by `cn build`
+    /// Run a compiled world
     //
     // Production path: no debug server and no WebSocket command channel.
     // A shipped run is neither remotely inspectable nor remotely driven:
@@ -96,7 +96,7 @@ enum Commands {
     #[command(name = "run")]
     Run(RunArgs),
 
-    // Run from world.jsonl with the runtime debug server (interpreted)
+    /// Run interpreted directly from a world jsonl file
     //
     // Compiles the world in memory (no prior `cn build` needed) and stands
     // up the localhost debug server.
@@ -105,7 +105,7 @@ enum Commands {
     #[command(name = "debug")]
     Debug(DebugArgs),
 
-    // Add an asset to the active world and rebuild
+    /// Add an asset to the active world
     //
     // TARGET can be:
     //   - A file path  (shaders/pbr.vert, models/scene.obj)
@@ -115,18 +115,18 @@ enum Commands {
     #[command(name = "add")]
     Add(AddArgs),
 
-    // Remove an asset from the active world by its unique name and rebuild
+    /// Remove an asset from the active world by its unique name
     //
     // NAME is the value of the `name` field in world.jsonl
     // (e.g. "my_llm", "pbr_vert", "tool_agent").
     #[command(name = "rm")]
     Rm(RmArgs),
 
-    // List all declared assets
+    /// List all declared assets
     #[command(name = "list")]
     List(ListArgs),
 
-    // Validate a world without running a full build
+    /// Validate a world without building
     #[command(name = "test")]
     Test(TestArgs),
 }

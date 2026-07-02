@@ -35,7 +35,7 @@ For custom / hand-authored geometry use [Mesh](Mesh.md) instead.
 - `source`: A string. Path to a grayscale heightmap image for the `heightfield` generator. Optional.
 - `elevation_min`: A float. Height mapped to black pixels in the `heightfield` source, in world units. Optional.
 - `elevation_max`: A float. Height mapped to white pixels in the `heightfield` source, in world units. Optional.
-- `size`: A float. Edge length for the `skybox` generator, in world units. Optional.
+- `size`: A float. Half-extent on all axes for the `skybox` generator, in world units. Keep it below the camera's `far` plane so the sky is not clipped. Optional.
 - `profile`: An array of arrays of 2 floats. 2D outline `[[x, z], ...]` extruded by the `extrude` generator. Optional.
 - `corner_radius`: A float. Corner-rounding radius for the `extrude` generator. 0 keeps sharp corners. Optional.
 - `corner_segments`: An integer. Number of segments used to round each corner in the `extrude` generator. Optional.

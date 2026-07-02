@@ -31,7 +31,7 @@
 // bytes ride in the blob.
 
 use crate::ecs::asset_id::AssetId;
-use crate::ecs::{AssetOrigin, AssetPayload, Component, PayloadLocator};
+use crate::ecs::{AssetOrigin, AssetPayload, CompanionSpec, Component, PayloadLocator};
 
 /// Per-volume parameter slots packed into a single fixed-size uniform
 /// block. The user shader casts the bound buffer to its own typed
@@ -227,6 +227,14 @@ impl Component for SdfVolume {
 
     fn inject_locator(&mut self, locator: PayloadLocator) {
         self.locator = Some(locator);
+    }
+
+    fn companions(_args: &serde_json::Value, _world: &[serde_json::Value]) -> Vec<CompanionSpec> {
+        vec![CompanionSpec {
+            name: "GraphicsConfig",
+            asset_type: "GraphicsConfig",
+            args: serde_json::json!({}),
+        }]
     }
 }
 

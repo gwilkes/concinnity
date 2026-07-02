@@ -2,18 +2,7 @@
 {"name": "scene_camera", "type": "Camera3D", "args": {"position": [-17.94, 5.04, 1.29], "fov_y_degrees": 60.0, "yaw": -1.446, "pitch": -0.187, "far": 900.0, "controller": {"free_fly": true, "move_speed": 8.0, "mouse_sensitivity": 0.0015, "player_radius": 0.3}}}
 {"name": "sun", "type": "DirectionalLight", "args": {"color": [1.0, 0.95, 0.85], "direction": [-0.4, 0.78, 0.5], "intensity": 3.0}}
 {"name": "env_sky", "type": "EnvironmentMap", "args": {"source": "assets/Bistro_v5_2/san_giuseppe_bridge_4k.hdr"}}
-{"name": "sky_mesh", "type": "ProceduralMesh", "args": {"generator": "skybox", "size": 400.0}}
-{"name": "mat_sky", "type": "Material", "args": {"roughness": 1.0, "metallic": 0.0, "tint": [1.0, 1.0, 1.0]}}
-{"name": "sky", "type": "Prop", "args": {"mesh": "sky_mesh", "material": "mat_sky", "position": [0.0, 0.0, 0.0]}}
 {"name": "post_all", "type": "PostProcessConfig", "args": {"ssr": true, "ray_traced_reflections": true, "ssr_intensity": 0.9, "ssr_max_distance": 120.0, "ssao": true, "ssao_radius": 0.6, "ssao_intensity": 1.3, "indirect_lighting": "ibl", "aa_mode": "taa", "bloom_intensity": 0.35, "bloom_threshold": 1.5, "occlusion_two_pass": true, "auto_exposure": false, "exposure_ev": -1.0, "lut_strength": 0.9}}
-{"name": "hud_font", "type": "Font", "args": {"size_px": 20}}
-{"name": "fps_chip", "type": "TextLabel", "args": {"font": "hud_font", "x": 10, "y": 10, "scale": 0.7, "color": [1, 1, 1], "background": [0.0, 0.18, 0.32, 0.85], "padding": 5}}
-{"name": "vram_chip", "type": "TextLabel", "args": {"font": "hud_font", "x": 92, "y": 10, "scale": 0.7, "color": [1, 1, 1], "background": [0.0, 0.18, 0.32, 0.85], "padding": 5}}
-{"name": "passes_chip", "type": "TextLabel", "args": {"font": "hud_font", "scale": 0.7, "color": [1, 1, 1], "background": [0.0, 0.18, 0.32, 0.85], "padding": 5}}
-{"name": "mouse_chip", "type": "TextLabel", "args": {"font": "hud_font", "scale": 0.7, "color": [1, 1, 1], "background": [0.0, 0.18, 0.32, 0.85], "padding": 5}}
-{"name": "camera_chip", "type": "TextLabel", "args": {"font": "hud_font", "scale": 0.7, "color": [1, 1, 1], "background": [0.0, 0.18, 0.32, 0.85], "padding": 5}}
-{"name": "stat_hud", "type": "StatHud", "args": {"fps_label": "fps_chip", "vram_label": "vram_chip"}}
-{"name": "debug_hud", "type": "DebugHud", "args": {"passes_label": "passes_chip", "mouse_label": "mouse_chip", "camera_label": "camera_chip"}}
 {"name": "bistro_exterior", "type": "SceneImport", "args": {"source": "assets/Bistro_v5_2/BistroExterior.fbx", "texture_max_size": 512}}
 {"name":"lobby", "type":"ReflectionProbe", "args": {"position": [-3.34, 1.7, 0.82], "half_extents": [5, 4, 5]}}
-{"name": "main_menu", "type": "MainMenu", "args": {"title": "Bistro_v5_2", "initial": false}}
+{"name": "main_menu", "type": "MainMenu", "args": {"title": "Bistro_v5_2"}}

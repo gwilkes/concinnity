@@ -1,7 +1,7 @@
 // src/assets/voxel_world.rs
 
 use crate::ecs::asset_id::{AssetId, de_opt_asset_ref};
-use crate::ecs::{AssetOrigin, Component};
+use crate::ecs::{AssetOrigin, CompanionSpec, Component};
 
 /// An infinite, procedurally generated voxel world.
 ///
@@ -141,6 +141,14 @@ impl Component for VoxelWorld {
     }
     fn to_args(&self) -> Self {
         self.clone()
+    }
+
+    fn companions(_args: &serde_json::Value, _world: &[serde_json::Value]) -> Vec<CompanionSpec> {
+        vec![CompanionSpec {
+            name: "GraphicsConfig",
+            asset_type: "GraphicsConfig",
+            args: serde_json::json!({}),
+        }]
     }
 }
 

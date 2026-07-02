@@ -2,17 +2,18 @@
 // Add an asset to a world JSONL and rebuild.
 //
 // The CLI and FFI both funnel through `add_to_path`, which:
-//   - scaffolds the renderer (GraphicsConfig + DirectionalLight) when `target`
-//     is a `.glb` and the world has no renderer-trigger asset yet; applies
-//     equally to a missing world file and an existing-but-renderer-less one,
-//   - bootstraps a missing world from a `.txt` / `.md` target by emitting a
-//     `TextLabel` whose content is the file body; the TextLabel itself is a
-//     renderer trigger so its companions (`GraphicsSystem` + default `Font`)
-//     inject the rest of the stack without an explicit scaffold,
+//   - bootstraps a missing world from a `.glb` / `.txt` / `.md` target (a
+//     text target becomes a `TextLabel` whose content is the file body); the
+//     renderer stack itself is injected at build time from the entries'
+//     companions, so no scaffold lines are written,
+//   - appends a named content template's entries (`--template showcase`) when
+//     one is requested for a `.glb` landing in a renderer-less world,
 //   - resolves `target` as a file path, a known asset type name, or inline
 //     JSON, building one or more asset entries,
 //   - patches the world JSONL atomically (via a tmp file) and reruns the
-//     build pipeline so blobs and the lock file stay in sync.
+//     build pipeline so blobs and the lock file stay in sync. Only the
+//     requested entries are written; injected companions and engine defaults
+//     stay build-time only (see world-lock.json).
 
 use crate::ecs::ComponentType;
 use crate::ecs::asset_api::{AssetRequest, create_asset_def};
@@ -80,7 +81,6 @@ pub fn add_to_path(
         // (font, x/y, color, scale, centered, ...) are left alone so any
         // hand edits to the TextLabel survive the refresh.
         if let Some(refreshed) = try_refresh_text_label(assets, &entries) {
-            concinnity_cook::world::inject_companions(assets);
             tracing::info!("refreshed TextLabel '{}' content", refreshed);
             return Ok(());
         }
@@ -101,8 +101,8 @@ pub fn add_to_path(
                 ));
             }
         }
-        // Inject scaffold entries first so the new asset's own systems (e.g.
-        // a glTF's Camera3D) run alongside a working renderer. Any scaffold
+        // Append template entries first so the new asset's own systems (e.g.
+        // a glTF's Camera3D) run alongside the template's setup. Any template
         // entry whose name already exists in the world is skipped to avoid
         // clobbering user-authored assets that happen to share the name.
         for entry in scaffold {
@@ -115,12 +115,6 @@ pub fn add_to_path(
             }
         }
         assets.extend(entries);
-        // Materialize companion injections (GraphicsSystem, Window, default
-        // ShaderStages, Camera3DSystem, Font, ...) into world.jsonl so the
-        // file shown to the user lists exactly what the runtime will load.
-        // Build-time macros (LightRig, MaterialPalette, …) stay authored and
-        // expand in-memory only.
-        concinnity_cook::world::inject_companions(assets);
         Ok(())
     })?;
 
@@ -217,7 +211,10 @@ fn scaffold_to_inject(
             if world_exists && has_renderer_trigger(world_path)? {
                 return Ok(Vec::new());
             }
-            Ok(template_entries.unwrap_or_else(super::sources::glb::scaffold))
+            // No default scaffold: the renderer stack is injected at build
+            // time from the scene's own assets. Only an explicitly requested
+            // template writes extra entries.
+            Ok(template_entries.unwrap_or_default())
         }
     }
 }
@@ -1015,8 +1012,9 @@ mod tests {
     // scaffold_to_inject
 
     #[test]
-    fn scaffold_to_inject_returns_scaffold_for_renderer_less_world() {
-        // Existing world with renderer-less assets + a .glb target.
+    fn scaffold_to_inject_writes_nothing_without_a_template() {
+        // Existing world with renderer-less assets + a .glb target: the
+        // renderer stack is injected at build time, so no lines are written.
         let dir =
             std::env::temp_dir().join(format!("cn_add_test_{}_{}", std::process::id(), line!()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1033,12 +1031,7 @@ mod tests {
         .unwrap();
 
         let scaffold = scaffold_to_inject(world.to_str().unwrap(), "scene.glb", None).unwrap();
-        assert_eq!(scaffold.len(), 2);
-        let names: Vec<&str> = scaffold
-            .iter()
-            .filter_map(|e| e.get("name").and_then(|v| v.as_str()))
-            .collect();
-        assert_eq!(names, vec!["scaffold_graphics", "ambient_light"]);
+        assert!(scaffold.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1062,17 +1055,17 @@ mod tests {
     }
 
     #[test]
-    fn scaffold_to_inject_returns_scaffold_for_missing_world_with_glb() {
-        // Mirrors the original empty_room-on-fresh-add behavior: no file
-        // present, target is `.glb` ⇒ caller is expected to create the file
-        // and the scaffold gets injected by the patch closure.
+    fn scaffold_to_inject_allows_missing_world_with_glb() {
+        // No file present, target is `.glb`: the caller is expected to create
+        // the file; the renderer stack comes from build-time injection, so no
+        // template entries are needed.
         let dir =
             std::env::temp_dir().join(format!("cn_add_test_{}_{}", std::process::id(), line!()));
         let _ = std::fs::remove_dir_all(&dir);
         let world = dir.join("world.jsonl");
 
         let scaffold = scaffold_to_inject(world.to_str().unwrap(), "scene.glb", None).unwrap();
-        assert_eq!(scaffold.len(), 2);
+        assert!(scaffold.is_empty());
     }
 
     #[test]
@@ -1114,14 +1107,12 @@ mod tests {
 
         let scaffold = scaffold_to_inject(world.to_str().unwrap(), "scene.glb", Some("showcase"))
             .expect("showcase template should apply for renderer-less glb add");
-        // template_showcase declares 5 entries; the default scaffold declares 2.
-        // Comparing lengths is enough to confirm the template path fired.
-        assert!(
-            scaffold.len() > 2,
-            "expected showcase template ({} entries), got {}: possibly fell through to default scaffold",
+        assert_eq!(
+            scaffold.len(),
             super::super::sources::glb::template_showcase().len(),
-            scaffold.len()
+            "expected the showcase template entries"
         );
+        assert!(!scaffold.is_empty());
     }
 
     #[test]
@@ -1143,8 +1134,8 @@ mod tests {
     #[test]
     fn scaffold_to_inject_rejects_unknown_template_even_when_no_scaffold_would_fire() {
         // An unknown template name is a typo, full stop. We don't want the
-        // user to silently get the default scaffold (or nothing) when they
-        // intended to ask for a template.
+        // user to silently get nothing when they intended to ask for a
+        // template.
         let dir =
             std::env::temp_dir().join(format!("cn_add_test_{}_{}", std::process::id(), line!()));
         std::fs::create_dir_all(&dir).unwrap();

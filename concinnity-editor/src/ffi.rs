@@ -214,34 +214,8 @@ pub extern "C" fn cn_build_world(
         }
     };
 
-    use crate::ecs::ComponentType;
-    // The blob carries only components; the lock file's pipeline-order section
-    // (once a declared system run order) is therefore empty.
-    let pipeline_refs: Vec<&str> = Vec::new();
-    let named_refs: Vec<(String, &crate::ecs::BlobAssetDef)> = result
-        .defs
-        .iter()
-        .map(|d| {
-            let name = ComponentType::from_discriminant(d.discriminant)
-                .map(|t| t.as_str().to_string())
-                .unwrap_or_default();
-            (name, d)
-        })
-        .collect();
-    let named_refs: Vec<(&str, &crate::ecs::BlobAssetDef)> =
-        named_refs.iter().map(|(n, d)| (n.as_str(), *d)).collect();
-
-    let pack_result = match concinnity_cook::blob::write_blobs(&result.defs, &result.payloads) {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!("cn_build_world: write_blobs failed: {e}");
-            return 0;
-        }
-    };
-    if let Err(e) =
-        concinnity_cook::blob::write_lock(&pipeline_refs, &named_refs, &pack_result.blob_paths)
-    {
-        tracing::error!("cn_build_world: write_lock failed: {e}");
+    if let Err(e) = concinnity_cook::write_build_outputs(&result, &loaded.injected) {
+        tracing::error!("cn_build_world: writing blobs/lock failed: {e}");
         return 0;
     }
 

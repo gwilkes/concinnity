@@ -309,7 +309,7 @@ pub(crate) fn load_mesh_geometry(ctx: &mut PipelineContext) -> Option<MeshGeomet
         && file_meshes.is_empty()
     {
         // Room path can carry the scene without any explicit Mesh/ProceduralMesh
-        tracing::warn!(
+        tracing::info!(
             "GraphicsSystem: no Mesh, ProceduralMesh, VoxelChunk, or mesh-kind File components found"
         );
     }

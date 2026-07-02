@@ -56,6 +56,20 @@ pub fn check_asset(type_norm: &str, name: &str, args: &serde_json::Value) -> Res
 pub fn check_world(assets: &[WorldJsonlAsset]) -> Result<(), Vec<String>> {
     let mut errors: Vec<String> = Vec::new();
 
+    // Names must still be unique after expansion and injection: a duplicate
+    // here means a generated or injected asset silently aliased another (the
+    // authored world's uniqueness was already checked before expansion).
+    let mut seen_names: std::collections::HashSet<&str> = Default::default();
+    for asset in assets {
+        if !seen_names.insert(asset.name.as_str()) {
+            errors.push(format!(
+                "duplicate name '{}' after build-time expansion: a generated or \
+                 injected asset collides with another; rename one of them",
+                asset.name
+            ));
+        }
+    }
+
     for asset in assets {
         let type_norm = asset.asset_type.to_lowercase().replace('_', "");
         if let Err(e) = check_asset(&type_norm, &asset.name, &asset.args) {

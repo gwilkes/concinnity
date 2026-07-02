@@ -19,11 +19,19 @@ authored coordinates.
 The always-on frame-rate and GPU-memory readouts live on the separate
 [StatHud](StatHud.md).
 
+Every rendering world receives a `DebugHud` and its chip labels at build
+time when it declares none, so the example below is only needed to restyle
+the chips. The HUD only activates in developer contexts: a debug build of
+the host binary, or a world launched through `cn debug`; release builds
+leave it inert even when declared. Declare an
+[EngineDefaults](EngineDefaults.md) with `"debug_hud": false` to remove it
+from the build entirely.
+
 ```jsonl
 {"type":"Font","name":"hud_font","args":{"size_px":20}}
-{"type":"TextLabel","name":"mouse_chip","args":{"font":"hud_font","scale":0.7,"color":[1,1,1],"background":[0,0.22,0.08,0.85],"padding":5}}
-{"type":"TextLabel","name":"passes_chip","args":{"font":"hud_font","scale":0.6,"color":[1,1,1],"background":[0,0.22,0.08,0.85],"padding":5}}
-{"type":"TextLabel","name":"camera_chip","args":{"font":"hud_font","scale":0.6,"color":[1,1,1],"background":[0,0.22,0.08,0.85],"padding":5}}
+{"type":"TextLabel","name":"mouse_chip","args":{"font":"hud_font","scale":0.7,"color":[1,1,1],"background":[0,0.18,0.32,0.85],"padding":5}}
+{"type":"TextLabel","name":"passes_chip","args":{"font":"hud_font","scale":0.6,"color":[1,1,1],"background":[0,0.18,0.32,0.85],"padding":5}}
+{"type":"TextLabel","name":"camera_chip","args":{"font":"hud_font","scale":0.6,"color":[1,1,1],"background":[0,0.18,0.32,0.85],"padding":5}}
 {"type":"DebugHud","name":"debug_hud","args":{"passes_label":"passes_chip","mouse_label":"mouse_chip","camera_label":"camera_chip"}}
 ```
 

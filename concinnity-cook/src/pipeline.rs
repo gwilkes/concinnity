@@ -21,7 +21,7 @@ pub fn build_from_path(json_path: &str) -> std::io::Result<()> {
 
     let result = build_compiled(loaded.assets, None)?;
 
-    let pack_result = crate::blob::write_blobs(&result.defs, &result.payloads)?;
+    let pack_result = write_build_outputs(&result, &loaded.injected)?;
     for (blob_idx, path) in pack_result.blob_paths.iter().enumerate() {
         let payload_bytes = result.payloads.get(blob_idx).map(|b| b.len()).unwrap_or(0);
         println!("Wrote {} ({} payload bytes)", path, payload_bytes);
@@ -34,27 +34,33 @@ pub fn build_from_path(json_path: &str) -> std::io::Result<()> {
         );
     }
 
-    // The blob carries only components; the lock file's pipeline-order section
-    // (once a declared system run order) is therefore empty.
-    let pipeline_refs: Vec<&str> = Vec::new();
-
-    let named_refs: Vec<(String, &crate::ecs::BlobAssetDef)> = result
-        .defs
-        .iter()
-        .map(|d| {
-            let name = ComponentType::from_discriminant(d.discriminant)
-                .map(|t| t.as_str().to_string())
-                .unwrap_or_default();
-            (name, d)
-        })
-        .collect();
-    let named_refs: Vec<(&str, &crate::ecs::BlobAssetDef)> =
-        named_refs.iter().map(|(n, d)| (n.as_str(), *d)).collect();
-
-    crate::blob::write_lock(&pipeline_refs, &named_refs, &pack_result.blob_paths)?;
+    if !loaded.injected.is_empty() {
+        println!(
+            "Injected {} default asset(s) (see world-lock.json)",
+            loaded.injected.len()
+        );
+    }
     println!("Wrote world-lock.json");
 
     Ok(())
+}
+
+// Write the blobs and world-lock.json for a compiled world: the shared build
+// tail used by the CLI and the FFI host. The lock records each asset under its
+// real name plus every injected default with its full args.
+pub fn write_build_outputs(
+    result: &PipelineResult,
+    injected: &[crate::world::InjectedAsset],
+) -> std::io::Result<crate::blob::PackResult> {
+    let pack_result = crate::blob::write_blobs(&result.defs, &result.payloads)?;
+    let named_refs: Vec<(&str, &BlobAssetDef)> = result
+        .names
+        .iter()
+        .map(|n| n.as_str())
+        .zip(result.defs.iter())
+        .collect();
+    crate::blob::write_lock(&named_refs, injected, &pack_result.blob_paths)?;
+    Ok(pack_result)
 }
 
 // Collapse a list of validation errors into a single io::Error. The messages
@@ -69,6 +75,9 @@ fn errors_to_io(errors: Vec<String>) -> std::io::Error {
 // blob i. This can be used directly without touching disk.
 pub struct PipelineResult {
     pub defs: Vec<BlobAssetDef>,
+    // Asset name of each def, index-aligned with `defs` (defs only carry the
+    // interned id; the lock file records the readable name).
+    pub names: Vec<String>,
     pub payloads: Vec<Vec<u8>>,
     // Compiled-asset payloads served from the build cache this run.
     pub cache_hits: usize,
@@ -192,10 +201,11 @@ pub fn build_compiled(
     // The blob carries only components, emitted in declaration order. (System
     // run order is no longer a build concern: every system is internal client
     // code ordered by the client's `World::build_internal_systems` schedule.)
-    let defs: Vec<BlobAssetDef> = named.into_iter().map(|(_, d)| d).collect();
+    let (names, defs): (Vec<String>, Vec<BlobAssetDef>) = named.into_iter().unzip();
 
     Ok(PipelineResult {
         defs,
+        names,
         payloads: blob_payloads,
         cache_hits,
         cache_misses,
@@ -1092,8 +1102,15 @@ fn resolve_scene_refs(assets: &mut [WorldJsonlAsset]) {
 mod tests {
     use super::*;
 
+    // Default-shader compilation writes intermediates to a shared
+    // .concinnity/data path keyed by asset name, so tests whose worlds pull in
+    // the default ShaderStages (any rendering world) must not build
+    // concurrently.
+    static SHADER_BUILD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn build_pipeline_interns_names_and_resolves_refs() {
+        let _guard = SHADER_BUILD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // box=0, day=1, day_crate=2 in declaration order.
         let world = concat!(
             r#"{"name":"box","type":"ProceduralMesh","args":{"generator":"box","half_extents":[1,1,1]}}"#,
@@ -1180,6 +1197,7 @@ mod tests {
     // resolved from the prefix at build time, mirroring Prop scene refs.
     #[test]
     fn build_pipeline_resolves_view_prefix_on_ui_assets() {
+        let _guard = SHADER_BUILD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let world = concat!(
             r#"{"name":"pause_menu","type":"View","args":{}}"#,
             "\n",

@@ -7,6 +7,7 @@
 mod add;
 mod build;
 mod check;
+mod explain;
 mod list;
 mod new;
 mod rm;
@@ -16,6 +17,9 @@ pub use add::add;
 
 // Analyze the current app and report errors, but don't build blob files
 pub use check::check;
+
+// Print one asset's effective entry from the expanded world
+pub use explain::explain;
 
 // List all declared assets
 pub use list::list;

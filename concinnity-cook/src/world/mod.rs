@@ -8,6 +8,7 @@ pub use concinnity_core::world::*;
 pub(crate) mod camera_shot;
 pub(crate) mod companion;
 pub(crate) mod config;
+pub(crate) mod defaults;
 
 pub(crate) mod light_rig;
 pub(crate) mod main_menu;
@@ -22,10 +23,8 @@ pub(crate) mod slider;
 pub(crate) mod expand;
 
 #[allow(unused_imports)]
-pub use companion::inject_companions;
-#[allow(unused_imports)]
 pub use config::{DEFAULT_MAX_BLOB_BYTES, WorldConfig};
-pub use expand::{expand_world, expand_world_from_str};
+pub use expand::{ExpandReport, InjectedAsset, expand_world, expand_world_from_str};
 pub use shader::normalize_single_shader_type;
 
 use crate::ecs::{AssetOrigin, ComponentType};
@@ -46,6 +45,12 @@ pub fn asset_name_from_path(path: &str) -> String {
 pub struct LoadedWorld {
     // The same assets as typed entries, consumed by the build pipeline.
     pub assets: Vec<WorldJsonlAsset>,
+    // Assets added by the injection passes (companions, engine defaults),
+    // recorded in world-lock.json so the user can see and override them.
+    pub injected: Vec<InjectedAsset>,
+    // Names declared in the world file itself (pre-expansion), for
+    // provenance listings.
+    pub authored: Vec<String>,
 }
 
 // Resolve $include directives in a flat asset list.
@@ -179,13 +184,22 @@ pub fn load_world(content: &str) -> Result<Vec<serde_json::Value>, Vec<String>> 
 // collected, so the caller gets the full picture in a single pass.
 pub fn prepare_world(content: &str) -> Result<LoadedWorld, Vec<String>> {
     let mut expanded = load_world(content)?;
-    expand_world(&mut expanded).map_err(|e| vec![e])?;
+    let authored: Vec<String> = expanded
+        .iter()
+        .filter_map(|v| v.get("name").and_then(|n| n.as_str()))
+        .map(str::to_string)
+        .collect();
+    let report = expand_world(&mut expanded).map_err(|e| vec![e])?;
 
     let assets: Vec<WorldJsonlAsset> = expanded.iter().map(WorldJsonlAsset::from_value).collect();
 
     crate::check::check_world(&assets)?;
 
-    Ok(LoadedWorld { assets })
+    Ok(LoadedWorld {
+        assets,
+        injected: report.injected,
+        authored,
+    })
 }
 
 #[cfg(test)]

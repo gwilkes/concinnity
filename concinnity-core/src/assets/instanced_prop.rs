@@ -1,7 +1,7 @@
 // src/assets/instanced_prop.rs
 
 use crate::ecs::asset_id::{AssetId, de_opt_asset_ref};
-use crate::ecs::{AssetOrigin, Component};
+use crate::ecs::{AssetOrigin, CompanionSpec, Component};
 
 /// Per-instance transform within an `InstancedProp`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -135,6 +135,14 @@ impl Component for InstancedProp {
 
     fn inject_name(&mut self, id: AssetId) {
         self.asset_id = id;
+    }
+
+    fn companions(_args: &serde_json::Value, _world: &[serde_json::Value]) -> Vec<CompanionSpec> {
+        vec![CompanionSpec {
+            name: "GraphicsConfig",
+            asset_type: "GraphicsConfig",
+            args: serde_json::json!({}),
+        }]
     }
 }
 

@@ -21,12 +21,19 @@ by the engine rather than the authored coordinates.
 Developer-facing readouts (per-pass GPU timings, cursor position, live
 camera pose) live on the separate [DebugHud](DebugHud.md), toggled with F1.
 
+A world that declares a [MainMenu](MainMenu.md) receives a `StatHud`, its
+chip labels, and their font at build time when it declares none (the
+menu's performance-stats toggles drive the chips), so the example below is
+only needed to restyle the chips or run a HUD without a menu. Declare an
+[EngineDefaults](EngineDefaults.md) with `"hud": false` to remove the
+injection entirely.
+
 ```jsonl
 {"type":"Font","name":"hud_font","args":{"size_px":20}}
-{"type":"TextLabel","name":"fps_chip","args":{"font":"hud_font","x":10,"y":10,"scale":0.7,"color":[1,1,1],"background":[0,0.22,0.08,0.85],"padding":5}}
-{"type":"TextLabel","name":"vram_chip","args":{"font":"hud_font","x":92,"y":10,"scale":0.7,"color":[1,1,1],"background":[0,0.22,0.08,0.85],"padding":5}}
-{"type":"TextLabel","name":"ev_chip","args":{"font":"hud_font","x":192,"y":10,"scale":0.7,"color":[1,1,1],"background":[0,0.22,0.08,0.85],"padding":5}}
-{"type":"TextLabel","name":"edr_chip","args":{"font":"hud_font","x":272,"y":10,"scale":0.7,"color":[1,1,1],"background":[0,0.22,0.08,0.85],"padding":5}}
+{"type":"TextLabel","name":"fps_chip","args":{"font":"hud_font","x":10,"y":10,"scale":0.7,"color":[1,1,1],"background":[0,0.18,0.32,0.85],"padding":5}}
+{"type":"TextLabel","name":"vram_chip","args":{"font":"hud_font","x":92,"y":10,"scale":0.7,"color":[1,1,1],"background":[0,0.18,0.32,0.85],"padding":5}}
+{"type":"TextLabel","name":"ev_chip","args":{"font":"hud_font","x":192,"y":10,"scale":0.7,"color":[1,1,1],"background":[0,0.18,0.32,0.85],"padding":5}}
+{"type":"TextLabel","name":"edr_chip","args":{"font":"hud_font","x":272,"y":10,"scale":0.7,"color":[1,1,1],"background":[0,0.18,0.32,0.85],"padding":5}}
 {"type":"StatHud","name":"hud","args":{"fps_label":"fps_chip","vram_label":"vram_chip","ev_label":"ev_chip","edr_label":"edr_chip"}}
 ```
 

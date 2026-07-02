@@ -4,7 +4,7 @@
 // the client crate's `hud::stat_hud`.
 
 use crate::ecs::asset_id::{AssetId, de_opt_asset_ref};
-use crate::ecs::{AssetOrigin, Component};
+use crate::ecs::{AssetOrigin, CompanionSpec, Component};
 
 /// Requests the default on-screen stats HUD. Drives a set of
 /// [TextLabel](#textlabel) chips with live engine stats, refreshed on a fixed
@@ -25,12 +25,19 @@ use crate::ecs::{AssetOrigin, Component};
 /// Developer-facing readouts (per-pass GPU timings, cursor position, live
 /// camera pose) live on the separate [DebugHud](#debughud), toggled with F1.
 ///
+/// A world that declares a [MainMenu](#mainmenu) receives a `StatHud`, its
+/// chip labels, and their font at build time when it declares none (the
+/// menu's performance-stats toggles drive the chips), so the example below is
+/// only needed to restyle the chips or run a HUD without a menu. Declare an
+/// [EngineDefaults](#enginedefaults) with `"hud": false` to remove the
+/// injection entirely.
+///
 /// ```jsonl
 /// {"type":"Font","name":"hud_font","args":{"size_px":20}}
-/// {"type":"TextLabel","name":"fps_chip","args":{"font":"hud_font","x":10,"y":10,"scale":0.7,"color":[1,1,1],"background":[0,0.22,0.08,0.85],"padding":5}}
-/// {"type":"TextLabel","name":"vram_chip","args":{"font":"hud_font","x":92,"y":10,"scale":0.7,"color":[1,1,1],"background":[0,0.22,0.08,0.85],"padding":5}}
-/// {"type":"TextLabel","name":"ev_chip","args":{"font":"hud_font","x":192,"y":10,"scale":0.7,"color":[1,1,1],"background":[0,0.22,0.08,0.85],"padding":5}}
-/// {"type":"TextLabel","name":"edr_chip","args":{"font":"hud_font","x":272,"y":10,"scale":0.7,"color":[1,1,1],"background":[0,0.22,0.08,0.85],"padding":5}}
+/// {"type":"TextLabel","name":"fps_chip","args":{"font":"hud_font","x":10,"y":10,"scale":0.7,"color":[1,1,1],"background":[0,0.18,0.32,0.85],"padding":5}}
+/// {"type":"TextLabel","name":"vram_chip","args":{"font":"hud_font","x":92,"y":10,"scale":0.7,"color":[1,1,1],"background":[0,0.18,0.32,0.85],"padding":5}}
+/// {"type":"TextLabel","name":"ev_chip","args":{"font":"hud_font","x":192,"y":10,"scale":0.7,"color":[1,1,1],"background":[0,0.18,0.32,0.85],"padding":5}}
+/// {"type":"TextLabel","name":"edr_chip","args":{"font":"hud_font","x":272,"y":10,"scale":0.7,"color":[1,1,1],"background":[0,0.18,0.32,0.85],"padding":5}}
 /// {"type":"StatHud","name":"hud","args":{"fps_label":"fps_chip","vram_label":"vram_chip","ev_label":"ev_chip","edr_label":"edr_chip"}}
 /// ```
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -60,5 +67,27 @@ impl Component for StatHud {
     }
     fn from_args(args: Self) -> Self {
         args
+    }
+
+    fn companions(_args: &serde_json::Value, _world: &[serde_json::Value]) -> Vec<CompanionSpec> {
+        vec![CompanionSpec {
+            name: "GraphicsConfig",
+            asset_type: "GraphicsConfig",
+            args: serde_json::json!({}),
+        }]
+    }
+}
+
+impl crate::check::cross_reference::CrossReferenced for StatHud {
+    fn cross_refs(
+        name: &str,
+        args: &serde_json::Value,
+    ) -> Vec<crate::check::cross_reference::CrossRef> {
+        crate::check::cross_reference::label_refs(
+            "StatHud",
+            name,
+            args,
+            &["fps_label", "vram_label", "ev_label", "edr_label"],
+        )
     }
 }

@@ -126,6 +126,14 @@ enum Commands {
     #[command(name = "list")]
     List(ListArgs),
 
+    /// Print an asset's effective entry from the expanded world
+    //
+    // Prints the full JSONL line for NAME as the build sees it, including
+    // assets that only exist through build-time expansion or injection. The
+    // output can be pasted into world.jsonl verbatim to override a default.
+    #[command(name = "explain")]
+    Explain(ExplainArgs),
+
     /// Validate a world without building
     #[command(name = "test")]
     Test(TestArgs),
@@ -222,6 +230,22 @@ pub struct TestArgs {
 
 #[derive(Debug, clap::Args)]
 pub struct ListArgs {
+    // Path to a world JSONL file (default: discover from .concinnity/worlds/)
+    #[arg(short = 'f', long)]
+    pub file: Option<String>,
+
+    // List the expanded world the build produces instead of the authored
+    // file: build-time macros are expanded and injected defaults included,
+    // each row tagged with its provenance (authored / injected / expanded).
+    #[arg(long)]
+    pub expanded: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct ExplainArgs {
+    // The `name` field of the asset to print
+    pub name: String,
+
     // Path to a world JSONL file (default: discover from .concinnity/worlds/)
     #[arg(short = 'f', long)]
     pub file: Option<String>,
@@ -338,7 +362,8 @@ fn main() -> std::io::Result<()> {
             cli::add(args.name.as_deref(), &args.target, args.template.as_deref())
         }
         Commands::Rm(args) => cli::rm(&args.name),
-        Commands::List(args) => cli::list(args.file.as_deref()),
+        Commands::List(args) => cli::list(args.file.as_deref(), args.expanded),
+        Commands::Explain(args) => cli::explain(&args.name, args.file.as_deref()),
         Commands::Test(args) => {
             let path = args.file.as_deref().unwrap_or("");
             cli::check(path)

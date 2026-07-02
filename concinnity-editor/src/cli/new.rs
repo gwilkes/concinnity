@@ -1,10 +1,11 @@
 // src/cli/new.rs
 
-use crate::world::{WORLD_JSONL, patch_world_jsonl};
+use crate::world::WORLD_JSONL;
 use concinnity_cook::build_from_path;
-use concinnity_cook::world::inject_companions;
 
-// Default starter world file
+// Default starter world file. Everything else a running world needs (window,
+// renderer, debug HUD) is injected at build time and recorded in
+// world-lock.json; `cn list --expanded` shows the effective world.
 const INIT_WORLD_JSONL: &str = r#"{"name":"hello_world","type":"TextLabel","args":{"content":"Hello, world!"}}
 "#;
 
@@ -42,9 +43,5 @@ fn init_in_dir(dir: &str) -> std::io::Result<()> {
     println!("Created {}", world_path.display());
 
     let world_path_str = world_path.to_str().unwrap_or(WORLD_JSONL);
-    // Materialize companion injections into the starter world so the file the
-    // user opens lists every runtime asset, not just the seed entry.
-    patch_world_jsonl(world_path_str, inject_companions)?;
-
     build_from_path(world_path_str)
 }

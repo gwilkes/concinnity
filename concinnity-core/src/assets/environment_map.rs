@@ -1,7 +1,7 @@
 // src/assets/environment_map.rs
 
 use crate::ecs::asset_id::AssetId;
-use crate::ecs::{AssetOrigin, AssetPayload, Component, PayloadLocator};
+use crate::ecs::{AssetOrigin, AssetPayload, CompanionSpec, Component, PayloadLocator};
 
 /// A baked lighting environment built from a Radiance HDR equirectangular
 /// source (or a built-in generator). It provides the scene's ambient
@@ -14,6 +14,13 @@ use crate::ecs::{AssetOrigin, AssetPayload, Component, PayloadLocator};
 ///
 /// **Built-in generators:** `sky` produces a procedural blue sky with a soft
 /// sun, useful when no HDR file is available.
+///
+/// The sky mesh that displays the map (a skybox
+/// [ProceduralMesh](#proceduralmesh) plus its [Material](#material) and
+/// [Prop](#prop)) is injected at build time when the world declares no skybox
+/// mesh of its own. Declare an [EngineDefaults](#enginedefaults) with
+/// `"sky": false` to use the map for image-based lighting only, with the
+/// background left to `clear_color` or your own geometry.
 ///
 /// ```jsonl
 /// {"name":"env_studio","type":"EnvironmentMap","args":{"source":"assets/hdri/studio.hdr"}}
@@ -105,6 +112,14 @@ impl Component for EnvironmentMap {
 
     fn inject_name(&mut self, id: AssetId) {
         self.asset_id = id;
+    }
+
+    fn companions(_args: &serde_json::Value, _world: &[serde_json::Value]) -> Vec<CompanionSpec> {
+        vec![CompanionSpec {
+            name: "GraphicsConfig",
+            asset_type: "GraphicsConfig",
+            args: serde_json::json!({}),
+        }]
     }
 }
 

@@ -1,6 +1,6 @@
 // src/assets/main_menu.rs
 
-use crate::ecs::{AssetOrigin, Component};
+use crate::ecs::{AssetOrigin, CompanionSpec, Component};
 
 /// A ready-made menu declared in a single line.
 ///
@@ -10,11 +10,17 @@ use crate::ecs::{AssetOrigin, Component};
 /// optional [KeyBinding](#keybinding) that toggles the menu, and an optional
 /// in-engine mouse cursor [Sprite](#sprite). So `world.jsonl` stays small.
 ///
-/// The bare form gives a centered Return / Settings / Quit menu shown on load:
+/// The bare form gives a centered Return / Settings / Quit menu that starts
+/// closed, with Escape opening it, so the scene itself shows first. Set
+/// `"initial": true` to show the menu as soon as the world loads:
 ///
 /// ```jsonl
 /// {"name":"main_menu","type":"MainMenu"}
 /// ```
+///
+/// Declaring a `MainMenu` also injects the [StatHud](#stathud) (and its chip
+/// labels) at build time when the world declares none, so the menu's
+/// performance-stats toggles have chips to drive.
 ///
 /// **Items.** Each item has a `label` (the text) and an `action` fired on
 /// click. `action` takes the same vocabulary as [HitRegion](#hitregion)
@@ -40,7 +46,8 @@ pub struct MainMenu {
     pub items: Vec<MainMenuItem>,
     /// Optional heading drawn above the items. Empty draws no heading.
     pub title: String,
-    /// Show the menu as soon as the world loads.
+    /// Show the menu as soon as the world loads. Off by default: the scene
+    /// shows first and the toggle key opens the menu.
     pub initial: bool,
     /// Key that toggles the menu while the cursor is free. Empty binds no key.
     /// Only `"Escape"` is currently recognised by the runtime.
@@ -126,7 +133,7 @@ impl Default for MainMenu {
                 },
             ],
             title: String::new(),
-            initial: true,
+            initial: false,
             toggle_key: "Escape".to_string(),
             dim: [0.0, 0.0, 0.0, 1.0],
             centered: true,
@@ -159,6 +166,14 @@ impl Component for MainMenu {
     fn to_args(&self) -> Self {
         self.clone()
     }
+
+    fn companions(_args: &serde_json::Value, _world: &[serde_json::Value]) -> Vec<CompanionSpec> {
+        vec![CompanionSpec {
+            name: "GraphicsConfig",
+            asset_type: "GraphicsConfig",
+            args: serde_json::json!({}),
+        }]
+    }
 }
 
 #[cfg(test)]
@@ -170,7 +185,8 @@ mod tests {
         let m: MainMenu = serde_json::from_str("{}").unwrap();
         let labels: Vec<&str> = m.items.iter().map(|i| i.label.as_str()).collect();
         assert_eq!(labels, vec!["Return", "Settings", "Quit"]);
-        assert!(m.initial);
+        // Closed on load by default: the scene shows first, Escape opens.
+        assert!(!m.initial);
         assert_eq!(m.toggle_key, "Escape");
         assert!(m.cursor);
     }

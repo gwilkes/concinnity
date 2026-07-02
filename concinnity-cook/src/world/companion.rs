@@ -17,6 +17,7 @@
 //      world: when there are TextLabels but no Font, it injects one from the
 //      engine's bundled font and points empty-`font` labels at it.
 
+use super::expand::ExpandReport;
 use crate::ecs::ComponentType;
 use std::collections::HashSet;
 
@@ -57,7 +58,7 @@ const DEFAULT_FONT_SIZE: u32 = 48;
 // font (a Font with no `path`), named after that file exactly as `cn add` would
 // name it. Then point every empty-`font` label at it (and default such labels to
 // centered, HUD-style). A world that declares its own Font pre-empts all of this.
-fn apply_default_font(assets: &mut Vec<serde_json::Value>) {
+fn apply_default_font(assets: &mut Vec<serde_json::Value>, report: &mut ExpandReport) {
     let has_text = assets.iter().any(|v| asset_type_norm(v) == "textlabel");
     if !has_text {
         return;
@@ -65,11 +66,13 @@ fn apply_default_font(assets: &mut Vec<serde_json::Value>) {
     let font_name = super::asset_name_from_path(crate::font::BUILTIN_FONT_FILE);
     let has_font = assets.iter().any(|v| asset_type_norm(v) == "font");
     if !has_font {
+        let args = serde_json::json!({ "size_px": DEFAULT_FONT_SIZE });
         assets.push(serde_json::json!({
             "name": font_name,
             "type": "Font",
-            "args": { "size_px": DEFAULT_FONT_SIZE },
+            "args": args.clone(),
         }));
+        report.record(&font_name, "Font", args, "default_font");
     }
     // Patch only if the default actually landed (nothing pre-empted it).
     let default_present = assets.iter().any(|v| {
@@ -102,7 +105,7 @@ fn apply_default_font(assets: &mut Vec<serde_json::Value>) {
     }
 }
 
-pub fn inject_companions(assets: &mut Vec<serde_json::Value>) {
+pub(crate) fn inject_companions(assets: &mut Vec<serde_json::Value>, report: &mut ExpandReport) {
     loop {
         // Snapshot the world for this round. New companions added in this
         // round only enter the visible set on the next iteration; that keeps
@@ -146,18 +149,25 @@ pub fn inject_companions(assets: &mut Vec<serde_json::Value>) {
             assets.push(serde_json::json!({
                 "name": spec.name,
                 "type": spec.asset_type,
-                "args": spec.args,
+                "args": spec.args.clone(),
             }));
+            report.record(spec.name, spec.asset_type, spec.args, "companion");
         }
     }
 
     // Default-font pass: ensure font-less labels have a Font to reference.
-    apply_default_font(assets);
+    apply_default_font(assets, report);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Test shim: run injection with a throwaway report.
+    fn inject(assets: &mut Vec<serde_json::Value>) {
+        let mut report = ExpandReport::default();
+        inject_companions(assets, &mut report);
+    }
 
     fn type_norm(v: &serde_json::Value) -> String {
         asset_type_norm(v)
@@ -166,7 +176,7 @@ mod tests {
     #[test]
     fn no_injection_without_trigger() {
         let mut assets = vec![serde_json::json!({"name":"w","type":"Window","args":{}})];
-        inject_companions(&mut assets);
+        inject(&mut assets);
         assert!(!assets.iter().any(|v| type_norm(v) == "graphicsconfig"));
     }
 
@@ -174,7 +184,7 @@ mod tests {
     fn text_injects_graphics_config_and_font() {
         let mut assets =
             vec![serde_json::json!({"name":"t","type":"TextLabel","args":{"content":"hi"}})];
-        inject_companions(&mut assets);
+        inject(&mut assets);
         assert!(assets.iter().any(|v| type_norm(v) == "graphicsconfig"));
         assert!(assets.iter().any(|v| type_norm(v) == "font"));
     }
@@ -185,7 +195,7 @@ mod tests {
             serde_json::json!({"name":"t","type":"TextLabel","args":{"content":"hi"}}),
             serde_json::json!({"name":"gfx","type":"GraphicsConfig","args":{}}),
         ];
-        inject_companions(&mut assets);
+        inject(&mut assets);
         let gfx_count = assets
             .iter()
             .filter(|v| type_norm(v) == "graphicsconfig")
@@ -199,7 +209,7 @@ mod tests {
             serde_json::json!({"name":"t","type":"TextLabel","args":{"content":"hi"}}),
             serde_json::json!({"name":"f","type":"Font","args":{"path":"my.ttf","size_px":20}}),
         ];
-        inject_companions(&mut assets);
+        inject(&mut assets);
         let font_count = assets.iter().filter(|v| type_norm(v) == "font").count();
         assert_eq!(font_count, 1);
     }
@@ -208,7 +218,7 @@ mod tests {
     fn text_patches_empty_font_field_to_default() {
         let mut assets =
             vec![serde_json::json!({"name":"t","type":"TextLabel","args":{"content":"hi"}})];
-        inject_companions(&mut assets);
+        inject(&mut assets);
         let label = assets.iter().find(|v| type_norm(v) == "textlabel").unwrap();
         let font = label["args"]["font"].as_str().unwrap_or("");
         // The default font is named after its bundled file, exactly as `cn add`
@@ -227,7 +237,7 @@ mod tests {
     fn text_sets_centered_when_patching() {
         let mut assets =
             vec![serde_json::json!({"name":"t","type":"TextLabel","args":{"content":"hi"}})];
-        inject_companions(&mut assets);
+        inject(&mut assets);
         let label = assets.iter().find(|v| type_norm(v) == "textlabel").unwrap();
         assert_eq!(label["args"]["centered"], true);
     }
@@ -239,7 +249,7 @@ mod tests {
             "type": "TextLabel",
             "args": {"content": "hi", "font": "myfont"}
         })];
-        inject_companions(&mut assets);
+        inject(&mut assets);
         let label = assets.iter().find(|v| type_norm(v) == "textlabel").unwrap();
         assert_eq!(label["args"]["font"].as_str().unwrap(), "myfont");
     }
@@ -250,7 +260,7 @@ mod tests {
         // vertex + fragment shader stages.
         let mut assets =
             vec![serde_json::json!({"name":"t","type":"TextLabel","args":{"content":"hi"}})];
-        inject_companions(&mut assets);
+        inject(&mut assets);
         let kinds: Vec<&str> = assets
             .iter()
             .filter(|v| type_norm(v) == "shaderstage")
@@ -269,7 +279,7 @@ mod tests {
                 "args":{"kind":"vertex","source":"custom.metal"}
             }),
         ];
-        inject_companions(&mut assets);
+        inject(&mut assets);
         let shader_count = assets
             .iter()
             .filter(|v| type_norm(v) == "shaderstage")
@@ -280,7 +290,7 @@ mod tests {
     #[test]
     fn graphics_config_injects_window() {
         let mut assets = vec![serde_json::json!({"name":"gfx","type":"GraphicsConfig","args":{}})];
-        inject_companions(&mut assets);
+        inject(&mut assets);
         assert!(assets.iter().any(|v| type_norm(v) == "window"));
     }
 
@@ -289,7 +299,7 @@ mod tests {
         // The camera controller is now a field on Camera3D, not an injected
         // system, so a bare Camera3D pulls in nothing.
         let mut assets = vec![serde_json::json!({"name":"c","type":"Camera3D","args":{}})];
-        inject_companions(&mut assets);
+        inject(&mut assets);
         assert_eq!(assets.len(), 1);
         assert!(type_norm(&assets[0]) == "camera3d");
     }

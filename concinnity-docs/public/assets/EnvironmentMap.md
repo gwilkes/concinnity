@@ -14,6 +14,13 @@ pixelates a 4K-source HDR sky, 1024 sharpens it further at 4× the size.
 **Built-in generators:** `sky` produces a procedural blue sky with a soft
 sun, useful when no HDR file is available.
 
+The sky mesh that displays the map (a skybox
+[ProceduralMesh](ProceduralMesh.md) plus its [Material](Material.md) and
+[Prop](Prop.md)) is injected at build time when the world declares no skybox
+mesh of its own. Declare an [EngineDefaults](EngineDefaults.md) with
+`"sky": false` to use the map for image-based lighting only, with the
+background left to `clear_color` or your own geometry.
+
 ```jsonl
 {"name":"env_studio","type":"EnvironmentMap","args":{"source":"assets/hdri/studio.hdr"}}
 {"name":"env_outdoor","type":"EnvironmentMap","args":{"source":"assets/hdri/sky.hdr","prefilter_face_size":512}}

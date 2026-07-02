@@ -461,9 +461,15 @@ impl World {
             .map(|cfg| crate::hud::fps_counter::FpsCounterSystem::new(cfg).into())
     }
 
-    // DebugHud: present whenever the world declares a `DebugHud`; built from that
-    // component (its developer-readout TextLabel refs).
+    // DebugHud: present whenever the world declares a `DebugHud`, but only in
+    // developer contexts. Blobs are profile-agnostic (the build injects a
+    // DebugHud into every rendering world), so the running binary is the one
+    // place its own profile is knowable: a debug build or a `cn debug` session
+    // activates the HUD, a release `cn run` leaves it inert.
     fn build_debug_hud(&self) -> Option<SystemAsset> {
+        if !(cfg!(debug_assertions) || crate::app::dev_flags::enabled()) {
+            return None;
+        }
         self.query::<crate::assets::DebugHud>()
             .next()
             .cloned()

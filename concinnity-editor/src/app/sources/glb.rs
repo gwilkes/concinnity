@@ -1,57 +1,22 @@
 // src/app/sources/glb.rs
 //
-// Renderer scaffold presets that `cn add` injects when a 3D scene target
-// (`.glb` / `.fbx`) lands in a world that has no renderer trigger yet: the
-// "bootstrap a viewable scene from one command" UX. The scene file itself is
-// expanded at build time from a single `SceneImport` asset (see
-// `concinnity_core::build::import`), so no per-format entry generation lives
-// here anymore.
+// Content template presets for `cn add <scene> --template <name>`. The
+// renderer stack itself (GraphicsConfig, Window, shader stages, menu, HUDs,
+// sky) is injected at build time from the scene's own assets, so a plain
+// scene add writes no extra lines; a template layers optional visual polish
+// on top as real, user-owned world.jsonl entries.
 //
-// To tweak the defaults a fresh scene add produces, edit this file.
+// To tweak what a template produces, edit this file.
 
-// Renderer scaffold injected when a scene add lands in a fresh (renderer-less)
-// world. GraphicsConfig triggers companion injection of the GraphicsSystem,
-// default ShaderStages (vertex + fragment + shadow), and Window. No Camera3D is
-// scaffolded so the import's framed Camera3D wins the runtime's
-// first-Camera3D query.
-pub fn scaffold() -> Vec<serde_json::Value> {
-    vec![
-        serde_json::json!({
-            "name": "scaffold_graphics",
-            "type": "GraphicsConfig",
-            "args": {
-                "clear_color": [0.05, 0.05, 0.08, 1.0],
-                "shadow_map_size": 2048,
-            }
-        }),
-        serde_json::json!({
-            "name": "ambient_light",
-            "type": "DirectionalLight",
-            "args": {
-                "color": [1.0, 0.95, 0.8],
-                "direction": [-0.3, 0.85, 0.4],
-                "intensity": 0.8,
-            }
-        }),
-    ]
-}
-
-// Aesthetic-defaults scaffold for `cn add foo.glb --template showcase`.
-// Same renderer-trigger role as `scaffold()` but layers visual polish so a
-// dropped scene lands in a richer setting: PostProcessConfig (bloom + tonemap),
-// an IBL EnvironmentMap (procedural sky generator, no .hdr needed),
-// and VolumetricFog. Shipped hardcoded for now; will move to an infra-fetched
-// template registry once there are 2+ templates that justify the indirection.
+// Aesthetic-defaults template for `cn add foo.glb --template showcase`.
+// Layers visual polish so a dropped scene lands in a richer setting: a warm
+// key light, PostProcessConfig (bloom + tonemap), an IBL EnvironmentMap
+// (procedural sky generator, no .hdr needed; the sky mesh that displays it is
+// injected at build time), and VolumetricFog. Shipped hardcoded for now; will
+// move to an infra-fetched template registry once there are 2+ templates that
+// justify the indirection.
 pub fn template_showcase() -> Vec<serde_json::Value> {
     vec![
-        serde_json::json!({
-            "name": "scaffold_graphics",
-            "type": "GraphicsConfig",
-            "args": {
-                "clear_color": [0.53, 0.71, 0.87, 1.0],
-                "shadow_map_size": 2048,
-            }
-        }),
         serde_json::json!({
             "name": "ambient_light",
             "type": "DirectionalLight",
@@ -96,17 +61,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scaffold_emits_graphics_config_and_directional_light() {
-        let entries = scaffold();
-        let types: Vec<&str> = entries
-            .iter()
-            .filter_map(|e| e.get("type").and_then(|v| v.as_str()))
-            .collect();
-        assert_eq!(types, vec!["GraphicsConfig", "DirectionalLight"]);
-    }
-
-    #[test]
-    fn template_showcase_includes_polish_assets_on_top_of_scaffold() {
+    fn template_showcase_layers_polish_assets() {
         let entries = template_showcase();
         let types: Vec<&str> = entries
             .iter()
@@ -116,7 +71,6 @@ mod tests {
         assert_eq!(
             types,
             vec![
-                "GraphicsConfig",
                 "DirectionalLight",
                 "PostProcessConfig",
                 "EnvironmentMap",

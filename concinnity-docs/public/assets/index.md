@@ -13,6 +13,7 @@
 - [DebugHud](DebugHud.md) - Requests the developer debug HUD: a set of [TextLabel](TextLabel.md) chips with diagnostic readouts, anchored to the top-right of the window and toggled with F1 (hidden by default).
 - [Decal](Decal.md) - A projected texture stamped onto whatever scene geometry sits inside the decal's oriented box.
 - [DirectionalLight](DirectionalLight.md) - An infinitely distant directional light (sun, moon, or sky fill).
+- [EngineDefaults](EngineDefaults.md) - Opts a world out of individual engine-injected defaults.
 - [EnvironmentMap](EnvironmentMap.md) - A baked lighting environment built from a Radiance HDR equirectangular source (or a built-in generator). It provides the scene's ambient image-based lighting (soft diffuse fill plus glossy reflections that follow surface roughness) and the on-screen sky.
 - [File](File.md) - References a source file by path.
 - [Font](Font.md) - Rasterises a TrueType font into a glyph atlas at build time.

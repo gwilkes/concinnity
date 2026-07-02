@@ -33,10 +33,16 @@ pub struct BlobEntry {
 // Human-readable; owned by the build, not the user
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BlobLock {
+    // Engine version the blob was built with; injected defaults come from the
+    // engine, so their content can change across versions.
+    pub engine_version: String,
     pub built_at: String,
     pub blobs: Vec<BlobEntry>,
-    pub pipeline: Vec<String>,
     pub assets: Vec<LockedAsset>,
+    // Assets the build added that have no world.jsonl line (companions and
+    // engine defaults). Each entry carries its full args so it can be copied
+    // into world.jsonl verbatim as an override.
+    pub injected: Vec<LockedInjection>,
 }
 
 // One asset as recorded in the lock file
@@ -49,6 +55,16 @@ pub struct LockedAsset {
     pub args_hash: String,
     // which blob holds this asset's payload, if any
     pub payload_blob: Option<u32>,
+}
+
+// One injected asset as recorded in the lock file
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LockedInjection {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub asset_type: String,
+    pub args: serde_json::Value,
+    pub injected_by: String,
 }
 
 // The result of a build pack: the blobs written and the path of each
@@ -142,8 +158,8 @@ impl PayloadPacker {
 
 // Lock file
 pub fn write_lock(
-    pipeline: &[&str],
     named_defs: &[(&str, &BlobAssetDef)],
+    injected: &[crate::world::InjectedAsset],
     blob_paths: &[String],
 ) -> std::io::Result<()> {
     let mut blobs = Vec::new();
@@ -175,10 +191,19 @@ pub fn write_lock(
         .collect();
 
     let lock = BlobLock {
+        engine_version: env!("CARGO_PKG_VERSION").to_string(),
         built_at: now_iso8601(),
         blobs,
-        pipeline: pipeline.iter().map(|s| s.to_string()).collect(),
         assets,
+        injected: injected
+            .iter()
+            .map(|i| LockedInjection {
+                name: i.name.clone(),
+                asset_type: i.asset_type.clone(),
+                args: i.args.clone(),
+                injected_by: i.injected_by.to_string(),
+            })
+            .collect(),
     };
 
     fs::write(LOCK_PATH, serde_json::to_string_pretty(&lock)?)

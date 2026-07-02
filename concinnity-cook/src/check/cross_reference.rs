@@ -21,8 +21,8 @@ use std::collections::HashSet;
 // to a `CrossReferenced` impl in the named asset's file.
 fn cross_refs_for(type_norm: &str, name: &str, args: &serde_json::Value) -> Vec<CrossRef> {
     use crate::assets::{
-        Decal, InstancedProp, Joint, Material, Model, ParticleEmitter, Prop, Scene, SceneReel,
-        VoxelChunk, VoxelWorld,
+        DebugHud, Decal, FpsCounter, InstancedProp, Joint, Material, Model, ParticleEmitter, Prop,
+        Scene, SceneReel, StatHud, VoxelChunk, VoxelWorld,
     };
     match type_norm {
         "prop" => Prop::cross_refs(name, args),
@@ -36,6 +36,9 @@ fn cross_refs_for(type_norm: &str, name: &str, args: &serde_json::Value) -> Vec<
         "decal" => Decal::cross_refs(name, args),
         "joint" => Joint::cross_refs(name, args),
         "particleemitter" | "particles" => ParticleEmitter::cross_refs(name, args),
+        "stathud" => StatHud::cross_refs(name, args),
+        "debughud" => DebugHud::cross_refs(name, args),
+        "fpscounter" => FpsCounter::cross_refs(name, args),
         _ => Vec::new(),
     }
 }
@@ -51,6 +54,7 @@ struct RefScope<'a> {
     scenes: HashSet<&'a str>,
     camera3ds: HashSet<&'a str>,
     block_types: HashSet<&'a str>,
+    text_labels: HashSet<&'a str>,
 }
 
 impl<'a> RefScope<'a> {
@@ -93,6 +97,7 @@ impl<'a> RefScope<'a> {
             scenes: by_type(&|t| t == "scene"),
             camera3ds: by_type(&|t| t == "camera3d"),
             block_types: by_type(&|t| t == "blocktype" || t == "block"),
+            text_labels: by_type(&|t| t == "textlabel"),
         }
     }
 
@@ -107,6 +112,7 @@ impl<'a> RefScope<'a> {
             RefKind::Scene => self.scenes.contains(name),
             RefKind::CameraShot => self.camera3ds.contains(name),
             RefKind::BlockType => self.block_types.contains(name),
+            RefKind::TextLabel => self.text_labels.contains(name),
         }
     }
 }

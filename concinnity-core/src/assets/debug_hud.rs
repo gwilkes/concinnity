@@ -4,7 +4,7 @@
 // the client crate's `hud::debug_hud`.
 
 use crate::ecs::asset_id::{AssetId, de_opt_asset_ref};
-use crate::ecs::{AssetOrigin, Component};
+use crate::ecs::{AssetOrigin, CompanionSpec, Component};
 
 /// Requests the developer debug HUD: a set of [TextLabel](#textlabel) chips
 /// with diagnostic readouts, anchored to the top-right of the window and
@@ -23,11 +23,19 @@ use crate::ecs::{AssetOrigin, Component};
 /// The always-on frame-rate and GPU-memory readouts live on the separate
 /// [StatHud](#stathud).
 ///
+/// Every rendering world receives a `DebugHud` and its chip labels at build
+/// time when it declares none, so the example below is only needed to restyle
+/// the chips. The HUD only activates in developer contexts: a debug build of
+/// the host binary, or a world launched through `cn debug`; release builds
+/// leave it inert even when declared. Declare an
+/// [EngineDefaults](#enginedefaults) with `"debug_hud": false` to remove it
+/// from the build entirely.
+///
 /// ```jsonl
 /// {"type":"Font","name":"hud_font","args":{"size_px":20}}
-/// {"type":"TextLabel","name":"mouse_chip","args":{"font":"hud_font","scale":0.7,"color":[1,1,1],"background":[0,0.22,0.08,0.85],"padding":5}}
-/// {"type":"TextLabel","name":"passes_chip","args":{"font":"hud_font","scale":0.6,"color":[1,1,1],"background":[0,0.22,0.08,0.85],"padding":5}}
-/// {"type":"TextLabel","name":"camera_chip","args":{"font":"hud_font","scale":0.6,"color":[1,1,1],"background":[0,0.22,0.08,0.85],"padding":5}}
+/// {"type":"TextLabel","name":"mouse_chip","args":{"font":"hud_font","scale":0.7,"color":[1,1,1],"background":[0,0.18,0.32,0.85],"padding":5}}
+/// {"type":"TextLabel","name":"passes_chip","args":{"font":"hud_font","scale":0.6,"color":[1,1,1],"background":[0,0.18,0.32,0.85],"padding":5}}
+/// {"type":"TextLabel","name":"camera_chip","args":{"font":"hud_font","scale":0.6,"color":[1,1,1],"background":[0,0.18,0.32,0.85],"padding":5}}
 /// {"type":"DebugHud","name":"debug_hud","args":{"passes_label":"passes_chip","mouse_label":"mouse_chip","camera_label":"camera_chip"}}
 /// ```
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -54,5 +62,27 @@ impl Component for DebugHud {
     }
     fn from_args(args: Self) -> Self {
         args
+    }
+
+    fn companions(_args: &serde_json::Value, _world: &[serde_json::Value]) -> Vec<CompanionSpec> {
+        vec![CompanionSpec {
+            name: "GraphicsConfig",
+            asset_type: "GraphicsConfig",
+            args: serde_json::json!({}),
+        }]
+    }
+}
+
+impl crate::check::cross_reference::CrossReferenced for DebugHud {
+    fn cross_refs(
+        name: &str,
+        args: &serde_json::Value,
+    ) -> Vec<crate::check::cross_reference::CrossRef> {
+        crate::check::cross_reference::label_refs(
+            "DebugHud",
+            name,
+            args,
+            &["passes_label", "mouse_label", "camera_label"],
+        )
     }
 }

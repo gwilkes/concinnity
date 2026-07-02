@@ -40,6 +40,6 @@ pub mod world;
 // concinnity-core.
 pub use pipeline::{
     PipelineResult, build_compiled, build_from_path, build_pipeline_from_str, validate_asset,
-    validate_world_jsonl,
+    validate_world_jsonl, write_build_outputs,
 };
 pub use world::prepare_world;

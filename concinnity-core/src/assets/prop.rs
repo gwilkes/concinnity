@@ -1,7 +1,7 @@
 // src/assets/prop.rs
 
 use crate::ecs::asset_id::{AssetId, de_opt_asset_ref};
-use crate::ecs::{AssetOrigin, Component};
+use crate::ecs::{AssetOrigin, CompanionSpec, Component};
 
 /// Collision volume attached to a [Prop](#prop).
 ///
@@ -204,6 +204,14 @@ impl Component for Prop {
 
     fn inject_name(&mut self, id: AssetId) {
         self.asset_id = id;
+    }
+
+    fn companions(_args: &serde_json::Value, _world: &[serde_json::Value]) -> Vec<CompanionSpec> {
+        vec![CompanionSpec {
+            name: "GraphicsConfig",
+            asset_type: "GraphicsConfig",
+            args: serde_json::json!({}),
+        }]
     }
 }
 

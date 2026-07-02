@@ -1121,9 +1121,10 @@ mod tests {
         // No MainMenu survives.
         assert!(!assets.iter().any(|v| type_norm(v) == "mainmenu"));
 
-        // The main view and a toggle binding exist.
+        // The main view and a toggle binding exist. The view starts closed by
+        // default: the scene shows first and the toggle key opens the menu.
         assert_eq!(by_name(&assets, "main_menu")["type"], "View");
-        assert_eq!(by_name(&assets, "main_menu")["args"]["initial"], true);
+        assert_eq!(by_name(&assets, "main_menu")["args"]["initial"], false);
         assert_eq!(by_name(&assets, "main_menu_toggle")["type"], "KeyBinding");
         assert_eq!(
             by_name(&assets, "main_menu_toggle")["args"]["action"],

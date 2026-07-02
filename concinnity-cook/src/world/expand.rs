@@ -4,6 +4,7 @@
 
 use super::camera_shot::expand_camera_shots;
 use super::companion::inject_companions;
+use super::defaults::inject_engine_defaults;
 use super::light_rig::expand_light_rigs;
 use super::main_menu::expand_main_menus;
 use super::material_palette::expand_material_palettes;
@@ -33,10 +34,47 @@ pub(crate) fn asset_name(v: &serde_json::Value) -> String {
         .to_string()
 }
 
-// Run all expansion passes in order. Mutates the asset list in place.
-// Returns an error only when a hard failure occurs (e.g. prefab cycle or
-// missing prefab reference).
-pub fn expand_world(assets: &mut Vec<serde_json::Value>) -> Result<(), String> {
+// One asset added to the world by an injection pass rather than authored or
+// macro-expanded. Recorded in world-lock.json so the user can see every
+// default and copy its entry into world.jsonl as an override.
+#[derive(Debug, Clone)]
+pub struct InjectedAsset {
+    pub name: String,
+    pub asset_type: String,
+    pub args: serde_json::Value,
+    // The injection pass (an EngineDefaults flag name, "companion", or
+    // "default_font"), so listings can say where a default came from.
+    pub injected_by: &'static str,
+}
+
+// What the injection passes added during one expansion run.
+#[derive(Debug, Default)]
+pub struct ExpandReport {
+    pub injected: Vec<InjectedAsset>,
+}
+
+impl ExpandReport {
+    pub(crate) fn record(
+        &mut self,
+        name: &str,
+        asset_type: &str,
+        args: serde_json::Value,
+        injected_by: &'static str,
+    ) {
+        self.injected.push(InjectedAsset {
+            name: name.to_string(),
+            asset_type: asset_type.to_string(),
+            args,
+            injected_by,
+        });
+    }
+}
+
+// Run all expansion passes in order. Mutates the asset list in place and
+// reports what the injection passes added. Returns an error only when a hard
+// failure occurs (e.g. prefab cycle or missing prefab reference).
+pub fn expand_world(assets: &mut Vec<serde_json::Value>) -> Result<ExpandReport, String> {
+    let mut report = ExpandReport::default();
     normalize_shader_types(assets);
     // Imports expand first so the assets they generate (materials, meshes,
     // props, a framed camera) flow through every later pass, including
@@ -47,10 +85,18 @@ pub fn expand_world(assets: &mut Vec<serde_json::Value>) -> Result<(), String> {
     expand_material_palettes(assets);
     expand_prefabs(assets)?;
     expand_room_textures(assets);
+    // First companion round: materialize the GraphicsConfig render marker (and
+    // its Window / ShaderStage stack) implied by everything authored or
+    // expanded above, so the defaults pass can key off "this world renders".
+    inject_companions(assets, &mut report);
+    // Engine defaults: complete a rendering world with the standard assets it
+    // does not declare (MainMenu, HUDs + chips + font, sky mesh). Runs before
+    // menu expansion so an injected MainMenu expands like an authored one.
+    inject_engine_defaults(assets, &mut report)?;
     // Menus expand to External UI assets (View / Sprite / TextLabel /
     // HitRegion / KeyBinding) that need no further expansion, but whose
     // TextLabels must still pull in their GraphicsConfig + Font companions, so
-    // this runs last, right before companion injection.
+    // this runs before the second companion round.
     expand_main_menus(assets)?;
     // Menus emit OptionSelect rows for their settings sub-view; expand those to
     // their primitives (TextLabels + HitRegion) before companion injection so
@@ -60,8 +106,10 @@ pub fn expand_world(assets: &mut Vec<serde_json::Value>) -> Result<(), String> {
     // primitives (TextLabels + Sprites + HitRegion) on the same footing, before
     // companion injection.
     expand_sliders(assets)?;
-    inject_companions(assets);
-    Ok(())
+    // Second companion round: companions for the assets the defaults and menu
+    // passes added. Idempotent for everything round one already covered.
+    inject_companions(assets, &mut report);
+    Ok(report)
 }
 
 // Load and structurally validate a world.jsonl string, then run all
@@ -72,7 +120,7 @@ pub fn expand_world_from_str(content: &str) -> std::io::Result<Vec<serde_json::V
     let mut assets = load_world(content)
         .map_err(|errs| std::io::Error::new(std::io::ErrorKind::InvalidData, errs.join("\n")))?;
 
-    expand_world(&mut assets)
+    let _ = expand_world(&mut assets)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
     Ok(assets)

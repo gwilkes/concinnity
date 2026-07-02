@@ -22,6 +22,7 @@ pub enum RefKind {
     // A camera shot target, resolves to declared `Camera3D` names.
     CameraShot,
     BlockType,
+    TextLabel,
 }
 
 // One item produced by a referencing asset's `cross_refs`.
@@ -43,4 +44,30 @@ pub enum CrossRef {
 // the asset's args; the resolver resolves each `Resolve` against the world.
 pub trait CrossReferenced {
     fn cross_refs(name: &str, args: &serde_json::Value) -> Vec<CrossRef>;
+}
+
+// Shared extractor for HUD-style assets whose args hold optional TextLabel
+// references: one `Resolve` per non-empty label field.
+pub fn label_refs(
+    asset_type: &str,
+    name: &str,
+    args: &serde_json::Value,
+    fields: &[&str],
+) -> Vec<CrossRef> {
+    let mut refs = Vec::new();
+    for field in fields {
+        let target = args.get(field).and_then(|v| v.as_str()).unwrap_or("");
+        if target.is_empty() {
+            continue;
+        }
+        refs.push(CrossRef::Resolve {
+            kind: RefKind::TextLabel,
+            target: target.to_string(),
+            error: format!(
+                "{} '{}': {} '{}' not found, add a TextLabel asset with that name",
+                asset_type, name, field, target
+            ),
+        });
+    }
+    refs
 }

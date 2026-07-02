@@ -42,3 +42,12 @@ impl Component for FpsCounter {
         args
     }
 }
+
+impl crate::check::cross_reference::CrossReferenced for FpsCounter {
+    fn cross_refs(
+        name: &str,
+        args: &serde_json::Value,
+    ) -> Vec<crate::check::cross_reference::CrossRef> {
+        crate::check::cross_reference::label_refs("FpsCounter", name, args, &["label"])
+    }
+}

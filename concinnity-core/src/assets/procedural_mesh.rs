@@ -69,7 +69,8 @@ pub struct ProceduralMesh {
     pub elevation_max: Option<f32>,
 
     // Skybox
-    /// Edge length for the `skybox` generator, in world units.
+    /// Half-extent on all axes for the `skybox` generator, in world units.
+    /// Keep it below the camera's `far` plane so the sky is not clipped.
     pub size: Option<f32>,
 
     // Extrude

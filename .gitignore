@@ -2,7 +2,7 @@
 /examples/**/assets/
 
 /world.jsonl
-/world-lock.json
+world-lock.json
 
 .build/
 .cache/

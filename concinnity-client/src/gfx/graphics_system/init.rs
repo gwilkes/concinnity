@@ -2051,62 +2051,83 @@ impl GraphicsSystem {
         // once at backend init below.
         let planar_reflection_planes = quality_ceiling.planar_reflection_planes as usize;
 
-        self.backend = init_backend(
-            &self.window_args,
+        // Assemble the backend construction inputs, derive the world's render
+        // requirements from them (a world with no 3D content drops every
+        // scene-scoped feature before any backend resource is sized), and
+        // hand the result to the compile-time-selected backend.
+        use crate::gfx::backend_init::{
+            BackendInit, MediaPayloads, PostSettings, SceneData, ShaderBytes, ShadowParams, WorldFx,
+        };
+        let mut backend_init = BackendInit {
+            window: &self.window_args,
             validation,
-            self.frames_in_flight,
-            self.vsync,
-            self.clear_color,
-            &all_vertices,
-            &all_indices,
-            draw_objects,
-            instanced_clusters,
-            // Skinned draw-object count, to size the backend's GPU-cull buffers
-            // for the merged total at init. The skinned geometry is uploaded later
-            // by `upload_skinned` (which consumes `skinned_draw_objects`).
-            skinned_draw_objects.len(),
-            // Worst-case resident chunk count, to reserve a chunk record region in
-            // the backend's GPU-cull buffers at init.
-            n_chunk_max,
-            &vert_bytes,
-            &frag_bytes,
-            &shadow_bytes,
-            &vert_instanced_bytes,
-            &texture_data,
-            &normal_map_data,
-            light_uniforms,
-            self.shadow_map_size,
-            self.shadow_update,
-            self.shadow_distance,
-            self.shadow_cascades,
-            self.anisotropy,
-            planar_reflection_planes,
-            text_atlas_data,
-            env_map_bytes.as_deref(),
-            post_process,
-            color_lut_bytes.as_deref(),
-            taa_enabled,
-            ssao_settings,
-            ssr_settings,
-            ssgi_settings,
-            rt_reflection_settings,
-            reflection_blur_scale,
-            decal_records,
-            particle_records,
-            fog_settings,
-            auto_exposure_settings,
-            auto_exposure_bias_ev,
-            hdr_display,
-            hdr_pq,
-            temporal_upscaling,
-            upscale_scale,
-            upscale_backend,
-            occlusion_two_pass,
-            water_surfaces,
-            glass_panels,
-            sdf_volumes,
+            frames_in_flight: self.frames_in_flight,
+            vsync: self.vsync,
+            clear_color: self.clear_color,
             hot_reload,
-        );
+            scene: SceneData {
+                vertices: &all_vertices,
+                indices: &all_indices,
+                draw_objects,
+                instanced_clusters,
+                // Skinned draw-object count, to size the backend's GPU-cull
+                // buffers for the merged total at init. The skinned geometry is
+                // uploaded later by `upload_skinned` (which consumes
+                // `skinned_draw_objects`).
+                n_skinned: skinned_draw_objects.len(),
+                n_chunk_max,
+            },
+            shaders: ShaderBytes {
+                vert: &vert_bytes,
+                frag: &frag_bytes,
+                shadow: &shadow_bytes,
+                vert_instanced: &vert_instanced_bytes,
+            },
+            media: MediaPayloads {
+                textures: &texture_data,
+                normal_maps: &normal_map_data,
+                text_atlases: text_atlas_data,
+                env_map_bytes: env_map_bytes.as_deref(),
+                color_lut_bytes: color_lut_bytes.as_deref(),
+            },
+            light_uniforms,
+            shadows: ShadowParams {
+                map_size: self.shadow_map_size,
+                update: self.shadow_update,
+                distance: self.shadow_distance,
+                cascades: self.shadow_cascades,
+            },
+            anisotropy: self.anisotropy,
+            planar_planes: planar_reflection_planes,
+            post: PostSettings {
+                post_process,
+                taa_enabled,
+                ssao: ssao_settings,
+                ssr: ssr_settings,
+                ssgi: ssgi_settings,
+                rt_reflections: rt_reflection_settings,
+                reflection_blur_scale,
+                auto_exposure: auto_exposure_settings,
+                auto_exposure_bias_ev,
+                hdr_display,
+                hdr_pq,
+                temporal_upscaling,
+                upscale_scale,
+                upscale_backend,
+                occlusion_two_pass,
+            },
+            fx: WorldFx {
+                decals: decal_records,
+                particles: particle_records,
+                fog: fog_settings,
+                water_surfaces,
+                glass_panels,
+                sdf_volumes,
+            },
+            requirements: Default::default(),
+        };
+        backend_init.resolve_requirements();
+        self.backend = init_backend(backend_init);
 
         if self.backend.is_none() {
             self.failed = true;

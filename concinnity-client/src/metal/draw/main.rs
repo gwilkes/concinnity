@@ -154,7 +154,9 @@ impl MtlContext {
         // descriptor's Clear load action: skip every geometry sub-path so even a
         // non-bindless skinned world (whose draw does not consult the now-empty
         // visible / instance / object inputs) renders nothing behind the menu.
-        if world_hidden {
+        // A scene-less world (no main pipeline) takes the same bare-clear shape
+        // every frame.
+        if world_hidden || self.pipeline_state.is_none() {
             return Ok(0);
         }
 
@@ -451,12 +453,17 @@ impl MtlContext {
     // binding 1). With the serial encoder this is re-applied on each
     // sub-path entry (duplicating some state writes) so the per-path
     // helpers stay shape-compatible with a future parallel-encoder retry.
+    // Returns false without touching the encoder when the world has no main
+    // pipeline (no 3D scene content); the caller then skips its draws.
     fn bind_main_pass_shared(
         &self,
         enc: &ProtocolObject<dyn objc2_metal::MTLRenderCommandEncoder>,
         view_uniforms: &ViewUniforms,
-    ) {
-        enc.setRenderPipelineState(&self.pipeline_state);
+    ) -> bool {
+        let Some(pipeline_state) = &self.pipeline_state else {
+            return false;
+        };
+        enc.setRenderPipelineState(pipeline_state);
         enc.setDepthStencilState(Some(&self.depth_state));
 
         unsafe {
@@ -513,6 +520,7 @@ impl MtlContext {
                 6,
             );
         }
+        true
     }
 
     // Encode the static-geometry sub-path: either the bindless GPU-driven
@@ -535,7 +543,10 @@ impl MtlContext {
         icb_override: Option<&ProtocolObject<dyn objc2_metal::MTLIndirectCommandBuffer>>,
     ) -> u32 {
         enc.pushDebugGroup(&objc2_foundation::NSString::from_str("main static"));
-        self.bind_main_pass_shared(enc, view_uniforms);
+        if !self.bind_main_pass_shared(enc, view_uniforms) {
+            enc.popDebugGroup();
+            return 0;
+        }
 
         let last_tex = self.textures.len().saturating_sub(1);
         let last_nm = self.normal_map_textures.len().saturating_sub(1);
@@ -616,7 +627,10 @@ impl MtlContext {
         enc.pushDebugGroup(&objc2_foundation::NSString::from_str("main instanced"));
         // Share the same view / lights / shadow / IBL / SSAO bindings as the
         // static path. The pipeline override below swaps to the instanced PSO.
-        self.bind_main_pass_shared(enc, view_uniforms);
+        if !self.bind_main_pass_shared(enc, view_uniforms) {
+            enc.popDebugGroup();
+            return 0;
+        }
         enc.setRenderPipelineState(&inst_ps);
 
         let last_tex = self.textures.len().saturating_sub(1);
@@ -644,7 +658,9 @@ impl MtlContext {
 
         // Restore the regular pipeline state so a future addition to the
         // main pass starts from the same shape the static path left it in.
-        enc.setRenderPipelineState(&self.pipeline_state);
+        if let Some(pipeline_state) = &self.pipeline_state {
+            enc.setRenderPipelineState(pipeline_state);
+        }
         enc.popDebugGroup();
         draw_calls
     }
@@ -678,7 +694,10 @@ impl MtlContext {
             return 0;
         }
         enc.pushDebugGroup(&objc2_foundation::NSString::from_str("main skinned"));
-        self.bind_main_pass_shared(enc, view_uniforms);
+        if !self.bind_main_pass_shared(enc, view_uniforms) {
+            enc.popDebugGroup();
+            return 0;
+        }
         enc.setRenderPipelineState(&skinned_ps);
         unsafe {
             enc.setVertexBuffer_offset_atIndex(Some(&svb), 0, 1);

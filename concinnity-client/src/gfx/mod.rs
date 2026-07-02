@@ -26,6 +26,9 @@ pub(crate) use concinnity_core::gfx::{chunk_coord, range_alloc};
 // `AnimationSystem` setter API.
 pub mod animation;
 pub mod backend;
+// Grouped backend-constructor inputs + the render-requirements derivation
+// that trims scene-scoped features for worlds with no 3D content.
+pub mod backend_init;
 pub(crate) mod bvh;
 // Generic Send/Sync shim shared by the three backends' parallel-encode fan-outs.
 pub(crate) mod parallel_ctx;

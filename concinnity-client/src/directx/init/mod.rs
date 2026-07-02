@@ -50,188 +50,97 @@ mod window;
 // so the heap layout stays anchored even when the window resizes.
 pub(in crate::directx) const HIZ_MAX_MIPS: usize = 15;
 
-#[allow(clippy::too_many_arguments)]
 impl DxContext {
-    pub fn new(
-        title: &str,
-        width: u32,
-        height: u32,
-        validation: bool,
-        _frames_in_flight: usize, // we always use FRAMES=3 for D3D12
-        vsync: bool,
-        clear_color: [f32; 4],
-        vertices: &[Vertex],
-        indices: &[u32],
-        draw_objects: Vec<DrawObject>,
-        instanced_clusters: Vec<InstancedCluster>,
-        // Skinned draw-object count, threaded purely to size the shared cull /
-        // object / draw-args / indirect buffers for the merged total at init
-        // (`n_objects + n_instances + n_skinned`); the skinned geometry itself is
-        // uploaded later by `upload_skinned`, which sets the live `self.n_skinned`.
-        // 0 when the world has no skinned meshes.
-        n_skinned: usize,
-        // Worst-case resident chunk count for a streaming VoxelWorld (0 otherwise).
-        // Reserves a chunk record region in the shared cull buffers at init
-        // (`[n_objects + n_instances, +n_chunk_max)`); resident chunks fold into
-        // the indirect path each frame. Sets the live `self.n_chunk`.
-        n_chunk_max: usize,
-        vert_bytes: &[u8],
-        frag_bytes: &[u8],
-        shadow_bytes: &[u8],
-        vert_instanced_bytes: &[u8],
-        textures: &[(u32, u32, Vec<u8>)],
-        normal_maps: &[(u32, u32, Vec<u8>)],
-        light_uniforms: LightUniforms,
-        shadow_map_size: u32,
-        // Shadow-cascade re-render policy: hybrid amortizes the far cascades
-        // across frames, every_frame refreshes all cascades every frame.
-        shadow_update: crate::assets::ShadowUpdate,
-        // Shadow distance (GraphicsConfig.shadow_distance, world units). The
-        // per-frame cascade split reads it, capped at the camera far plane.
-        shadow_distance: u32,
-        // Shadow cascade count (GraphicsConfig.shadow_cascades, 1..=4). The
-        // per-frame split + schedule read it; applies at the next launch.
-        shadow_cascades: u32,
-        // Scene-sampler max anisotropy (GraphicsConfig.anisotropy), clamped to the
-        // D3D12 1..16 range where the sampler is built below.
-        anisotropy: u32,
-        // Distinct planar-reflection plane budget from the quality preset / GPU tier
-        // ceiling. Passed to `assign_planar_slots` below (clamped to the capacity
-        // ceiling); panes past it fall back to the probe cube. Restart-required.
-        planar_planes: usize,
-        text_atlases: Vec<(u32, u32, Vec<u8>)>,
-        // Serialised EnvironmentMap payload (irradiance + prefilter cubemaps).
-        // None disables IBL; the runtime binds 1×1 grey fallback cubes and
-        // sets ViewUniforms::prefilter_mip_count to 0 so the shader falls
-        // back to the legacy ambient/skybox path.
-        env_map_bytes: Option<&[u8]>,
-        // Post-process tunables. `bloom_intensity` / `bloom_threshold` /
-        // `bloom_knee` drive the bloom chain; `exposure` / `vignette` /
-        // `lut_strength` feed the composite pass.
-        post_process: crate::gfx::render_types::PostProcessParams,
-        // Serialised ColorLut payload (3D grading LUT) baked into the composite
-        // pass. `None` binds a 2×2×2 identity LUT, so the grade is a no-op at
-        // any `lut_strength`.
-        color_lut_bytes: Option<&[u8]>,
-        // Temporal anti-aliasing toggle (resolved from `PostProcessConfig.aa_mode`).
-        // When set, the renderer jitters the projection, runs a velocity
-        // pre-pass + a history-resolve pass, and feeds the resolved image to
-        // the bloom + composite passes.
-        taa_enabled: bool,
-        // SSAO (GTAO) settings. When `Some`, the renderer runs a depth +
-        // normal pre-pass, the GTAO horizon-search kernel, and a depth-aware
-        // blur; the main pass then samples the blurred occlusion to modulate
-        // its ambient term. `None` skips every SSAO pass and binds a 1x1
-        // white fallback so the ambient multiplier is a constant 1.0.
-        ssao_settings: Option<crate::gfx::ssao::SsaoSettings>,
-        // SSR settings. When `Some`, the renderer runs a depth + normal +
-        // roughness pre-pass and a fullscreen ray-march resolve; the resolve
-        // output then replaces `hdr_resolve` as the scene colour the TAA /
-        // bloom / composite passes consume. `None` skips every SSR pass and
-        // the post stack samples `hdr_resolve` directly.
-        ssr_settings: Option<crate::gfx::ssr::SsrSettings>,
-        // SSGI settings. When `Some`, the renderer runs the SSR depth + normal
-        // pre-pass (forced on so the gather has a G-buffer, even when SSR
-        // resolve is off) plus a hemisphere-gather + depth-aware-blur composite
-        // that additively bleeds nearby lit surfaces' colour onto one another
-        // on top of the IBL ambient. `None` skips the SSGI pass entirely.
-        ssgi_settings: Option<crate::gfx::ssgi::SsgiSettings>,
-        // Hardware ray-traced-reflection settings. `Some` only when the world
-        // authored `ray_traced_reflections`. When present AND the GPU supports
-        // the DXR tier, the renderer builds the scene acceleration structure +
-        // the inline-`RayQuery` reflection pass (forcing the SSR pre-pass
-        // G-buffer on, like SSGI) and the frame graph runs `RtReflections` in
-        // the `SsrResolve` slot. Any failure (no DXR, DXC absent, build error)
-        // falls back to SSR. Reuses the SSR `intensity` / `max_distance` knobs.
-        rt_reflection_settings: Option<crate::gfx::rt_reflections::RtReflectionSettings>,
-        // Per-axis divisor for the roughness-aware reflection blur target,
-        // resolved from `PostProcessConfig.reflection_blur_resolution`. The
-        // reflection composite sizes its reduced-resolution blur target at
-        // render-resolution / this; `Half` (=2) is the default and matches the
-        // historical hardcoded scale.
-        reflection_blur_scale: u32,
-        // Authored projected decals resolved from the world's `Decal`
-        // components. The decal pipeline + unit-cube buffers are always built
-        // (so runtime `add_decal` works from an empty world); the encoder
-        // simply skips when every slot is `None`.
-        decals: Vec<crate::gfx::decal::DecalRecord>,
-        // Particle-emitter records resolved from the world's
-        // `ParticleEmitter` components. The compute + render pipelines and the
-        // per-emitter GPU pool buffers are built only when at least one
-        // emitter is declared (or when runtime `add_emitter` fires); the
-        // encoder skips the passes when `particle_resources` is `None`.
-        particles: Vec<crate::gfx::particles::ParticleEmitterRecord>,
-        // Volumetric-fog settings resolved from the world's `VolumetricFog`.
-        // `Some` builds the fog pipeline + per-frame uniform ring; `None`
-        // skips the fog pass entirely.
-        fog_settings: Option<crate::gfx::volumetric_fog::FogSettings>,
-        // Auto-exposure settings resolved from `PostProcessConfig`. `Some`
-        // builds the histogram + average compute pipelines and drives the EMA;
-        // `None` disables auto-exposure entirely (the authored `exposure_ev`
-        // remains the only input to `post_process.exposure`).
-        auto_exposure_settings: Option<crate::gfx::auto_exposure::AutoExposureSettings>,
-        // Authored `exposure_ev` carried through as a bias on the adapted EV
-        // when auto-exposure is on; ignored when it is off.
-        auto_exposure_bias_ev: f32,
-        // World-side HDR display request from `PostProcessConfig.hdr_display`.
-        // When `true` and the active adapter reports an HDR-capable output, the
-        // swapchain is created in `RGBA16Float` + scRGB-linear colour space and
-        // the composite shader's `hdr_output` branch skips ACES + gamma + FXAA
-        // + LUT, emitting linear extended-range values directly. When `false`
-        // or the panel reports no EDR headroom, the renderer stays on the SDR
-        // path (BGRA8Unorm + ACES tonemap chain) and the request is logged.
-        hdr_display: bool,
-        // PQ-encoded HDR output request from `PostProcessConfig.hdr_pq`.
-        // When `true` and `hdr_display` resolves on AND the swapchain
-        // advertises `DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020`, the
-        // swapchain is created in that colour space and the composite
-        // shader emits SMPTE ST 2084 PQ-encoded values directly (SDR
-        // reference white = 203 nits per BT.2408). When the swapchain
-        // does not advertise HDR10 PQ but does advertise scRGB linear,
-        // the renderer falls back to extended-linear output with a
-        // warning. Mirrors the Metal `kCGColorSpaceDisplayP3_PQ` path.
-        hdr_pq: bool,
-        // Temporal upscaling toggle from `PostProcessConfig.temporal_upscaling`.
-        // When on AND the FFX SDK (`amd_fidelityfx_dx12.dll`) loads
-        // successfully, the engine builds an FSR3 upscaler that runs
-        // between the post-SSR scene and the bloom + composite stack. The
-        // scene renders at `output * upscale_scale` and FSR reconstructs the
-        // drawable resolution.
-        temporal_upscaling: bool,
-        // Per-axis input-to-output ratio from `PostProcessConfig.upscale_quality`.
-        // Threaded through to the FSR3 upscaler when `temporal_upscaling`
-        // is on; it sizes the off-screen scene targets at
-        // `output * upscale_scale`. Ignored when upscaling is off.
-        upscale_scale: f32,
-        // `PostProcessConfig.upscale_backend`. Selects the temporal-upscaling
-        // backend (auto / fsr3 / dlss / xess); resolved against runtime
-        // availability by `build_upscaler`, falling back when the requested one
-        // is unavailable. Only consumed when `temporal_upscaling` is on.
-        upscale_backend: crate::assets::UpscalerBackend,
-        // `PostProcessConfig.occlusion_two_pass`. When set (and the bindless
-        // GPU-cull path is active), the renderer builds the phase-2 cull
-        // pipeline + second indirect buffers and the frame graph inserts the
-        // HizBuild / Cull2 / Main2 chain that re-tests phase-1-occluded objects
-        // against a mid-frame-rebuilt Hi-Z pyramid.
-        occlusion_two_pass: bool,
-        // Raymarched SDF volumes drained from the world's `SdfVolume`
-        // components, paired with their compiled-payload fragment shader
-        // source bytes + asset label. Each entry is filtered at init:
-        // `.hlsl` payloads compile + render, `.metal` (Metal-first) ones
-        // are skipped with a logged warning and the rest of the world
-        // renders unchanged.
-        sdf_volumes: Vec<(crate::assets::SdfVolume, Vec<u8>, String)>,
-        // Translucent glass panels drained from the world's `GlassPanel`
-        // components. Each becomes one back-to-front-sorted draw in the shared
-        // transparent pass. Empty leaves `glass` None and the pass skipped.
-        glass_panels: Vec<crate::assets::GlassPanel>,
-        // True only under `cn debug` (set via `crate::app::dev_flags`). Routes
-        // every built-in shader compile through the disk-first
-        // `shader_source` helper and spawns the `directx/shaders/` filesystem
-        // watcher. `cn run` leaves it false; the baked-in include_str! sources
-        // continue to drive every pipeline.
-        hot_reload: bool,
-    ) -> Result<Self, String> {
+    // Construct from the assembled backend inputs (see
+    // `crate::gfx::backend_init::BackendInit` for per-field docs); the
+    // DirectX-specific behaviour of each input is documented inline below.
+    pub fn new(init: crate::gfx::backend_init::BackendInit<'_>) -> Result<Self, String> {
+        use crate::gfx::backend_init::{
+            BackendInit, MediaPayloads, PostSettings, SceneData, ShaderBytes, ShadowParams, WorldFx,
+        };
+        let BackendInit {
+            window,
+            validation,
+            // We always use FRAMES=3 for D3D12.
+            frames_in_flight: _,
+            vsync,
+            clear_color,
+            hot_reload,
+            scene:
+                SceneData {
+                    vertices,
+                    indices,
+                    draw_objects,
+                    instanced_clusters,
+                    // Skinned draw-object count, threaded purely to size the
+                    // shared cull / object / draw-args / indirect buffers for the
+                    // merged total at init (`n_objects + n_instances +
+                    // n_skinned`); the skinned geometry itself is uploaded later
+                    // by `upload_skinned`, which sets the live `self.n_skinned`.
+                    n_skinned,
+                    // Reserves a chunk record region in the shared cull buffers
+                    // at init (`[n_objects + n_instances, +n_chunk_max)`);
+                    // resident chunks fold into the indirect path each frame.
+                    // Sets the live `self.n_chunk`.
+                    n_chunk_max,
+                },
+            shaders:
+                ShaderBytes {
+                    vert: vert_bytes,
+                    frag: frag_bytes,
+                    shadow: shadow_bytes,
+                    vert_instanced: vert_instanced_bytes,
+                },
+            media:
+                MediaPayloads {
+                    textures,
+                    normal_maps,
+                    text_atlases,
+                    env_map_bytes,
+                    color_lut_bytes,
+                },
+            light_uniforms,
+            shadows:
+                ShadowParams {
+                    map_size: shadow_map_size,
+                    update: shadow_update,
+                    distance: shadow_distance,
+                    cascades: shadow_cascades,
+                },
+            // Clamped to the D3D12 1..16 range where the sampler is built below.
+            anisotropy,
+            planar_planes,
+            post:
+                PostSettings {
+                    post_process,
+                    taa_enabled,
+                    ssao: ssao_settings,
+                    ssr: ssr_settings,
+                    ssgi: ssgi_settings,
+                    rt_reflections: rt_reflection_settings,
+                    reflection_blur_scale,
+                    auto_exposure: auto_exposure_settings,
+                    auto_exposure_bias_ev,
+                    hdr_display,
+                    hdr_pq,
+                    temporal_upscaling,
+                    upscale_scale,
+                    upscale_backend,
+                    occlusion_two_pass,
+                },
+            fx:
+                WorldFx {
+                    decals,
+                    particles,
+                    fog: fog_settings,
+                    // The DirectX water port is still open.
+                    water_surfaces: _,
+                    glass_panels,
+                    sdf_volumes,
+                },
+            requirements: _,
+        } = init;
+        let (title, width, height) = (window.title.as_str(), window.width, window.height);
         // Record this (main) thread so the `RenderBackend` mutation entry
         // points can `debug_assert_main_thread` against it; the Send invariant
         // rests on the context being touched from this thread alone.

@@ -8,7 +8,6 @@ use std::ffi::{CStr, CString, c_char};
 use ash::vk;
 use ash::vk::Handle;
 
-use crate::gfx::mesh_payload::Vertex;
 use crate::gfx::render_types::*;
 
 use super::context::*;
@@ -28,176 +27,98 @@ use super::texture::{self, *};
 
 //  Construction
 
-#[allow(clippy::too_many_arguments)]
 impl VkContext {
-    pub fn new(
-        title: &str,
-        width: u32,
-        height: u32,
-        validation: bool,
-        frames_in_flight: usize,
-        vsync: bool,
-        clear_color: [f32; 4],
-        vertices: &[Vertex],
-        indices: &[u32],
-        draw_objects: Vec<DrawObject>,
-        instanced_clusters: Vec<InstancedCluster>,
-        // Skinned draw-object count, threaded to size the shared GPU-cull buffers'
-        // reserved skinned tail at init (`n_objects + n_instances + n_skinned`).
-        // The skinned geometry is uploaded later by `upload_skinned`, which sets
-        // the live `self.n_skinned`; this only reserves capacity.
-        n_skinned: usize,
-        // Worst-case resident chunk count for a streaming VoxelWorld (0 otherwise).
-        // Reserves a chunk record region in the shared cull buffers at init
-        // (`[n_objects + n_instances, +n_chunk_max)`); resident chunks fold into the
-        // indirect path each frame. Sets the live `self.n_chunk`.
-        n_chunk_max: usize,
-        vert_bytes: &[u8],
-        frag_bytes: &[u8],
-        shadow_bytes: &[u8],
-        vert_instanced_bytes: &[u8],
-        textures: &[(u32, u32, Vec<u8>)],
-        normal_maps: &[(u32, u32, Vec<u8>)],
-        light_uniforms: LightUniforms,
-        shadow_map_size: u32,
-        // Shadow-cascade re-render policy: hybrid amortizes the far cascades
-        // across frames, every_frame refreshes all cascades every frame.
-        shadow_update: crate::assets::ShadowUpdate,
-        // Shadow distance (GraphicsConfig.shadow_distance, world units). The
-        // per-frame cascade split reads it, capped at the camera far plane.
-        shadow_distance: u32,
-        // Shadow cascade count (GraphicsConfig.shadow_cascades, 1..=4). The
-        // per-frame split + schedule read it; applies at the next launch.
-        shadow_cascades: u32,
-        // Scene-sampler max anisotropy (GraphicsConfig.anisotropy), clamped to the
-        // device limit where the sampler is built below.
-        anisotropy: u32,
-        // Distinct planar-reflection plane budget from the quality preset / GPU tier
-        // ceiling. Passed to `assign_planar_slots` below (clamped to the capacity
-        // ceiling); panes past it fall back to the probe cube. Restart-required.
-        planar_planes: usize,
-        text_atlases: Vec<(u32, u32, Vec<u8>)>,
-        // Serialised `EnvironmentMap` payload; `None` binds 1×1 grey fallback
-        // cubes and disables IBL via `prefilter_mip_count = 0`.
-        env_map_bytes: Option<&[u8]>,
-        // Post-process tunables. `bloom_intensity` / `bloom_threshold` /
-        // `bloom_knee` drive the bloom chain; `exposure` / `vignette` /
-        // `lut_strength` feed the composite pass.
-        mut post_process: crate::gfx::render_types::PostProcessParams,
-        // Serialised `ColorLut` payload (3D grading LUT) baked into the
-        // composite pass. `None` binds a 2x2x2 identity LUT, so the grade is a
-        // no-op at any `lut_strength`.
-        color_lut_bytes: Option<&[u8]>,
-        // Temporal anti-aliasing toggle, resolved from `PostProcessConfig.aa_mode`.
-        // When set, a velocity pre-pass + history-resolve pass run and the
-        // projection is sub-pixel jittered; when false all of that is skipped.
-        taa_enabled: bool,
-        // SSAO (GTAO) settings. `Some` builds the pre-pass + kernel + blur
-        // pipelines and a per-frame VP UBO; the main pass then samples the
-        // blurred occlusion at set 0 binding 6 to modulate its ambient term.
-        // `None` skips SSAO entirely and a 1×1 white fallback is bound at
-        // binding 6 so the multiplier collapses to a pass-through.
-        ssao_settings: Option<crate::gfx::ssao::SsaoSettings>,
-        // SSR settings. `Some` builds the depth + normal + roughness pre-pass
-        // and the fullscreen ray-march resolve; the resolve output then
-        // replaces the raw HDR resolve as the scene the bloom / composite /
-        // TAA passes consume (`scene_view_for_post`). `None` skips SSR.
-        ssr_settings: Option<crate::gfx::ssr::SsrSettings>,
-        // SSGI settings. `Some` (the world selected `indirect_lighting: ssgi`)
-        // builds the hemisphere-gather + depth-aware-blur GI pass, which reuses
-        // the SSR depth + normal pre-pass G-buffer. Turning SSGI on therefore
-        // forces that pre-pass to be built even when the SSR resolve is off.
-        // `None` leaves the indirect-diffuse term as the IBL ambient alone.
-        ssgi_settings: Option<crate::gfx::ssgi::SsgiSettings>,
-        // Hardware ray-traced reflection settings from `PostProcessConfig`.
-        // `Some` (the world set `ray_traced_reflections: true`) builds the scene
-        // acceleration structure + the inline `rayQueryEXT` reflection pass when
-        // the GPU exposes the ray-query extensions; the pass then replaces the
-        // SSR resolve in the frame graph (it reuses the SSR depth + normal + roughness
-        // pre-pass G-buffer, so that pre-pass is forced on like SSGI). `None`, an
-        // unsupported GPU, or any build failure leaves RT off and SSR remains the
-        // fallback. Mirrors the DirectX / Metal `rt_reflection_settings`.
-        rt_settings: Option<crate::gfx::rt_reflections::RtReflectionSettings>,
-        // Per-axis render-resolution divisor for the reflection composite's roughness
-        // blur target, resolved from `PostProcessConfig.reflection_blur_resolution`
-        // (Half=2 default). The blur is low-frequency so running it reduced and
-        // bilinear-upsampling in the composite is visually free.
-        reflection_blur_scale: u32,
-        // Authored projected decals resolved from the world's `Decal`
-        // components. The decal pipeline + per-frame uniforms are always
-        // built (so runtime `add_decal` works from an empty world); the
-        // encoder simply skips when every slot is `None`.
-        decals: Vec<crate::gfx::decal::DecalRecord>,
-        // Authored particle emitters resolved from the world's
-        // `ParticleEmitter` components. The compute + render pipelines and
-        // per-emitter GPU pool buffers are built only when at least one
-        // emitter is declared (or when runtime `add_particle_emitter`
-        // fires); the encoder skips the passes when `particle_resources`
-        // is `None`. Mirrors `directx/init/mod.rs`.
-        particles: Vec<crate::gfx::particles::ParticleEmitterRecord>,
-        // Volumetric-fog settings resolved from the world's `VolumetricFog`.
-        // `Some` builds the fog pipeline + per-frame uniform ring; `None`
-        // skips the fog pass entirely.
-        fog_settings: Option<crate::gfx::volumetric_fog::FogSettings>,
-        // Auto-exposure settings resolved from `PostProcessConfig`. `Some`
-        // builds the histogram + average compute pipelines and drives the
-        // EMA; `None` disables auto-exposure entirely (the authored
-        // `exposure_ev` remains the only input to `post_process.exposure`).
-        auto_exposure_settings: Option<crate::gfx::auto_exposure::AutoExposureSettings>,
-        // Authored `exposure_ev` carried through as a bias on the adapted
-        // EV when auto-exposure is on; ignored when it is off.
-        auto_exposure_bias_ev: f32,
-        // World-side HDR display request from `PostProcessConfig.hdr_display`.
-        // When true, the constructor enables `VK_EXT_swapchain_colorspace`
-        // (instance extension; gated on availability) and probes the surface
-        // for `R16G16B16A16_SFLOAT` + `VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT`.
-        // If found, the swapchain runs in scRGB linear and the composite
-        // shader's `hdr_output > 0.5` branch lights up; otherwise the
-        // request falls back to SDR with a logged warning. Mirrors
-        // `DxContext::new`'s `hdr_display`.
-        hdr_display: bool,
-        // PQ-encoded HDR output request from `PostProcessConfig.hdr_pq`. Honoured
-        // only when `hdr_display` also resolves on AND the surface advertises an
-        // `HDR10_ST2084_EXT` colour-space pair: the swapchain is then created in
-        // that colour space and the composite shader PQ-encodes (SMPTE ST 2084)
-        // in-shader. When PQ is unavailable the renderer falls back to the
-        // scRGB-linear extended-range path. Mirrors `DxContext::new`.
-        hdr_pq: bool,
-        // Temporal upscaling toggle from `PostProcessConfig.temporal_upscaling`.
-        // When on (and the FFX VK runtime loads), the scene renders at the
-        // reduced `render_extent` and an FSR pass reconstructs the swapchain
-        // resolution; falls back to native rendering when FFX is unavailable.
-        temporal_upscaling: bool,
-        // Per-axis input-to-output ratio from `PostProcessConfig.upscale_quality`
-        // (e.g. 2/3 Quality, 0.5 Performance). Drives the `render_extent` split
-        // when `temporal_upscaling` is on.
-        upscale_scale: f32,
-        // Upscaler backend selector from `PostProcessConfig.upscale_backend`.
-        // Only FSR is available on Vulkan (DLSS / XeSS are DirectX-only); a
-        // DX-only request logs a note and uses FSR.
-        upscale_backend: crate::assets::UpscalerBackend,
-        // Two-pass Hi-Z occlusion toggle from `PostProcessConfig.occlusion_two_pass`.
-        // When set (and the bindless GPU-cull path is active), the constructor
-        // builds the phase-2 cull pipeline + second indirect buffers + the
-        // phase-1/phase-2 main render passes, and the frame graph inserts
-        // HizBuild -> Cull2 -> Main2 after Main. Inert without bindless cull.
-        occlusion_two_pass: bool,
-        // Raymarched SDF volumes drained from the world's `SdfVolume`
-        // components, paired with their compiled-payload fragment shader source
-        // bytes + asset label. `.glsl` payloads build a per-volume raymarch
-        // pipeline; `.metal` / `.hlsl` SDFs are skipped with a warning.
-        sdf_volumes: Vec<(crate::assets::SdfVolume, Vec<u8>, String)>,
-        // Translucent glass panels drained from the world's `GlassPanel`
-        // components. Each becomes one back-to-front-sorted draw in the shared
-        // transparent pass. Empty leaves `glass` None and the pass skipped.
-        glass_panels: Vec<crate::assets::GlassPanel>,
-        // True only under `cn debug` (set via `crate::app::dev_flags`).
-        // Routes every built-in shader compile through the disk-first
-        // `shader_source` helper and spawns the `vulkan/shaders/`
-        // filesystem watcher. `cn run` leaves it false; the
-        // include_str!-baked GLSL sources continue to drive every pipeline.
-        hot_reload: bool,
-    ) -> Result<Self, String> {
+    // Construct from the assembled backend inputs (see
+    // `crate::gfx::backend_init::BackendInit` for per-field docs); the
+    // Vulkan-specific behaviour of each input is documented inline below.
+    pub fn new(init: crate::gfx::backend_init::BackendInit<'_>) -> Result<Self, String> {
+        use crate::gfx::backend_init::{
+            BackendInit, MediaPayloads, PostSettings, SceneData, ShaderBytes, ShadowParams, WorldFx,
+        };
+        let BackendInit {
+            window,
+            validation,
+            frames_in_flight,
+            vsync,
+            clear_color,
+            hot_reload,
+            scene:
+                SceneData {
+                    vertices,
+                    indices,
+                    draw_objects,
+                    instanced_clusters,
+                    // Skinned draw-object count, threaded to size the shared
+                    // GPU-cull buffers' reserved skinned tail at init
+                    // (`n_objects + n_instances + n_skinned`). The skinned
+                    // geometry is uploaded later by `upload_skinned`, which sets
+                    // the live `self.n_skinned`; this only reserves capacity.
+                    n_skinned,
+                    // Reserves a chunk record region in the shared cull buffers
+                    // at init (`[n_objects + n_instances, +n_chunk_max)`);
+                    // resident chunks fold into the indirect path each frame.
+                    // Sets the live `self.n_chunk`.
+                    n_chunk_max,
+                },
+            shaders:
+                ShaderBytes {
+                    vert: vert_bytes,
+                    frag: frag_bytes,
+                    shadow: shadow_bytes,
+                    vert_instanced: vert_instanced_bytes,
+                },
+            media:
+                MediaPayloads {
+                    textures,
+                    normal_maps,
+                    text_atlases,
+                    env_map_bytes,
+                    color_lut_bytes,
+                },
+            light_uniforms,
+            shadows:
+                ShadowParams {
+                    map_size: shadow_map_size,
+                    update: shadow_update,
+                    distance: shadow_distance,
+                    cascades: shadow_cascades,
+                },
+            // Clamped to the device limit where the sampler is built below.
+            anisotropy,
+            planar_planes,
+            post:
+                PostSettings {
+                    mut post_process,
+                    taa_enabled,
+                    ssao: ssao_settings,
+                    ssr: ssr_settings,
+                    ssgi: ssgi_settings,
+                    rt_reflections: rt_settings,
+                    reflection_blur_scale,
+                    auto_exposure: auto_exposure_settings,
+                    auto_exposure_bias_ev,
+                    hdr_display,
+                    hdr_pq,
+                    temporal_upscaling,
+                    upscale_scale,
+                    // Only FSR is available on Vulkan (DLSS / XeSS are
+                    // DirectX-only); a DX-only request logs a note and uses FSR.
+                    upscale_backend,
+                    occlusion_two_pass,
+                },
+            fx:
+                WorldFx {
+                    decals,
+                    particles,
+                    fog: fog_settings,
+                    // The Vulkan water port is still open.
+                    water_surfaces: _,
+                    glass_panels,
+                    sdf_volumes,
+                },
+            requirements: _,
+        } = init;
+        let (title, width, height) = (window.title.as_str(), window.width, window.height);
         // Record this (main) thread so the `RenderBackend` mutation entry points
         // can `debug_assert_main_thread` against it; the Send invariant rests on
         // the context being touched from this thread alone.
@@ -1237,20 +1158,10 @@ impl VkContext {
             )?;
             (Some(pl), fbs)
         } else {
-            // No shadow pipeline: per-frame DEPTH_STENCIL→SHADER_READ_ONLY
-            // transition in draw.rs is skipped, so move the (1×1 fallback)
-            // shadow_map into the layout the main-pass descriptor expects.
-            one_shot_submit(&device, command_pool, graphics_queue, |cmd| {
-                transition_image_layout_array(
-                    &device,
-                    cmd,
-                    shadow_map.image,
-                    vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                    vk::ImageAspectFlags::DEPTH,
-                    1,
-                );
-            })?;
+            // No shadow pipeline: no transition needed. create_shadow_map_array
+            // already rests the (1x1 fallback) shadow_map in SHADER_READ_ONLY,
+            // the layout the main-pass descriptor expects, and with no shadow
+            // loop nothing ever moves it out of that layout.
             (None, Vec::new())
         };
 

@@ -628,7 +628,10 @@ impl MtlContext {
             hdr_sample_count: super::context::HDR_SAMPLE_COUNT,
             bindless_cull_enabled: object_buffer.is_some() && cull_draw_args.is_some(),
             auto_exposure_enabled: self.auto_exposure.pipelines.is_some(),
-            bloom_enabled: self.post_process.bloom_intensity > 0.0,
+            // Gated on the pipelines existing: a scene-less world builds none
+            // (its 1x1 bloom targets stay untouched black).
+            bloom_enabled: self.post_process.bloom_intensity > 0.0
+                && self.bloom_pipelines.is_some(),
             // Velocity runs whenever its targets exist: that's TAA on or
             // the upscaler on. The graph builder adds the Velocity pass
             // when this flag is true; TaaResolve / Upscale then declare a

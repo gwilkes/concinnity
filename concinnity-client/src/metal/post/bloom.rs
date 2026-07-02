@@ -147,6 +147,11 @@ impl MtlContext {
         cmd_buf: &ProtocolObject<dyn objc2_metal::MTLCommandBuffer>,
         scene_color: &ProtocolObject<dyn objc2_metal::MTLTexture>,
     ) -> Result<u32, String> {
+        // Scene-less worlds build no bloom pipelines and the graph never
+        // inserts the Bloom pass, so this is a defensive no-op there.
+        let Some(bloom_pipelines) = &self.bloom_pipelines else {
+            return Ok(0);
+        };
         let mips = &self.bloom_targets.mips;
         let n = mips.len();
 
@@ -165,7 +170,7 @@ impl MtlContext {
             mips[0].as_ref(),
             MTLLoadAction::DontCare,
             prefilter_timer,
-            &self.bloom_pipelines.prefilter,
+            &bloom_pipelines.prefilter,
             "bloom prefilter",
             |enc| unsafe {
                 enc.setFragmentTexture_atIndex(Some(scene_color), 0);
@@ -185,7 +190,7 @@ impl MtlContext {
                 mips[i].as_ref(),
                 MTLLoadAction::DontCare,
                 PassTimer::None,
-                &self.bloom_pipelines.downsample,
+                &bloom_pipelines.downsample,
                 "bloom downsample",
                 |enc| unsafe {
                     enc.setFragmentTexture_atIndex(Some(mips[i - 1].as_ref()), 0);
@@ -209,7 +214,7 @@ impl MtlContext {
                 mips[i].as_ref(),
                 MTLLoadAction::Load,
                 timer,
-                &self.bloom_pipelines.upsample,
+                &bloom_pipelines.upsample,
                 "bloom upsample",
                 |enc| unsafe {
                     enc.setFragmentTexture_atIndex(Some(mips[i + 1].as_ref()), 0);

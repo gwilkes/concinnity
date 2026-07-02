@@ -229,7 +229,10 @@ impl MtlContext {
         // any compile error leaves the running session rendering with the
         // previous shader source.
         let post = build_post_pipeline(device, self.swap_pixel_format, hr)?;
-        let bloom = build_bloom_pipelines(device, hr)?;
+        let bloom = rebuild_if_live!(
+            self.bloom_pipelines.is_some(),
+            build_bloom_pipelines(device, hr)
+        );
 
         let text = rebuild_if_live!(
             self.text_pipeline_state.is_some(),
@@ -373,7 +376,9 @@ impl MtlContext {
         // point the next frame's draw calls bind the freshly compiled
         // pipelines.
         self.post_pipeline_state = post;
-        self.bloom_pipelines = bloom;
+        if let Some(b) = bloom {
+            self.bloom_pipelines = Some(b);
+        }
         if let Some(p) = text {
             self.text_pipeline_state = Some(p);
         }
@@ -511,14 +516,20 @@ impl MtlContext {
 
         // Build everything into temporaries first. Any `?` early-return
         // leaves the live pipelines untouched, mirroring `reload_shaders`.
+        // A scene-less world never built a main pipeline; there is nothing
+        // for the fresh world-shader bytes to replace.
         let vert_desc = make_vertex_descriptor();
-        let new_main = build_main_pipeline(
-            &self.device,
-            &vert_desc,
-            vert_bytes,
-            frag_bytes,
-            self.hot_reload,
-        )?;
+        let new_main = if self.pipeline_state.is_some() {
+            Some(build_main_pipeline(
+                &self.device,
+                &vert_desc,
+                vert_bytes,
+                frag_bytes,
+                self.hot_reload,
+            )?)
+        } else {
+            None
+        };
 
         // Instanced pipeline depends on both the instanced vertex bytes and
         // the (potentially fresh) fragment bytes. Rebuilt only when an
@@ -567,41 +578,43 @@ impl MtlContext {
         // All builds succeeded: swap into the live context. After this
         // point the next frame's draw calls bind the freshly compiled
         // pipelines.
-        let MainPipelineBundle {
-            pipeline_state,
-            bindless,
-            cull_pipeline,
-            cull_icb_arg_encoder,
-            cull_pipeline_phase2,
-            cull_icb2_arg_encoder,
-            bindless_tex_arg_encoder,
-        } = new_main;
-        self.pipeline_state = pipeline_state;
-        // Swap the bindless flag + dependent state. The flag is the
-        // bindless-vs-legacy switch for the static draw loop; if it changed
-        // (e.g. the user toggled `fragment_main_bindless` on or off in
-        // their shader), the ICB also has to be rebuilt because the new
-        // arg encoder produces a different encoding shape.
-        self.bindless = bindless;
-        self.cull.pipeline = cull_pipeline;
-        self.cull.icb_arg_encoder = cull_icb_arg_encoder;
-        // Second-pass (two-pass occlusion) pipeline + ICB arg encoder swap with the
-        // rest of the bundle. `two_pass_occlusion` is left as the init-time
-        // resolution: a shader edit that drops `fragment_main_bindless` leaves
-        // `cull_pipeline_phase2` None, and `ensure_icb_capacity` then skips the
-        // phase-2 ICB while the graph builder skips the phase-2 nodes.
-        self.cull.pipeline_phase2 = cull_pipeline_phase2;
-        self.cull.icb_2_arg_encoder = cull_icb2_arg_encoder;
-        self.bindless_tex_arg_encoder = bindless_tex_arg_encoder;
-        // Force a fresh ICB on the next frame so its argument-buffer encoding
-        // re-binds to the new encoder. Matches the `cull` swap in
-        // `reload_shaders`; the phase-2 ICB + status buffer rebuild alongside.
-        self.cull.icb = None;
-        self.cull.icb_arg_buffer = None;
-        self.cull.icb_capacity = 0;
-        self.cull.icb_2 = None;
-        self.cull.icb_2_arg_buffer = None;
-        self.cull.status_buffer = None;
+        if let Some(new_main) = new_main {
+            let MainPipelineBundle {
+                pipeline_state,
+                bindless,
+                cull_pipeline,
+                cull_icb_arg_encoder,
+                cull_pipeline_phase2,
+                cull_icb2_arg_encoder,
+                bindless_tex_arg_encoder,
+            } = new_main;
+            self.pipeline_state = Some(pipeline_state);
+            // Swap the bindless flag + dependent state. The flag is the
+            // bindless-vs-legacy switch for the static draw loop; if it changed
+            // (e.g. the user toggled `fragment_main_bindless` on or off in
+            // their shader), the ICB also has to be rebuilt because the new
+            // arg encoder produces a different encoding shape.
+            self.bindless = bindless;
+            self.cull.pipeline = cull_pipeline;
+            self.cull.icb_arg_encoder = cull_icb_arg_encoder;
+            // Second-pass (two-pass occlusion) pipeline + ICB arg encoder swap with
+            // the rest of the bundle. `two_pass_occlusion` is left as the init-time
+            // resolution: a shader edit that drops `fragment_main_bindless` leaves
+            // `cull_pipeline_phase2` None, and `ensure_icb_capacity` then skips the
+            // phase-2 ICB while the graph builder skips the phase-2 nodes.
+            self.cull.pipeline_phase2 = cull_pipeline_phase2;
+            self.cull.icb_2_arg_encoder = cull_icb2_arg_encoder;
+            self.bindless_tex_arg_encoder = bindless_tex_arg_encoder;
+            // Force a fresh ICB on the next frame so its argument-buffer encoding
+            // re-binds to the new encoder. Matches the `cull` swap in
+            // `reload_shaders`; the phase-2 ICB + status buffer rebuild alongside.
+            self.cull.icb = None;
+            self.cull.icb_arg_buffer = None;
+            self.cull.icb_capacity = 0;
+            self.cull.icb_2 = None;
+            self.cull.icb_2_arg_buffer = None;
+            self.cull.status_buffer = None;
+        }
 
         if let Some(ps) = new_instanced {
             self.instanced_pipeline_state = Some(ps);

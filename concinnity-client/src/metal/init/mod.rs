@@ -35,7 +35,7 @@ use objc2_metal::{
 };
 
 use crate::gfx::mesh_payload::Vertex;
-use crate::gfx::render_types::{DrawObject, InstancedCluster, LightUniforms, NUM_SHADOW_CASCADES};
+use crate::gfx::render_types::NUM_SHADOW_CASCADES;
 
 use super::context::*;
 use super::input::KeyState;
@@ -46,177 +46,100 @@ use super::texture::{
     create_fallback_texture, create_hdr_targets, create_shadow_map_array,
     create_shadow_map_fallback, upload_color_lut, upload_environment_map, upload_texture,
 };
-use crate::gfx::auto_exposure::AutoExposureSettings;
-use crate::gfx::decal::DecalRecord;
-use crate::gfx::particles::ParticleEmitterRecord;
-use crate::gfx::rt_reflections::RtReflectionSettings;
-use crate::gfx::ssao::SsaoSettings;
-use crate::gfx::ssgi::SsgiSettings;
-use crate::gfx::ssr::SsrSettings;
-use crate::gfx::volumetric_fog::FogSettings;
 
 impl MtlContext {
-    // Create a window and Metal render pipeline from pre-compiled .metallib bytes.
+    // Create a window and Metal render pipeline from the assembled backend
+    // inputs (see `crate::gfx::backend_init::BackendInit` for per-field docs).
     //
-    // Entry points must be named "vertex_main" and "fragment_main".
-    // Each entry in `textures` is `(width, height, rgba_pixels)`. When the
-    // slice is empty a 1x1 white fallback texture is created automatically.
-    // `draw_objects` defines the geometry slices, model matrices, and texture
-    // slot assignments for every object to be rendered each frame. The shadow
-    // pass is engine-internal (compiled from `shadow_map.metal`); it is enabled
-    // whenever `shadow_map_size > 0`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        title: &str,
-        width: u32,
-        height: u32,
-        _validation: bool,
-        frames_in_flight: usize,
-        // Initial display sync (vsync). Applied to the CAMetalLayer below and
-        // changeable at runtime via `set_vsync`.
-        vsync: bool,
-        clear_color: [f32; 4],
-        vertices: &[Vertex],
-        indices: &[u32],
-        draw_objects: Vec<DrawObject>,
-        instanced_clusters: Vec<InstancedCluster>,
-        // Skinned draw-object count. Accepted for cross-backend signature parity
-        // (DX/VK pre-size their fixed cull buffers from it). Unused on Metal: the
-        // skinned fold is live, but the object / draw-args transient rings and the
-        // cull ICB auto-grow to `cull_count()` each frame, and `n_skinned` (the
-        // count that drives `cull_count()`) is set in `upload_skinned` once the
-        // SkinnedMesh + deformed buffers exist -- so no init-time sizing is needed.
-        _n_skinned: usize,
-        // Worst-case resident chunk count. Unused on Metal: the
-        // object / draw-args transient rings + the cull ICB auto-grow to
-        // `cull_count()` each frame over the full `draw_objects` list, so streamed
-        // chunks are already covered with no init-time reserve. Accepted for
-        // init_backend signature parity with DX/VK.
-        _n_chunk_max: usize,
-        vert_lib_bytes: &[u8],
-        frag_lib_bytes: &[u8],
-        vert_instanced_lib_bytes: &[u8],
-        textures: &[(u32, u32, Vec<u8>)],
-        normal_maps: &[(u32, u32, Vec<u8>)],
-        light_uniforms: LightUniforms,
-        shadow_map_size: u32,
-        shadow_update: crate::assets::ShadowUpdate,
-        // Shadow distance (GraphicsConfig.shadow_distance, world units). The
-        // per-frame cascade split reads it; live via set_shadow_distance.
-        shadow_distance: u32,
-        // Shadow cascade count (GraphicsConfig.shadow_cascades, 1..=4). The
-        // per-frame split + schedule read it; live via set_shadow_cascades.
-        shadow_cascades: u32,
-        // Scene-sampler max anisotropy (GraphicsConfig.anisotropy), clamped to
-        // Metal's guaranteed 1..16 range where it is used below.
-        anisotropy: u32,
-        // Distinct planar-reflection plane budget from the quality preset / GPU tier
-        // ceiling. Passed to `assign_planar_slots` below (clamped to the capacity
-        // ceiling); reflectors past it fall back to the probe cube. Restart-required.
-        planar_planes: usize,
-        text_atlases: Vec<(u32, u32, Vec<u8>)>,
-        // serialised EnvironmentMap payload (irradiance + prefilter cubemaps).
-        // None → IBL disabled; the runtime binds 1x1 grey fallback cubes and
-        // sets ViewUniforms::prefilter_mip_count to 0.
-        env_map_bytes: Option<&[u8]>,
-        // post-process tunables: bloom intensity / threshold / knee. The
-        // backend overwrites `hdr_output` after EDR negotiation, so this is
-        // taken by value and rebound below.
-        mut post_process: crate::gfx::render_types::PostProcessParams,
-        // serialised ColorLut payload (3D grading LUT). None → identity LUT.
-        color_lut_bytes: Option<&[u8]>,
-        // temporal anti-aliasing toggle resolved from PostProcessConfig.aa_mode.
-        taa_enabled: bool,
-        // SSAO tunables resolved from PostProcessConfig; None → SSAO disabled.
-        ssao_settings: Option<SsaoSettings>,
-        // SSR tunables resolved from PostProcessConfig; None → SSR disabled.
-        ssr_settings: Option<SsrSettings>,
-        // SSGI tunables resolved from PostProcessConfig; None → SSGI disabled
-        // (indirect lighting is IBL-only). When Some, the SSR depth + normal
-        // pre-pass is built even with SSR off, since SSGI gathers against it.
-        ssgi_settings: Option<SsgiSettings>,
-        // RT-reflection tunables resolved from PostProcessConfig; None → RT
-        // reflections disabled. When Some (and the GPU supports ray tracing),
-        // the SSR pre-pass is built (the kernel reads its G-buffer) and the
-        // scene acceleration structure is built below; the graph builder then
-        // picks `RtReflections` over `SsrResolve` (RT takes precedence; SSR
-        // stays the cross-backend fallback if the world authored both).
-        rt_reflection_settings: Option<RtReflectionSettings>,
-        // Per-axis divisor for the roughness-aware reflection blur target,
-        // resolved from `PostProcessConfig.reflection_blur_resolution`. Sizes
-        // the reflection composite's reduced-resolution blur target at
-        // render / this; stored on `SsrState` so resize reuses it.
-        reflection_blur_scale: u32,
-        // Projected-decal records resolved from the world's `Decal` components.
-        // Empty → the decal pass is skipped entirely.
-        decals: Vec<DecalRecord>,
-        // Particle emitter records resolved from the world's
-        // `ParticleEmitter` components. Empty → both the particle compute and
-        // render passes are skipped entirely.
-        particles: Vec<ParticleEmitterRecord>,
-        // Volumetric-fog tunables resolved from `VolumetricFog`. `None` →
-        // the fog pass is skipped entirely.
-        fog_settings: Option<FogSettings>,
-        // Auto-exposure tunables resolved from PostProcessConfig; `None` →
-        // auto-exposure is off and the static `post_process.exposure` wins.
-        auto_exposure_settings: Option<AutoExposureSettings>,
-        // Authored `exposure_ev` (bias) carried alongside the auto-exposure
-        // settings. Honoured only when `auto_exposure_settings` is `Some`;
-        // ignored otherwise because the static path already baked it into
-        // `post_process.exposure`.
-        auto_exposure_bias_ev: f32,
-        // World-side HDR display request from `PostProcessConfig.hdr_display`.
-        // The backend queries the active display's EDR capability and either
-        // configures the swapchain + composite shader for HDR output or logs
-        // a warning and stays on the SDR path.
-        hdr_display_requested: bool,
-        // World-side PQ-encoding request from `PostProcessConfig.hdr_pq`.
-        // Honoured only when `hdr_display_requested` is true and the active
-        // display reports EDR headroom; otherwise ignored. Picks
-        // `kCGColorSpaceDisplayP3_PQ` for the swapchain and flips the
-        // composite shader's PQ-encode branch.
-        hdr_pq_requested: bool,
-        // World-side temporal upscaling request from
-        // `PostProcessConfig.temporal_upscaling`. When true (and the active
-        // GPU supports MetalFX temporal scaling), the renderer draws the 3D
-        // scene at `(drawable * upscale_scale)` and inserts the MetalFX
-        // upscale pass between the post-SSR scene and the bloom + composite
-        // stack. The TAA pass is bypassed while upscaling is on; the
-        // velocity pre-pass and projection jitter still run because the
-        // scaler consumes their output.
-        temporal_upscaling_requested: bool,
-        // Per-axis input-to-output ratio from
-        // `PostProcessConfig.upscale_quality`. Clamped to the device's
-        // supported scale range when the upscaler is built. Ignored when
-        // `temporal_upscaling_requested` is false.
-        upscale_scale_requested: f32,
-        // World-side two-pass Hi-Z occlusion request from
-        // `PostProcessConfig.occlusion_two_pass`. Only effective when the
-        // bindless cull path is active (the phase-2 cull pipeline is built
-        // alongside the phase-1 one), so it is ANDed with that below; when on,
-        // `draw_frame` inserts the HizBuild → Cull2 → Main2 phase-2 chain.
-        occlusion_two_pass_requested: bool,
-        // Transparent water surfaces resolved from the world's `WaterSurface`
-        // components. Empty → the water pipeline + per-surface records are not
-        // built and the transparent pass executor short-circuits.
-        water_surfaces: Vec<crate::assets::WaterSurface>,
-        // Translucent glass panels resolved from the world's `GlassPanel`
-        // components. Empty → the glass pipeline + per-panel records are not
-        // built. Rides the same transparent pass as water.
-        glass_panels: Vec<crate::assets::GlassPanel>,
-        // Raymarched SDF volumes resolved from the world's `SdfVolume`
-        // components. Each tuple is `(volume, user_fragment_shader_bytes,
-        // asset_label_for_error_messages)`; the label is the
-        // world.jsonl asset name. Empty → the proxy-cube buffers + per-
-        // volume PSOs are not built and the raymarch executor short-
-        // circuits.
-        sdf_volumes: Vec<(crate::assets::SdfVolume, Vec<u8>, String)>,
-        // True only under `cn debug` (set via `crate::app::dev_flags`). Enables
-        // disk-first shader-source resolution and the filesystem watcher; the
-        // baked-in shaders work regardless, so the flag is a pure dev-loop
-        // toggle that production `cn run` leaves false.
-        hot_reload: bool,
-    ) -> Result<Self, String> {
+    // Main-shader entry points must be named "vertex_main" and
+    // "fragment_main"; the shadow pass is engine-internal (compiled from
+    // `shadow_map.metal`) and enabled whenever `shadows.map_size > 0`.
+    pub fn new(init: crate::gfx::backend_init::BackendInit<'_>) -> Result<Self, String> {
+        use crate::gfx::backend_init::{
+            BackendInit, MediaPayloads, PostSettings, SceneData, ShaderBytes, ShadowParams, WorldFx,
+        };
+        let BackendInit {
+            window,
+            // The Metal validation layer is enabled by the CLI re-execing with
+            // MTL_DEBUG_LAYER, not through this flag.
+            validation: _,
+            frames_in_flight,
+            vsync,
+            clear_color,
+            hot_reload,
+            scene:
+                SceneData {
+                    vertices,
+                    indices,
+                    draw_objects,
+                    instanced_clusters,
+                    // Unused on Metal: the object / draw-args transient rings and
+                    // the cull ICB auto-grow to `cull_count()` each frame (the
+                    // skinned count is set later in `upload_skinned`, and resident
+                    // chunks fold into the per-frame rebuild), so no init-time
+                    // sizing is needed. DX/VK pre-size fixed buffers from these.
+                    n_skinned: _,
+                    n_chunk_max: _,
+                },
+            shaders:
+                ShaderBytes {
+                    vert: vert_lib_bytes,
+                    frag: frag_lib_bytes,
+                    // The Metal shadow shader is engine-internal.
+                    shadow: _,
+                    vert_instanced: vert_instanced_lib_bytes,
+                },
+            media:
+                MediaPayloads {
+                    textures,
+                    normal_maps,
+                    text_atlases,
+                    env_map_bytes,
+                    color_lut_bytes,
+                },
+            light_uniforms,
+            shadows:
+                ShadowParams {
+                    map_size: shadow_map_size,
+                    update: shadow_update,
+                    distance: shadow_distance,
+                    cascades: shadow_cascades,
+                },
+            anisotropy,
+            planar_planes,
+            post:
+                PostSettings {
+                    // The backend overwrites `hdr_output` after EDR negotiation,
+                    // so this is rebound mutably below.
+                    mut post_process,
+                    taa_enabled,
+                    ssao: ssao_settings,
+                    ssr: ssr_settings,
+                    ssgi: ssgi_settings,
+                    rt_reflections: rt_reflection_settings,
+                    reflection_blur_scale,
+                    auto_exposure: auto_exposure_settings,
+                    auto_exposure_bias_ev,
+                    hdr_display: hdr_display_requested,
+                    hdr_pq: hdr_pq_requested,
+                    temporal_upscaling: temporal_upscaling_requested,
+                    upscale_scale: upscale_scale_requested,
+                    // Metal always uses MetalFX for temporal upscaling.
+                    upscale_backend: _,
+                    occlusion_two_pass: occlusion_two_pass_requested,
+                },
+            fx:
+                WorldFx {
+                    decals,
+                    particles,
+                    fog: fog_settings,
+                    water_surfaces,
+                    glass_panels,
+                    sdf_volumes,
+                },
+            requirements,
+        } = init;
+        let (title, width, height) = (window.title.as_str(), window.width, window.height);
         // all Metal and AppKit calls must happen on the main thread
         let mtm = objc2::MainThreadMarker::new()
             .ok_or("MtlContext::new must be called from the main thread")?;
@@ -228,16 +151,12 @@ impl MtlContext {
             .ok_or("failed to create Metal command queue")?;
 
         // Main + cull + bindless argument encoder. The bundle's `bindless`
-        // flag drives the texture-pool overflow warning below.
+        // flag drives the texture-pool overflow warning below. A world with no
+        // 3D scene content skips the main PBR pipeline and the whole GPU-cull
+        // path: the Main pass then survives as a bare clear the composite pass
+        // samples (the same shape a world_hidden frame takes).
         let vert_desc = pipelines::make_vertex_descriptor();
-        let main_bundle = pipelines::build_main_pipeline(
-            &device,
-            &vert_desc,
-            vert_lib_bytes,
-            frag_lib_bytes,
-            hot_reload,
-        )?;
-        let pipelines::MainPipelineBundle {
+        let (
             pipeline_state,
             bindless,
             cull_pipeline,
@@ -245,7 +164,34 @@ impl MtlContext {
             cull_pipeline_phase2,
             cull_icb2_arg_encoder,
             bindless_tex_arg_encoder,
-        } = main_bundle;
+        ) = if requirements.scene {
+            let pipelines::MainPipelineBundle {
+                pipeline_state,
+                bindless,
+                cull_pipeline,
+                cull_icb_arg_encoder,
+                cull_pipeline_phase2,
+                cull_icb2_arg_encoder,
+                bindless_tex_arg_encoder,
+            } = pipelines::build_main_pipeline(
+                &device,
+                &vert_desc,
+                vert_lib_bytes,
+                frag_lib_bytes,
+                hot_reload,
+            )?;
+            (
+                Some(pipeline_state),
+                bindless,
+                cull_pipeline,
+                cull_icb_arg_encoder,
+                cull_pipeline_phase2,
+                cull_icb2_arg_encoder,
+                bindless_tex_arg_encoder,
+            )
+        } else {
+            (None, false, None, None, None, None, None)
+        };
 
         // Two-pass occlusion is only usable on the bindless cull path (the
         // phase-2 pipeline exists exactly then). Gate the request here so the
@@ -487,7 +433,11 @@ impl MtlContext {
         // (`HdrOutputMode::Sdr` vs `Hdr`); the post + text pipelines that
         // target the drawable need to know that mode to pick BGRA8Unorm vs
         // RGBA16Float, so this hop happens before pipeline construction.
-        let geometry_less = vertices.is_empty();
+        // Scene-less (UI / text only) worlds clamp the HDR / bloom / effect
+        // targets to 1x1; keyed off the derived requirements rather than raw
+        // vertex presence so a vertex-less world that still renders 3D content
+        // (SDF volumes, water, glass) keeps full-size targets.
+        let geometry_less = !requirements.scene;
         let window::WindowSetup {
             window,
             mtk_view,
@@ -647,9 +597,10 @@ impl MtlContext {
             None
         };
 
-        // Post-process effect chain: bloom is always built; TAA / velocity /
-        // SSAO / SSR / decal / fog / auto-exposure are gated on their own
-        // settings so a world that disables them pays zero construction cost.
+        // Post-process effect chain: bloom is built for any world with a 3D
+        // scene; TAA / velocity / SSAO / SSR / decal / fog / auto-exposure are
+        // gated on their own settings so a world that disables them pays zero
+        // construction cost.
         let effects::EffectsBundle {
             bloom_targets,
             bloom_pipelines,
@@ -680,6 +631,7 @@ impl MtlContext {
         } = effects::build_effects(
             &device,
             &vert_desc,
+            requirements.scene,
             render_w,
             render_h,
             initial_w,

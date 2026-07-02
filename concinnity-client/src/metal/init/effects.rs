@@ -42,9 +42,12 @@ use crate::metal::texture::create_fallback_texture;
 use crate::metal::transient_pool::{TransientTexturePool, transient_specs};
 
 pub(crate) struct EffectsBundle {
-    // Bloom is always built.
+    // Bloom targets are always created (the composite pass binds the top mip
+    // unconditionally; a scene-less world sizes them 1x1). The pipelines are
+    // built only for worlds with a 3D scene: without one there is nothing to
+    // threshold, and the graph never inserts the Bloom pass.
     pub bloom_targets: BloomTargets,
-    pub bloom_pipelines: BloomPipelines,
+    pub bloom_pipelines: Option<BloomPipelines>,
 
     // TAA: built only when taa_enabled.
     pub taa_pipeline_state: Option<Retained<ProtocolObject<dyn MTLRenderPipelineState>>>,
@@ -407,6 +410,10 @@ pub(crate) fn build_quality_effects(
 pub(crate) fn build_effects(
     device: &ProtocolObject<dyn MTLDevice>,
     vert_desc: &MTLVertexDescriptor,
+    // False for a world with no 3D scene content: bloom pipelines are skipped
+    // (the settings-gated features below are already trimmed by the
+    // requirements derivation before they reach here).
+    scene: bool,
     // Render-resolution dimensions: where the 3D scene + most post passes
     // (HDR, TAA, velocity, SSAO, SSR) draw. Equal to `output_w/h` when no
     // upscaler is active; smaller when MetalFX upscaling is on.
@@ -440,10 +447,16 @@ pub(crate) fn build_effects(
     // Bloom chain + pipelines. Bloom samples whatever scene_color the post
     // stack hands it: that's at output (drawable) resolution when MetalFX
     // upscaling is on, native resolution otherwise. Sized off `output_w/h`
-    // so bloom stays crisp at the panel's pixel grid. Always built (only its
-    // uniforms vary), so it is not part of the toggle-controlled subset.
+    // so bloom stays crisp at the panel's pixel grid. Built for any world
+    // with a 3D scene (only its uniforms vary at runtime), so it is not part
+    // of the toggle-controlled subset; the targets exist regardless because
+    // the composite pass binds the top mip unconditionally (1x1 scene-less).
     let bloom_targets = create_bloom_targets(device, output_w, output_h)?;
-    let bloom_pipelines = build_bloom_pipelines(device, hot_reload)?;
+    let bloom_pipelines = if scene {
+        Some(build_bloom_pipelines(device, hot_reload)?)
+    } else {
+        None
+    };
 
     // The toggle-controlled subset (TAA, SSAO, SSR, SSGI, RT resolve pipelines,
     // auto-exposure, + the shared G-buffer pre-pass and SSAO transient pool).

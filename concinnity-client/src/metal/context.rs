@@ -115,7 +115,10 @@ pub struct MtlContext {
     // switched off under the same gate so the drawable is blit-readable.
     // Mirrors the DX/VK `last_present_index`.
     pub(super) last_present_texture: Option<Retained<ProtocolObject<dyn MTLTexture>>>,
-    pub(super) pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+    // Main-pass PBR pipeline. None for a world with no 3D scene content
+    // (render requirements derived `scene == false`): the Main pass then
+    // encodes as a bare clear and every geometry sub-path early-outs.
+    pub(super) pipeline_state: Option<Retained<ProtocolObject<dyn MTLRenderPipelineState>>>,
     // True when the static main-pass pipeline runs the bindless fragment
     // shader (`fragment_main_bindless`). The static draw loop then reads each
     // object from the per-frame `GpuObjectData` buffer and a bindless texture
@@ -317,8 +320,10 @@ pub struct MtlContext {
     // Bloom mip chain (prefilter/downsample/upsample targets). Re-created
     // alongside `hdr_targets` whenever the drawable size changes.
     pub(super) bloom_targets: BloomTargets,
-    // Prefilter / downsample / upsample pipelines for the bloom chain.
-    pub(super) bloom_pipelines: BloomPipelines,
+    // Prefilter / downsample / upsample pipelines for the bloom chain. None
+    // for a world with no 3D scene content: the graph never inserts the Bloom
+    // pass, and the composite's unconditional top-mip bind stays 1x1 black.
+    pub(super) bloom_pipelines: Option<BloomPipelines>,
     // Pool backing the render graph's transient textures
     // (`gfx::render_graph::alias`). Owns `ao_output` today (relocated off SSAO);
     // a later stage aliases it with `bloom_top` on one `MTLHeap` slot. Rebuilt on

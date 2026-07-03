@@ -58,6 +58,23 @@ pub struct GraphicsSystem {
     // running target for the next frame's start.
     fps_cap: u32,
     next_frame_deadline: Option<Instant>,
+    // The display modes the Resolution row offers, shaped at init from the
+    // backend's enumeration (or the static fallback when it cannot enumerate)
+    // and published once as the `DisplayModes` resource for the dropdown list.
+    display_modes: Vec<crate::gfx::display_mode::DisplayMode>,
+    // The user's chosen fullscreen display mode, persisted as `resolution`.
+    // `None` = never chosen: the display keeps its own mode and the row shows
+    // `current_mode`. Fullscreen-only: windowed sizes come from the window
+    // (authored / dragged) and borderless covers the display, so the row is
+    // grayed + inert outside Fullscreen and never resizes the window.
+    resolution: Option<crate::gfx::display_mode::DisplayMode>,
+    // The mode the display was running at init (the row's display value until
+    // the user chooses one). `None` when the backend cannot read it.
+    current_mode: Option<crate::gfx::display_mode::DisplayMode>,
+    // The Resolution row's labels with their authored colors, captured at init
+    // so window-mode changes can gray the row out and restore it (mirrors
+    // `perf_sub_row_labels`).
+    resolution_row_labels: Vec<(AssetId, [f32; 3])>,
     // Stats-HUD display state (GraphicsSettings perf_stats / show_fps / show_vram;
     // default shown). `perf_stats` is the master "Display performance stats"
     // toggle; the per-readout flags gate the FPS / VRAM chips under it. Published
@@ -414,6 +431,10 @@ impl GraphicsSystem {
             frames_in_flight: 2,
             vsync: false,
             fps_cap: 0,
+            display_modes: Vec::new(),
+            resolution: None,
+            current_mode: None,
+            resolution_row_labels: Vec::new(),
             perf_stats: true,
             show_fps: true,
             show_vram: true,
@@ -485,6 +506,19 @@ impl GraphicsSystem {
             texture_cap: 96,
             texture_budget: 4,
         }
+    }
+
+    // The mode the Resolution row displays and cycles from: the user's choice,
+    // else the display's own mode, else the authored window size (a backend
+    // that cannot read the display; snaps to the nearest listed mode).
+    fn effective_resolution(&self) -> crate::gfx::display_mode::DisplayMode {
+        self.resolution
+            .or(self.current_mode)
+            .unwrap_or(crate::gfx::display_mode::DisplayMode {
+                width: self.window_args.width,
+                height: self.window_args.height,
+                refresh_hz: 0,
+            })
     }
 }
 

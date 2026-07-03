@@ -476,6 +476,10 @@ pub struct MtlContext {
     // read directly (the delegate communicates through `fullscreen`).
     #[allow(dead_code)]
     pub(super) window_delegate: Option<Retained<super::window_delegate::WindowDelegate>>,
+    // Holds the display to the user's chosen mode while the window is in
+    // native fullscreen; restores the desktop mode on exit / drop. Reconciled
+    // once per frame in draw_frame from the delegate-tracked flag above.
+    pub(super) fullscreen_display: super::display_mode::FullscreenDisplayMode,
     pub(super) keys: KeyState,
     // The runtime movement key map (canonical action -> key). `handle_key`
     // decodes physical events through this instead of hardcoded keys, so a

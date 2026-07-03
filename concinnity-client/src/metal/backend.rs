@@ -67,6 +67,9 @@ impl RenderBackend for MtlContext {
         fn set_vsync(&mut self, on: bool);
         fn set_window_mode(&mut self, mode: crate::assets::WindowMode);
         fn set_window_size(&mut self, width: u32, height: u32);
+        fn display_modes(&self) -> Vec<crate::gfx::display_mode::DisplayMode>;
+        fn current_display_mode(&self) -> Option<crate::gfx::display_mode::DisplayMode>;
+        fn set_display_mode(&mut self, mode: crate::gfx::display_mode::DisplayMode);
         fn update_post_process(&mut self, params: PostProcessParams);
         fn set_ambient_intensity(&mut self, value: f32);
         fn set_keymap(&mut self, keymap: &crate::gfx::keymap::KeyMap);

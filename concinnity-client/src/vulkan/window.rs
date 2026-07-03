@@ -11,6 +11,7 @@
 // deltas directly via CursorPos events, so no manual warping is needed.
 
 use crate::assets::{Key, WindowMode};
+use crate::gfx::display_mode::DisplayMode;
 use crate::gfx::keymap::KeyMap;
 
 // Win32 cursor clipping for the fullscreen menu confine. GLFW has no
@@ -117,6 +118,28 @@ pub struct GlfwWindow {
     // Defaults to W/S/A/D/Shift/Space/E. (GLFW delivers Shift as Left/Right Shift
     // key events, so it is just another key here -- no separate modifier path.)
     keymap: KeyMap,
+    // The primary monitor's video modes + desktop mode, enumerated once at
+    // creation: the &self getters cannot take the &mut Glfw a live query
+    // needs, and the hardware mode list does not change mid-session.
+    display_modes: Vec<DisplayMode>,
+    desktop_mode: Option<DisplayMode>,
+    // The user's chosen fullscreen display mode (snapped to a real video
+    // mode). Fullscreen switches the monitor to it via set_monitor; GLFW
+    // itself restores the desktop mode when the window leaves fullscreen or
+    // is destroyed, so no explicit hold/restore machinery is needed here
+    // (unlike DirectX / Metal).
+    desired_mode: Option<DisplayMode>,
+}
+
+// The (width, height, refresh Hz) of a GLFW video mode. GLFW reports 0 for an
+// unknown refresh rate (e.g. Wayland), which is already DisplayMode's
+// "unknown" convention.
+fn display_mode_of(v: &glfw::VidMode) -> DisplayMode {
+    DisplayMode {
+        width: v.width,
+        height: v.height,
+        refresh_hz: v.refresh_rate,
+    }
 }
 
 // GlfwWindow is only ever used on the thread that created it.
@@ -299,6 +322,17 @@ impl GlfwWindow {
         glfw.window_hint(glfw::WindowHint::ClientApi(glfw::ClientApiHint::NoApi));
         glfw.window_hint(glfw::WindowHint::Resizable(resizable));
 
+        // The Resolution row's mode list + the desktop mode. Queried before
+        // the window exists so a fullscreen creation never reports its own
+        // (possibly switched) mode as the desktop mode.
+        let (display_modes, desktop_mode) = glfw.with_primary_monitor(|_, monitor| match monitor {
+            Some(m) => (
+                m.get_video_modes().iter().map(display_mode_of).collect(),
+                m.get_video_mode().map(|v| display_mode_of(&v)),
+            ),
+            None => (Vec::new(), None),
+        });
+
         let (mut window, events) = match mode {
             WindowMode::Windowed => glfw
                 .create_window(width, height, title, glfw::WindowMode::Windowed)
@@ -353,6 +387,9 @@ impl GlfwWindow {
             #[cfg(target_os = "windows")]
             menu_clip_active: false,
             keymap: KeyMap::default(),
+            display_modes,
+            desktop_mode,
+            desired_mode: None,
         })
     }
 
@@ -523,11 +560,18 @@ impl GlfwWindow {
     // Switch windowed / borderless / fullscreen. The framebuffer-size change
     // makes the next present return OUT_OF_DATE, which rebuilds the swapchain.
     pub fn set_window_mode(&mut self, mode: WindowMode) {
+        // Leaving a mode-switched fullscreen: GLFW restores the desktop mode
+        // as part of the switch away, so a borderless cover must size to the
+        // cached desktop mode, not the (still-switched) current video mode.
+        let leaving_switched_fullscreen =
+            matches!(self.window_mode, WindowMode::Fullscreen) && self.desired_mode.is_some();
         // Record the mode so the per-frame cursor confinement can tell fullscreen
         // (confine) from windowed / borderless (hide the arrow on leave).
         self.window_mode = mode;
         // Disjoint field borrows so the with_primary_monitor closure can drive
         // the window while glfw is borrowed for the monitor lookup.
+        let desired_mode = self.desired_mode;
+        let desktop_mode = self.desktop_mode;
         let glfw = &mut self.glfw;
         let window = &mut self.window;
         match mode {
@@ -548,37 +592,84 @@ impl GlfwWindow {
                 // Undecorated windowed at the monitor's video-mode size.
                 window.set_decorated(false);
                 glfw.with_primary_monitor(|_, monitor| {
-                    if let Some(m) = monitor
-                        && let Some(vid) = m.get_video_mode()
-                    {
-                        window.set_monitor(
-                            glfw::WindowMode::Windowed,
-                            0,
-                            0,
-                            vid.width,
-                            vid.height,
-                            None,
-                        );
+                    if let Some(m) = monitor {
+                        let size = if leaving_switched_fullscreen {
+                            desktop_mode.map(|d| (d.width, d.height))
+                        } else {
+                            None
+                        }
+                        .or_else(|| m.get_video_mode().map(|vid| (vid.width, vid.height)));
+                        if let Some((w, h)) = size {
+                            window.set_monitor(glfw::WindowMode::Windowed, 0, 0, w, h, None);
+                        }
                     }
                 });
             }
             WindowMode::Fullscreen => {
                 window.set_decorated(true);
                 glfw.with_primary_monitor(|_, monitor| {
-                    if let Some(m) = monitor
-                        && let Some(vid) = m.get_video_mode()
-                    {
-                        window.set_monitor(
-                            glfw::WindowMode::FullScreen(m),
-                            0,
-                            0,
-                            vid.width,
-                            vid.height,
-                            Some(vid.refresh_rate),
-                        );
+                    if let Some(m) = monitor {
+                        // The chosen Resolution mode (already snapped to a
+                        // real video mode), else the monitor's current one.
+                        // GLFW holds the switched mode while fullscreen and
+                        // restores the desktop mode on leaving it.
+                        let target = desired_mode
+                            .map(|d| (d.width, d.height, d.refresh_hz))
+                            .or_else(|| {
+                                m.get_video_mode()
+                                    .map(|vid| (vid.width, vid.height, vid.refresh_rate))
+                            });
+                        if let Some((w, h, hz)) = target {
+                            window.set_monitor(
+                                glfw::WindowMode::FullScreen(m),
+                                0,
+                                0,
+                                w,
+                                h,
+                                (hz != 0).then_some(hz),
+                            );
+                        }
                     }
                 });
             }
+        }
+    }
+
+    // The display modes of the primary monitor (enumerated at creation),
+    // feeding the Resolution settings row; the caller dedups + sorts.
+    pub fn display_modes(&self) -> Vec<DisplayMode> {
+        self.display_modes.clone()
+    }
+
+    // The desktop mode of the primary monitor (captured at creation, before
+    // any fullscreen switch): what the Resolution row shows before the user
+    // ever picks a mode.
+    pub fn current_display_mode(&self) -> Option<DisplayMode> {
+        self.desktop_mode
+    }
+
+    // Remember the display mode to hold while fullscreen, snapped to a video
+    // mode the monitor actually has (a stale persisted choice from another
+    // display is ignored with a warning, mirroring Metal / DirectX). While
+    // fullscreen it applies immediately by re-entering fullscreen at the new
+    // mode; otherwise the next switch to Fullscreen picks it up.
+    pub fn set_display_mode(&mut self, mode: DisplayMode) {
+        let Some(idx) = crate::gfx::display_mode::best_native_index(&self.display_modes, mode)
+        else {
+            tracing::warn!(
+                "display has no {}x{} mode; keeping the current mode",
+                mode.width,
+                mode.height
+            );
+            return;
+        };
+        let snapped = self.display_modes[idx];
+        if self.desired_mode == Some(snapped) {
+            return;
+        }
+        self.desired_mode = Some(snapped);
+        if matches!(self.window_mode, WindowMode::Fullscreen) {
+            self.set_window_mode(WindowMode::Fullscreen);
         }
     }
 

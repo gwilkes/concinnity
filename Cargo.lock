@@ -301,7 +301,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "bistro"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "concinnity-toolchain",
  "example-common",
@@ -586,7 +586,7 @@ dependencies = [
 
 [[package]]
 name = "concinnity-client"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "ash",
  "bitflags 2.11.1",
@@ -605,6 +605,7 @@ dependencies = [
  "notify",
  "objc2 0.6.4",
  "objc2-app-kit",
+ "objc2-core-foundation",
  "objc2-core-graphics",
  "objc2-foundation",
  "objc2-metal",
@@ -631,7 +632,7 @@ dependencies = [
 
 [[package]]
 name = "concinnity-cook"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "concinnity-core",
  "fbxcel",
@@ -655,7 +656,7 @@ dependencies = [
 
 [[package]]
 name = "concinnity-core"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "concinnity-eas",
  "postcard",
@@ -671,18 +672,18 @@ dependencies = [
 
 [[package]]
 name = "concinnity-docs"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "syn",
 ]
 
 [[package]]
 name = "concinnity-eas"
-version = "0.7.1"
+version = "0.7.2"
 
 [[package]]
 name = "concinnity-editor"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "argon2",
  "ash",
@@ -738,7 +739,7 @@ dependencies = [
 
 [[package]]
 name = "concinnity-toolchain"
-version = "0.7.1"
+version = "0.7.2"
 
 [[package]]
 name = "cookie"
@@ -1075,7 +1076,7 @@ dependencies = [
 
 [[package]]
 name = "example-common"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "concinnity-client",
  "concinnity-cook",

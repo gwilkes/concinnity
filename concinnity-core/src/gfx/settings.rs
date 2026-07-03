@@ -86,23 +86,18 @@ pub const GRAPHICS_QUALITY_OPTIONS: [&str; 6] =
 // Master-volume options, in cycle order. The client maps each to a linear gain.
 pub const MASTER_VOLUME_OPTIONS: [&str; 5] = ["Off", "25%", "50%", "75%", "100%"];
 
-// Window-size presets [label, width, height], in cycle order. The label is the
-// option text; the dimensions are read by the client's window_size mapping.
-pub const WINDOW_SIZE_PRESETS: [(&str, u32, u32); 4] = [
-    ("1280x720", 1280, 720),
-    ("1600x900", 1600, 900),
-    ("1920x1080", 1920, 1080),
-    ("2560x1440", 2560, 1440),
-];
+// Settings whose option list is enumerated from the hardware at runtime, so
+// this static registry cannot hold their labels. Each still renders as a
+// click-to-open dropdown row; the client seeds the floating list from the
+// enumerated values. `resolution` lists the display modes (width x height at
+// refresh rate) the current display supports.
+pub const DYNAMIC_DROPDOWN_KEYS: [&str; 1] = ["resolution"];
 
-// The window-size preset labels, derived once from the preset table so the two
-// never drift.
-pub const WINDOW_SIZE_LABELS: [&str; 4] = [
-    WINDOW_SIZE_PRESETS[0].0,
-    WINDOW_SIZE_PRESETS[1].0,
-    WINDOW_SIZE_PRESETS[2].0,
-    WINDOW_SIZE_PRESETS[3].0,
-];
+// Whether `key`'s options are enumerated at runtime (a dropdown row with no
+// static label table; `options` returns `None` for it).
+pub fn is_dynamic_dropdown(key: &str) -> bool {
+    DYNAMIC_DROPDOWN_KEYS.contains(&key)
+}
 
 // The option labels for a known setting key, or `None` if the key is unknown
 // (a slider or rebind key, or a typo). A key with more than two labels renders
@@ -115,7 +110,6 @@ pub fn options(key: &str) -> Option<&'static [&'static str]> {
         "render_scale" => Some(&RENDER_SCALE_OPTIONS),
         "upscale_backend" => Some(&UPSCALE_BACKEND_OPTIONS),
         "fps_cap" => Some(&FPS_CAP_OPTIONS),
-        "window_size" => Some(&WINDOW_SIZE_LABELS),
         "master_volume" => Some(&MASTER_VOLUME_OPTIONS),
         "aa_mode" => Some(&AA_MODE_OPTIONS),
         "ssgi_resolution" => Some(&SSGI_RESOLUTION_OPTIONS),
@@ -145,10 +139,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn window_size_labels_track_the_preset_table() {
-        for (i, (label, _, _)) in WINDOW_SIZE_PRESETS.iter().enumerate() {
-            assert_eq!(WINDOW_SIZE_LABELS[i], *label);
-        }
+    fn resolution_is_a_dynamic_dropdown_with_no_static_options() {
+        // The resolution list is enumerated from the display at runtime, so the
+        // static registry knows the key only as a dynamic dropdown.
+        assert!(is_dynamic_dropdown("resolution"));
+        assert!(options("resolution").is_none());
+        // Statically-registered keys are not misclassified as dynamic.
+        assert!(!is_dynamic_dropdown("window_mode"));
+        assert!(!is_dynamic_dropdown("nope"));
     }
 
     #[test]
@@ -175,7 +173,6 @@ mod tests {
             "window_mode",
             "render_scale",
             "fps_cap",
-            "window_size",
             "master_volume",
             "aa_mode",
             "shadow_map_size",

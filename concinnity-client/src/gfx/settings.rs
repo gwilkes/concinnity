@@ -330,25 +330,6 @@ pub(crate) fn texture_quality_index(cap: u32) -> usize {
     nearest_count_index(&TEXTURE_QUALITY_CAPS, cap)
 }
 
-// Window (width, height) for a preset index. The preset table (label + dims)
-// lives in core so the cook and client agree on the option labels.
-pub(crate) fn window_size_at(index: usize) -> (u32, u32) {
-    use concinnity_core::gfx::settings::WINDOW_SIZE_PRESETS;
-    let p = WINDOW_SIZE_PRESETS
-        .get(index)
-        .unwrap_or(&WINDOW_SIZE_PRESETS[0]);
-    (p.1, p.2)
-}
-// The preset index whose dimensions match (w, h), or 0 when none match (a
-// custom / asset-authored size that isn't a preset).
-pub(crate) fn window_size_index(w: u32, h: u32) -> usize {
-    use concinnity_core::gfx::settings::WINDOW_SIZE_PRESETS;
-    WINDOW_SIZE_PRESETS
-        .iter()
-        .position(|p| p.1 == w && p.2 == h)
-        .unwrap_or(0)
-}
-
 // Linear gain for a master-volume option index, and the index for a gain. A
 // gain that is not a preset (an authored value) falls back to the last index
 // (full).
@@ -720,7 +701,12 @@ mod tests {
     fn known_settings_have_options() {
         assert_eq!(options("window_mode").unwrap().len(), 3);
         assert_eq!(options("render_scale").unwrap().len(), 4);
-        assert_eq!(options("window_size").unwrap().len(), 4);
+        // resolution is a dynamic dropdown: options are enumerated from the
+        // display at runtime, so the static registry has none for it.
+        assert!(options("resolution").is_none());
+        assert!(concinnity_core::gfx::settings::is_dynamic_dropdown(
+            "resolution"
+        ));
         assert_eq!(options("master_volume").unwrap().len(), 5);
         // mouse_sensitivity is a slider, not a cycle row.
         assert!(options("mouse_sensitivity").is_none());
@@ -1037,14 +1023,6 @@ mod tests {
             ),
             cfg!(not(backend_metal))
         );
-    }
-
-    #[test]
-    fn window_size_matches_preset_or_defaults_to_first() {
-        assert_eq!(window_size_index(1920, 1080), 2);
-        assert_eq!(window_size_at(2), (1920, 1080));
-        // A non-preset (asset-authored) size falls back to index 0.
-        assert_eq!(window_size_index(1024, 768), 0);
     }
 
     #[test]

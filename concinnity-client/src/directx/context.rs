@@ -666,6 +666,10 @@ pub(super) struct DxDescriptors {
 pub struct DxContext {
     // Win32 window
     pub(super) win_state: Box<WindowState>,
+    // The user's chosen fullscreen display mode, held on the monitor while the
+    // window is in (borderless) fullscreen and restored on exit / drop.
+    // Reconciled once per frame in `window_closed`.
+    pub(super) fullscreen_display: super::display_mode::FullscreenDisplayMode,
 
     // D3D12 core
     pub(super) device: ID3D12Device,
@@ -1718,6 +1722,21 @@ impl DxContext {
         // Metal's `pump_ns_events`). GraphicsSystem reads `cursor_outside_window`
         // later this same frame.
         update_ui_cursor_confinement(&mut self.win_state);
+        // Converge the monitor on the chosen Resolution mode: held while the
+        // window is in (borderless) fullscreen, restored otherwise (mirrors
+        // Metal's per-frame reconcile in draw_frame). When the monitor mode
+        // just changed under a monitor-covering window (a fullscreen switch,
+        // or a restore on the way out to borderless), re-cover the monitor's
+        // new bounds; a windowed window keeps its own rect.
+        let mode = self.win_state.window_mode;
+        let fullscreen = matches!(mode, crate::assets::WindowMode::Fullscreen);
+        if self
+            .fullscreen_display
+            .reconcile(self.win_state.hwnd, fullscreen)
+            && !matches!(mode, crate::assets::WindowMode::Windowed)
+        {
+            do_set_window_mode(&mut self.win_state, mode);
+        }
         self.win_state.closed
     }
 
@@ -1812,6 +1831,26 @@ impl DxContext {
 
     pub fn set_window_size(&mut self, width: u32, height: u32) {
         do_set_window_size(&mut self.win_state, width, height);
+    }
+
+    // The display modes (resolution + refresh rate) of the monitor the window
+    // sits on, feeding the Resolution settings row (the caller dedups + sorts).
+    pub fn display_modes(&self) -> Vec<crate::gfx::display_mode::DisplayMode> {
+        super::display_mode::enumerate(self.win_state.hwnd)
+    }
+
+    // The mode the window's monitor is currently running (what the Resolution
+    // row shows before the user ever picks one).
+    pub fn current_display_mode(&self) -> Option<crate::gfx::display_mode::DisplayMode> {
+        super::display_mode::current(self.win_state.hwnd)
+    }
+
+    // Remember the display mode to hold while the window is in fullscreen.
+    // Applied by the per-frame reconcile in `window_closed` (which also
+    // restores the desktop mode on leaving fullscreen), so a choice made in
+    // any window mode takes effect when fullscreen is (or becomes) active.
+    pub fn set_display_mode(&mut self, mode: crate::gfx::display_mode::DisplayMode) {
+        self.fullscreen_display.set_desired(mode);
     }
 
     // Replace the live post-process parameters, pushed to the bloom + composite

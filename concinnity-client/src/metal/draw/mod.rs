@@ -157,6 +157,15 @@ impl MtlContext {
             }
         }
 
+        // Converge the display on the fullscreen state: hold the chosen mode
+        // while the window is fullscreen, restore the desktop mode otherwise.
+        // Runs off the delegate-tracked flag so OS-driven fullscreen exits
+        // (green traffic-light button, Mission Control) restore too. Cheap
+        // when nothing changed.
+        let is_fullscreen = self.fullscreen.load(std::sync::atomic::Ordering::Relaxed);
+        self.fullscreen_display
+            .reconcile(self.window.as_deref(), is_fullscreen);
+
         // Frames-in-flight gate: block until the GPU has retired an older frame
         // so the CPU never queues more than `frames_in_flight` frames ahead,
         // bounding how many sets of per-frame transient buffers pile up. Taken

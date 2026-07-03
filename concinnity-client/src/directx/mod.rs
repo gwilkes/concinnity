@@ -7,6 +7,7 @@ mod barrier_translate;
 mod context;
 mod cull;
 mod decal;
+mod display_mode;
 mod draw;
 mod draw_iter;
 mod dxc;

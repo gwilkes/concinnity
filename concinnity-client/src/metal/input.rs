@@ -347,6 +347,33 @@ impl MtlContext {
         window.makeKeyAndOrderFront(None);
     }
 
+    // The display modes (pixel resolution + refresh rate) of the display the
+    // engine window sits on. Empty in embedded mode: the host owns the window,
+    // so the engine never switches its display and the Resolution row falls
+    // back to the windowed presets.
+    pub fn display_modes(&self) -> Vec<crate::gfx::display_mode::DisplayMode> {
+        if self.window.is_none() {
+            return Vec::new();
+        }
+        super::display_mode::enumerate(self.window.as_deref())
+    }
+
+    // The mode the engine window's display is currently running (what the
+    // Resolution row shows before the user ever picks one). None in embedded
+    // mode, matching display_modes.
+    pub fn current_display_mode(&self) -> Option<crate::gfx::display_mode::DisplayMode> {
+        let window = self.window.as_deref()?;
+        super::display_mode::current(Some(window))
+    }
+
+    // Remember the display mode to hold while the window is in native
+    // fullscreen. Applied by the per-frame reconcile in draw_frame (which also
+    // restores the desktop mode on leaving fullscreen), so a choice made in
+    // any window mode takes effect when fullscreen is (or becomes) active.
+    pub fn set_display_mode(&mut self, mode: crate::gfx::display_mode::DisplayMode) {
+        self.fullscreen_display.set_desired(mode);
+    }
+
     // Resize the engine-created window's content area (windowed mode only).
     // No-op in embedded mode or while in native fullscreen.
     pub fn set_window_size(&mut self, width: u32, height: u32) {

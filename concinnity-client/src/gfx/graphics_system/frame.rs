@@ -43,16 +43,15 @@ fn expand_dim_set(
     dim
 }
 
-// Gray the captured show_fps / show_vram row labels (or restore their authored
-// colors) to match the master "Display performance stats" toggle. A free
-// function taking the captured (id, color) list so it can run inside the
-// settings drain, where `backend` already borrows part of `self`.
-fn apply_perf_stats_gating(
-    ctx: &mut PipelineContext,
-    sub_rows: &[(AssetId, [f32; 3])],
-    grayed: bool,
-) {
-    for &(id, orig) in sub_rows {
+// Gray a captured set of settings-row labels (or restore their authored
+// colors), for a row disabled at runtime: the show_fps / show_vram rows under
+// the "Display performance stats" master, and the Resolution row outside
+// fullscreen. A free function taking the captured (id, color) list so it can
+// run inside the settings drain, where `backend` already borrows part of
+// `self`. The matching input inertness comes from the `DisabledSettingRows`
+// resource, published after the drain.
+fn set_rows_grayed(ctx: &mut PipelineContext, rows: &[(AssetId, [f32; 3])], grayed: bool) {
+    for &(id, orig) in rows {
         let color = if grayed { DISABLED_ROW_COLOR } else { orig };
         for l in ctx.query_mut::<TextLabel>() {
             if l.asset_id == id {
@@ -61,6 +60,39 @@ fn apply_perf_stats_gating(
             }
         }
     }
+}
+
+// The (label id, authored color) list of every settings row whose key is in
+// `keys`, each expanded to its whole scroll row (background + name + value +
+// glyphs) so the row grays as a unit; the authored colors drive the restore.
+// Runs at init while the HitRegions / ScrollPanels are still present.
+fn capture_row_labels(ctx: &mut PipelineContext, keys: &[&str]) -> Vec<(AssetId, [f32; 3])> {
+    // Collect the rows' value-label ids (every region of a row -- steppers'
+    // prev/next or a dropdown's open -- references its value label).
+    let mut anchors: std::collections::HashSet<AssetId> = std::collections::HashSet::new();
+    for r in ctx.query::<HitRegion>() {
+        let Some(rest) = r.action.strip_prefix("setting:") else {
+            continue;
+        };
+        let key = rest.split(':').next().unwrap_or("");
+        if keys.contains(&key)
+            && let Some(label) = r.label
+        {
+            anchors.insert(label);
+        }
+    }
+    if anchors.is_empty() {
+        return Vec::new();
+    }
+    let rows: Vec<Vec<AssetId>> = ctx
+        .query::<crate::assets::ScrollPanel>()
+        .flat_map(|p| p.rows.iter().map(|r| r.elements.clone()))
+        .collect();
+    let dim = expand_dim_set(&anchors, &rows);
+    ctx.query::<TextLabel>()
+        .filter(|l| dim.contains(&l.asset_id))
+        .map(|l| (l.asset_id, l.color))
+        .collect()
 }
 
 // Reposition the labels owned by every visible `LayoutContainer`. This runs in
@@ -285,10 +317,22 @@ fn build_dropdown_overlay(
     const BORDER: [f32; 4] = [0.28, 0.34, 0.52, 1.0];
     const SELECTED_BG: [f32; 4] = [0.14, 0.20, 0.34, 1.0];
     const HOVER_BG: [f32; 4] = [0.22, 0.30, 0.48, 1.0];
+    const THUMB: [f32; 4] = [0.45, 0.52, 0.70, 0.9];
     const TEXT_PAD: f32 = 10.0;
     const BORDER_PX: f32 = 2.0;
 
-    let layout = concinnity_core::gfx::dropdown::layout(view.anchor, view.options.len());
+    use concinnity_core::gfx::dropdown;
+    let count = view.options.len();
+    let layout = dropdown::layout(view.anchor, count);
+    // The layout windows a long list; rows show options `first..`, so the
+    // selected / hovered option indices map to row indices (off-window ones
+    // simply draw no highlight).
+    let first = view.first.min(dropdown::max_first(count));
+    let row_of = |option: usize| {
+        option
+            .checked_sub(first)
+            .filter(|r| *r < layout.items.len())
+    };
     let mut sprites: Vec<Sprite> = Vec::new();
     let mk_sprite = |rect: [f32; 4], tint: [f32; 4]| Sprite {
         asset_id: AssetId::default(),
@@ -315,18 +359,26 @@ fn build_dropdown_overlay(
         BORDER,
     ));
     sprites.push(mk_sprite(layout.list, PANEL_BG));
-    // The currently-applied option, then the hovered one on top of it.
-    if let Some(rect) = layout.items.get(view.selected) {
+    // The currently-applied option, then the hovered one on top of it (each
+    // only when its option is inside the shown window).
+    if let Some(rect) = row_of(view.selected).and_then(|r| layout.items.get(r)) {
         sprites.push(mk_sprite(*rect, SELECTED_BG));
     }
-    if let Some(h) = view.hovered
-        && let Some(rect) = layout.items.get(h)
+    if let Some(rect) = view
+        .hovered
+        .and_then(row_of)
+        .and_then(|r| layout.items.get(r))
     {
         sprites.push(mk_sprite(*rect, HOVER_BG));
     }
+    // A scrolled list gets a slim scrollbar thumb inside its right edge so the
+    // window's position in the full list is visible.
+    if let Some(rect) = dropdown::thumb_rect(&layout, first, count) {
+        sprites.push(mk_sprite(rect, THUMB));
+    }
 
-    // One text label per option, vertically centered in its row (the text draws
-    // after the sprites, so it sits over the highlights).
+    // One text label per SHOWN option, vertically centered in its row (the text
+    // draws after the sprites, so it sits over the highlights).
     let line_h = view
         .font
         .and_then(|f| loaded_fonts.get(&f))
@@ -335,6 +387,7 @@ fn build_dropdown_overlay(
     let labels: Vec<TextLabel> = view
         .options
         .iter()
+        .skip(first)
         .zip(&layout.items)
         .map(|(opt, rect)| TextLabel {
             asset_id: AssetId::default(),
@@ -1191,6 +1244,49 @@ impl GraphicsSystem {
                         }
                         continue;
                     }
+                    // The Resolution row: a dynamic dropdown whose option list is
+                    // the enumerated display-mode list, not the static registry.
+                    // Fullscreen-only: the backend holds the display to the
+                    // chosen mode while the window is fullscreen (restoring the
+                    // desktop mode on exit); in the other modes the row is
+                    // grayed + inert (a windowed size comes from the window
+                    // itself, borderless covers the display), so the window is
+                    // never resized here. Independent of the quality preset (a
+                    // user/hardware preference, like window mode).
+                    if cmd.setting == "resolution" {
+                        if self.display_modes.is_empty() {
+                            continue;
+                        }
+                        // The chosen mode, else the display's own (read inline,
+                        // not via effective_resolution, so the borrow stays
+                        // field-local alongside the live backend).
+                        let effective = self.resolution.or(self.current_mode).unwrap_or(
+                            crate::gfx::display_mode::DisplayMode {
+                                width: self.window_args.width,
+                                height: self.window_args.height,
+                                refresh_hz: 0,
+                            },
+                        );
+                        let cur =
+                            crate::gfx::display_mode::index_of(&self.display_modes, effective);
+                        let next = settings::cycle(cur, self.display_modes.len(), cmd.op);
+                        let mode = self.display_modes[next];
+                        self.resolution = Some(mode);
+                        backend.set_display_mode(mode);
+                        let mut cfg = crate::config::Settings::load();
+                        cfg.graphics.resolution = Some([mode.width, mode.height, mode.refresh_hz]);
+                        if let Err(e) = cfg.save() {
+                            tracing::warn!(
+                                "GraphicsSystem: persist setting '{}': {}",
+                                cmd.setting,
+                                e
+                            );
+                        }
+                        if let Some(label_id) = cmd.value_label {
+                            set_label_content(ctx, label_id, &mode.label());
+                        }
+                        continue;
+                    }
                     let Some(opts) = settings::options(&cmd.setting) else {
                         tracing::warn!("GraphicsSystem: unknown setting '{}'", cmd.setting);
                         continue;
@@ -1215,11 +1311,7 @@ impl GraphicsSystem {
                                 settings::cycle(self.perf_stats as usize, opts.len(), cmd.op);
                             self.perf_stats = next == 1;
                             cfg.graphics.perf_stats = Some(self.perf_stats);
-                            apply_perf_stats_gating(
-                                ctx,
-                                &self.perf_sub_row_labels,
-                                !self.perf_stats,
-                            );
+                            set_rows_grayed(ctx, &self.perf_sub_row_labels, !self.perf_stats);
                             Some(opts[next])
                         }
                         "show_fps" => {
@@ -1263,24 +1355,16 @@ impl GraphicsSystem {
                                     self.window_args.height,
                                 );
                             }
-                            cfg.graphics.window_mode = Some(mode);
-                            Some(opts[next])
-                        }
-                        "window_size" => {
-                            let cur = settings::window_size_index(
-                                self.window_args.width,
-                                self.window_args.height,
+                            // The Resolution row only applies in fullscreen, so
+                            // the new mode grays it out or restores it (the
+                            // matching inertness rides the DisabledSettingRows
+                            // publish below).
+                            set_rows_grayed(
+                                ctx,
+                                &self.resolution_row_labels,
+                                mode != WindowMode::Fullscreen,
                             );
-                            let next = settings::cycle(cur, opts.len(), cmd.op);
-                            let (w, h) = settings::window_size_at(next);
-                            self.window_args.width = w;
-                            self.window_args.height = h;
-                            // Resizing only applies in windowed mode; the preset
-                            // is still remembered for the return to windowed.
-                            if self.window_args.mode == WindowMode::Windowed {
-                                backend.set_window_size(w, h);
-                            }
-                            cfg.graphics.window_size = Some([w, h]);
+                            cfg.graphics.window_mode = Some(mode);
                             Some(opts[next])
                         }
                         "render_scale" => {
@@ -1636,7 +1720,7 @@ impl GraphicsSystem {
                     show_fps: self.perf_stats && self.show_fps,
                     show_vram: self.perf_stats && self.show_vram,
                 });
-                let disabled_rows: std::collections::HashSet<String> = if self.perf_stats {
+                let mut disabled_rows: std::collections::HashSet<String> = if self.perf_stats {
                     std::collections::HashSet::new()
                 } else {
                     ["show_fps", "show_vram"]
@@ -1644,6 +1728,13 @@ impl GraphicsSystem {
                         .map(|s| s.to_string())
                         .collect()
                 };
+                // The Resolution row only applies in fullscreen (windowed sizes
+                // come from the window, borderless covers the display), so it is
+                // inert in the other modes; its gray-out is applied on the
+                // window-mode change (and at init) via `set_rows_grayed`.
+                if self.window_args.mode != WindowMode::Fullscreen {
+                    disabled_rows.insert("resolution".to_string());
+                }
                 ctx.insert_resource(crate::ecs::DisabledSettingRows(disabled_rows));
 
                 // advance SceneReel and apply fade / visibility changes, sourcing
@@ -2093,43 +2184,26 @@ impl GraphicsSystem {
 
     // Capture the show_fps / show_vram row labels (with their authored colors)
     // so the master "Display performance stats" toggle can gray them out at
-    // runtime and restore them. Runs once at init while the HitRegions /
-    // ScrollPanels are present (before UiInputSystem drains them), the same
-    // window `apply_capability_gating` and the other init-time row captures use.
+    // runtime and restore them, and apply the initial gray from the resolved
+    // toggle. Runs once at init while the HitRegions / ScrollPanels are present
+    // (before UiInputSystem drains them), the same window
+    // `apply_capability_gating` and the other init-time row captures use.
     pub(super) fn capture_perf_sub_rows(&mut self, ctx: &mut PipelineContext) {
-        // Collect the value-label ids of the show_fps / show_vram rows (both
-        // stepper regions of a row reference its value label).
-        let mut anchors: std::collections::HashSet<AssetId> = std::collections::HashSet::new();
-        for r in ctx.query::<HitRegion>() {
-            let Some(rest) = r.action.strip_prefix("setting:") else {
-                continue;
-            };
-            let key = rest.split(':').next().unwrap_or("");
-            if matches!(key, "show_fps" | "show_vram")
-                && let Some(label) = r.label
-            {
-                anchors.insert(label);
-            }
-        }
-        if anchors.is_empty() {
-            self.perf_sub_row_labels = Vec::new();
-            return;
-        }
-        // Expand each anchor to its whole scroll row (background + name + value +
-        // stepper glyphs) so the row grays as a unit, then snapshot each label's
-        // authored color for the restore.
-        let rows: Vec<Vec<AssetId>> = ctx
-            .query::<crate::assets::ScrollPanel>()
-            .flat_map(|p| p.rows.iter().map(|r| r.elements.clone()))
-            .collect();
-        let dim = expand_dim_set(&anchors, &rows);
-        self.perf_sub_row_labels = ctx
-            .query::<TextLabel>()
-            .filter(|l| dim.contains(&l.asset_id))
-            .map(|l| (l.asset_id, l.color))
-            .collect();
-        // Apply the initial gray-out from the resolved master toggle.
-        apply_perf_stats_gating(ctx, &self.perf_sub_row_labels, !self.perf_stats);
+        self.perf_sub_row_labels = capture_row_labels(ctx, &["show_fps", "show_vram"]);
+        set_rows_grayed(ctx, &self.perf_sub_row_labels, !self.perf_stats);
+    }
+
+    // Capture the Resolution row's labels and apply the initial gray from the
+    // resolved window mode: the row only applies in fullscreen (windowed sizes
+    // come from the window itself, borderless covers the display), so it is
+    // grayed + inert in the other modes. Same init window as the perf rows.
+    pub(super) fn capture_resolution_row(&mut self, ctx: &mut PipelineContext) {
+        self.resolution_row_labels = capture_row_labels(ctx, &["resolution"]);
+        set_rows_grayed(
+            ctx,
+            &self.resolution_row_labels,
+            self.window_args.mode != WindowMode::Fullscreen,
+        );
     }
 
     // The current user-facing value of a slider setting, derived from the live

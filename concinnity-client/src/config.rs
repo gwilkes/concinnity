@@ -87,10 +87,13 @@ pub struct GraphicsSettings {
     // `Window.mode`. Applied live.
     #[serde(default)]
     pub window_mode: Option<crate::assets::WindowMode>,
-    // Window size [width, height] in pixels (windowed mode only). `None` uses
-    // the world's `Window.width`/`Window.height`. Applied live.
+    // Chosen fullscreen display mode [width, height, refresh_hz] in pixels
+    // (refresh_hz 0 = unknown / keep the display's rate). `None` means never
+    // chosen: the display keeps its own mode and the Resolution row shows it.
+    // Fullscreen-only (the row is grayed in windowed / borderless, where the
+    // window itself defines the size); applied live while fullscreen.
     #[serde(default)]
-    pub window_size: Option<[u32; 2]>,
+    pub resolution: Option<[u32; 3]>,
     // Render-scale preset (upscaling quality). `None` uses the world's
     // `PostProcessConfig.upscale_quality`. Applied at next launch (the upscaler
     // and render targets are sized once at init).
@@ -461,7 +464,7 @@ mod tests {
                 quality_preset: Some(crate::gfx::quality_preset::QualityPreset::High),
                 vsync: Some(true),
                 fps_cap: Some(144),
-                window_size: Some([1920, 1080]),
+                resolution: Some([1920, 1080, 120]),
                 upscale_backend: Some(crate::assets::UpscalerBackend::Xess),
                 exposure_ev: Some(-1.5),
                 bloom_intensity: Some(0.8),

@@ -99,9 +99,14 @@ impl GraphicsSystem {
         if let Some(m) = user_graphics.window_mode {
             self.window_args.mode = m;
         }
-        if let Some([w, h]) = user_graphics.window_size {
-            self.window_args.width = w;
-            self.window_args.height = h;
+        // The chosen fullscreen display mode. Fullscreen-only: it never feeds
+        // the windowed size, which stays the world's authored `Window` value.
+        if let Some([w, h, hz]) = user_graphics.resolution {
+            self.resolution = Some(crate::gfx::display_mode::DisplayMode {
+                width: w,
+                height: h,
+                refresh_hz: hz,
+            });
         }
 
         if let Some(c) = ctx.drain::<GraphicsConfig>().into_iter().next() {
@@ -119,7 +124,7 @@ impl GraphicsSystem {
         }
         // A persisted vsync choice overrides the world's value. Applied outside
         // the GraphicsConfig block (unconditional), matching window_mode /
-        // window_size, so it wins over both the authored value and the default.
+        // resolution, so it wins over both the authored value and the default.
         if let Some(v) = user_graphics.vsync {
             self.vsync = v;
         }
@@ -538,13 +543,7 @@ impl GraphicsSystem {
         // render, so a persisted/authored choice shows instead of the build's
         // placeholder. HitRegions are still present here: GraphicsSystem.init
         // runs before UiInputSystem.init, which drains them.
-        let (vsync, mode, win_w, win_h, scale) = (
-            self.vsync,
-            self.window_args.mode,
-            self.window_args.width,
-            self.window_args.height,
-            self.render_scale,
-        );
+        let (vsync, mode, scale) = (self.vsync, self.window_args.mode, self.render_scale);
         let fps_cap_val = self.fps_cap;
         // Stats-HUD display toggles for the value-label sync (copies, so the
         // closure below does not borrow self while ctx is borrowed mutably).
@@ -585,7 +584,8 @@ impl GraphicsSystem {
             "vsync" => Some(vsync as usize),
             "fps_cap" => Some(crate::gfx::settings::fps_cap_index(fps_cap_val)),
             "window_mode" => Some(crate::gfx::settings::window_mode_index(mode)),
-            "window_size" => Some(crate::gfx::settings::window_size_index(win_w, win_h)),
+            // "resolution" is a dynamic dropdown; its label is set from the
+            // enumerated mode list after the backend is built.
             "render_scale" => Some(crate::gfx::settings::render_scale_index(scale)),
             "upscale_backend" => Some(crate::gfx::settings::upscale_backend_index(
                 upscale_backend_sel,
@@ -646,6 +646,9 @@ impl GraphicsSystem {
         // gray-out from the resolved "Display performance stats" master toggle.
         // Before UiInputSystem drains the HitRegions / ScrollPanels.
         self.capture_perf_sub_rows(ctx);
+        // Capture the Resolution row's labels and apply the initial gray-out
+        // from the resolved window mode (the row only applies in fullscreen).
+        self.capture_resolution_row(ctx);
         // Capture each ScrollPanel's per-element clip bands for the draw path,
         // before UiInputSystem drains the panels (init order: graphics first).
         self.init_clip_rects(ctx);
@@ -2144,6 +2147,34 @@ impl GraphicsSystem {
             && let Some(backend) = self.backend.as_deref_mut()
         {
             backend.set_window_mode(self.window_args.mode);
+        }
+
+        // The Resolution row's mode list: the display's enumerated modes when
+        // the backend can provide them, else the static preset fallback. The
+        // list is published once for UiInputSystem to seed the row's dropdown.
+        // A persisted mode choice is handed to the backend, which holds the
+        // display to it whenever the window is in fullscreen; with no choice
+        // the row shows the display's own mode. The row's value label is
+        // dynamic (built from the list, not the static registry), so it is set
+        // here rather than in the generic sync above.
+        let chosen = self.resolution;
+        if let Some(backend) = self.backend.as_deref_mut() {
+            let raw = backend.display_modes();
+            self.display_modes = if raw.is_empty() {
+                crate::gfx::display_mode::fallback_modes()
+            } else {
+                crate::gfx::display_mode::normalize(raw)
+            };
+            self.current_mode = backend.current_display_mode();
+            if let Some(mode) = chosen {
+                backend.set_display_mode(mode);
+            }
+        }
+        ctx.insert_resource(crate::ecs::DisplayModes(self.display_modes.clone()));
+        let idx =
+            crate::gfx::display_mode::index_of(&self.display_modes, self.effective_resolution());
+        if let Some(m) = self.display_modes.get(idx) {
+            set_setting_row_label(ctx, "resolution", &m.label());
         }
 
         // Reflection probes: hand the backend the declared `ReflectionProbe`

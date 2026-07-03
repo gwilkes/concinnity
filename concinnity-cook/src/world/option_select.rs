@@ -18,11 +18,13 @@ use std::collections::HashMap;
 use super::expand::{asset_name, type_norm};
 use crate::assets::{Font, OptionSelect};
 
-// Whether a setting row expands to a dropdown (more than two options) rather
-// than a `<`/`>` stepper. An unknown key (no registered options) falls back to
-// the stepper form.
+// Whether a setting row expands to a dropdown (more than two options, or a
+// runtime-enumerated option list like `resolution`) rather than a `<`/`>`
+// stepper. An unknown key (no registered options) falls back to the stepper
+// form.
 fn is_dropdown(setting: &str) -> bool {
     concinnity_core::gfx::settings::options(setting).is_some_and(|o| o.len() > 2)
+        || concinnity_core::gfx::settings::is_dynamic_dropdown(setting)
 }
 
 // Where the control group (the `<` button + value + `>`) starts, as a fraction
@@ -426,6 +428,25 @@ mod tests {
         assert_eq!(open["args"]["label"], "opt_wm_value");
         assert!(!assets.iter().any(|v| asset_name(v) == "opt_wm_prev"));
         assert!(!assets.iter().any(|v| asset_name(v) == "opt_wm_next"));
+    }
+
+    // A runtime-enumerated setting (resolution) has no static option table but
+    // still expands to a dropdown; the runtime seeds the list from the display.
+    #[test]
+    fn dynamic_setting_expands_to_dropdown() {
+        let mut assets = vec![serde_json::json!({
+            "name": "opt_res",
+            "type": "OptionSelect",
+            "args": {
+                "setting": "resolution", "label": "Resolution",
+                "x": 100.0, "y": 200.0, "width": 300.0
+            }
+        })];
+        expand_option_selects(&mut assets).unwrap();
+        let open = by_name(&assets, "opt_res_open");
+        assert_eq!(open["args"]["action"], "setting:resolution:open");
+        assert_eq!(by_name(&assets, "opt_res_chevron")["args"]["content"], "v");
+        assert!(!assets.iter().any(|v| asset_name(v) == "opt_res_prev"));
     }
 
     // `element_names` must list exactly the Sprite/TextLabel children the

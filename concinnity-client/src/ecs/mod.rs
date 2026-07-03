@@ -73,6 +73,13 @@ pub struct HudPrefs {
 #[derive(Debug, Clone, Default)]
 pub struct DisabledSettingRows(pub std::collections::HashSet<String>);
 
+// The display modes offered by the "Resolution" settings row, published once by
+// GraphicsSystem at init (enumerated from the backend's display, or the static
+// fallback when it cannot enumerate) and read by `UiInputSystem` to seed the
+// row's dropdown list. Ordered as displayed; a pick's `SetIndex` indexes it.
+#[derive(Debug, Clone, Default)]
+pub struct DisplayModes(pub Vec<crate::gfx::display_mode::DisplayMode>);
+
 // A settings dropdown's open floating option list, or `None` when none is open.
 // `UiInputSystem` owns the interaction state (open on a `setting:<key>:open`
 // click, close on a pick / outside click / Escape / scroll) and publishes this
@@ -84,13 +91,15 @@ pub struct OpenDropdown(pub Option<DropdownView>);
 
 // What GraphicsSystem needs to draw an open dropdown list: the anchor control
 // rect (reference space), the option labels top-to-bottom, the selected +
-// hovered indices to highlight, and the row value label's font / scale / color
-// so the list text matches the row it drops from.
+// hovered OPTION indices to highlight, the scroll position (`first`, the top
+// shown option of a list longer than the layout window), and the row value
+// label's font / scale / color so the list text matches the row it drops from.
 #[derive(Debug, Clone)]
 pub struct DropdownView {
     pub anchor: [f32; 4],
     pub options: Vec<String>,
     pub selected: usize,
+    pub first: usize,
     pub hovered: Option<usize>,
     pub view: Option<asset_id::AssetId>,
     pub font: Option<asset_id::AssetId>,

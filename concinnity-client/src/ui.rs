@@ -116,10 +116,10 @@ struct PanelState {
 
 // A settings dropdown whose floating option list is open. Owned by
 // UiInputSystem: while set, the list overlays the menu and consumes the frame's
-// input (a pick sends a SetIndex command; an outside click, Escape, or a scroll
-// dismisses it). Published each frame as an `OpenDropdown` resource so
-// GraphicsSystem can draw the list. The style fields mirror the row's value
-// label so the list text matches it.
+// input (a pick sends a SetIndex command; an outside click or Escape dismisses
+// it; the wheel scrolls a list longer than the shown window). Published each
+// frame as an `OpenDropdown` resource so GraphicsSystem can draw the list. The
+// style fields mirror the row's value label so the list text matches it.
 #[derive(Debug)]
 struct OpenDropdownState {
     // The setting the list picks a value for (e.g. `"window_mode"`).
@@ -134,6 +134,10 @@ struct OpenDropdownState {
     options: Vec<String>,
     // The currently-applied option (highlighted as selected).
     selected: usize,
+    // The scroll position of a list longer than the shown window, as a
+    // fractional row offset (the wheel accumulates into it); `first()` rounds
+    // and clamps it to the top shown option. 0 for a list that fits.
+    scroll_rows: f32,
     // The option under the cursor this frame, if any (highlighted as hovered).
     hovered: Option<usize>,
     // The view the row belongs to (drives reference-space vs window hit-testing
@@ -144,6 +148,14 @@ struct OpenDropdownState {
     font: Option<AssetId>,
     scale: f32,
     color: [f32; 3],
+}
+
+impl OpenDropdownState {
+    // The top shown option: the scroll accumulator rounded and clamped to the
+    // windowable range. 0 for a list that fits.
+    fn first(&self) -> usize {
+        (self.scroll_rows.round().max(0.0) as usize).min(dropdown::max_first(self.options.len()))
+    }
 }
 
 // A dropdown-row click captured during the hit-test loop, resolved into an
@@ -649,8 +661,9 @@ impl System for UiInputSystem {
 impl UiInputSystem {
     // Advance an open dropdown for one frame: track the option under the cursor,
     // and on a click pick it (a SetIndex command) or dismiss (a click outside
-    // the list); Escape or a scroll also dismiss. Clears `open_dropdown` when the
-    // list closes.
+    // the list); Escape also dismisses. The wheel scrolls the shown window of a
+    // list longer than `dropdown::MAX_VISIBLE` (it never dismisses). Clears
+    // `open_dropdown` when the list closes.
     fn step_open_dropdown(&mut self, input: &FrameInput, ctx: &mut PipelineContext) {
         let Some(state) = self.open_dropdown.as_mut() else {
             return;
@@ -663,11 +676,22 @@ impl UiInputSystem {
         } else {
             (input.mouse_x, input.mouse_y)
         };
+        // Wheel: scroll the shown window (same feel as the settings panel:
+        // wheel distance in pixels, converted to rows by the row height).
+        if input.scroll_delta != 0.0 {
+            let item_h = state.anchor[3].max(1.0);
+            let max = dropdown::max_first(state.options.len()) as f32;
+            state.scroll_rows = (state.scroll_rows
+                + input.scroll_delta * WHEEL_SCROLL_SPEED / item_h)
+                .clamp(0.0, max);
+        }
+        let first = state.first();
         let layout = dropdown::layout(state.anchor, state.options.len());
-        state.hovered = dropdown::item_at(&layout, qx, qy);
+        // Rows show options `first..`; hovered is the OPTION index.
+        state.hovered = dropdown::item_at(&layout, qx, qy).map(|row| first + row);
 
-        // Escape or a scroll dismisses without changing the value.
-        if input.escape || input.scroll_delta != 0.0 {
+        // Escape dismisses without changing the value.
+        if input.escape {
             self.open_dropdown = None;
             return;
         }
@@ -693,17 +717,29 @@ impl UiInputSystem {
     }
 
     // Resolve a captured dropdown-row click into an open list: read the option
-    // labels from the shared registry and the current value from the row's value
-    // label to seed the selection. Returns `None` (stays closed) when the setting
-    // has no registered options.
+    // labels from the shared registry (or, for a runtime-enumerated setting
+    // like `resolution`, from the resource its owner publishes) and the current
+    // value from the row's value label to seed the selection. Returns `None`
+    // (stays closed) when the setting has no options to offer.
     fn build_open_dropdown(
         req: OpenRequest,
         ctx: &mut PipelineContext,
     ) -> Option<OpenDropdownState> {
-        let options: Vec<String> = settings::options(&req.setting)?
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let options: Vec<String> =
+            if concinnity_core::gfx::settings::is_dynamic_dropdown(&req.setting) {
+                // Today the only dynamic dropdown is `resolution`, whose modes
+                // GraphicsSystem publishes at init.
+                let modes = ctx.resource::<crate::ecs::DisplayModes>()?;
+                if modes.0.is_empty() {
+                    return None;
+                }
+                modes.0.iter().map(|m| m.label()).collect()
+            } else {
+                settings::options(&req.setting)?
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect()
+            };
         // The value label's font (for the list text) and current content (to
         // mark the selected option).
         let (font, current) = req
@@ -719,6 +755,8 @@ impl UiInputSystem {
             setting: req.setting,
             value_label: req.value_label,
             anchor: req.anchor,
+            // Open with the selection near the middle of a scrolled window.
+            scroll_rows: dropdown::first_for_selected(selected, options.len()) as f32,
             options,
             selected,
             hovered: None,
@@ -739,6 +777,7 @@ impl UiInputSystem {
                 anchor: s.anchor,
                 options: s.options.clone(),
                 selected: s.selected,
+                first: s.first(),
                 hovered: s.hovered,
                 view: s.view,
                 font: s.font,
@@ -1538,6 +1577,102 @@ mod tests {
         assert_eq!(cmds[0].setting, "window_mode");
         assert!(matches!(cmds[0].op, SettingOp::SetIndex(1)));
         assert!(!dropdown_is_open(&world), "picking closes the list");
+    }
+
+    // A dropdown over a runtime-enumerated list longer than the shown window
+    // (a `resolution` row with 20 display modes): opening centers the current
+    // selection, the wheel scrolls the window instead of dismissing, and a
+    // click picks the OPTION under the row (not the raw row index).
+    fn scrolled_dropdown_world() -> World {
+        let view = AssetId(9);
+        let mut world = World::new_empty();
+        world.add_component(View {
+            asset_id: view,
+            initial: true,
+            ..Default::default()
+        });
+        // 20 modes, 1000x100 (0Hz) .. 1000x2000 (0Hz); the row's value label
+        // currently shows the 11th (index 10).
+        let modes: Vec<crate::gfx::display_mode::DisplayMode> = (1..=20)
+            .map(|i| crate::gfx::display_mode::DisplayMode {
+                width: 1000,
+                height: i * 100,
+                refresh_hz: 0,
+            })
+            .collect();
+        world.add_component(TextLabel {
+            asset_id: AssetId(1),
+            font: None,
+            content: modes[10].label(),
+            x: 0.0,
+            y: 0.0,
+            color: [0.85, 0.85, 0.85],
+            scale: 1.0,
+            centered: false,
+            background: [0.0, 0.0, 0.0, 0.0],
+            padding: 0.0,
+            visible: true,
+            view: Some(view),
+        });
+        world.add_component(HitRegion {
+            x: 400.0,
+            y: 100.0,
+            width: 200.0,
+            height: 40.0,
+            label: Some(AssetId(1)),
+            hover_color: Some([1.0, 0.85, 0.3]),
+            hover_scale: Some(1.0),
+            action: "setting:resolution:open".to_string(),
+            drag_handle: None,
+            view: Some(view),
+            disabled: false,
+        });
+        world.start().unwrap();
+        world.insert_resource(crate::ecs::DisplayModes(modes));
+        world
+    }
+
+    #[test]
+    fn dropdown_scrolls_instead_of_dismissing() {
+        let mut world = scrolled_dropdown_world();
+
+        // Open: the full option list is carried, the window starts centered on
+        // the selection (10 - MAX_VISIBLE/2).
+        world.add_component(make_frame_input(500.0, 120.0, true));
+        world.step();
+        let center = 10 - dropdown::MAX_VISIBLE / 2;
+        {
+            let open = world.resource::<crate::ecs::OpenDropdown>().unwrap();
+            let dv = open.0.as_ref().expect("dropdown should be open");
+            assert_eq!(dv.options.len(), 20);
+            assert_eq!(dv.selected, 10);
+            assert_eq!(dv.first, center);
+        }
+
+        // Wheel: the list stays open and the window moves (40px * speed 2.0 /
+        // 40px rows = +2 rows), clamped to the scrollable range.
+        world.add_component(FrameInput {
+            mouse_x: 500.0,
+            mouse_y: 200.0,
+            scroll_delta: 40.0,
+            ..Default::default()
+        });
+        world.step();
+        {
+            let open = world.resource::<crate::ecs::OpenDropdown>().unwrap();
+            let dv = open.0.as_ref().expect("scrolling must not dismiss");
+            assert_eq!(dv.first, center + 2);
+        }
+
+        // Click the top shown row (y 140..180): the pick is the OPTION at the
+        // scrolled window's top, not row 0 of the full list.
+        world.add_component(make_frame_input(500.0, 150.0, true));
+        world.step();
+        let cmds = produced_setting_commands(&world);
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0].setting, "resolution");
+        assert!(matches!(cmds[0].op, SettingOp::SetIndex(i) if i == center + 2));
+        assert!(!dropdown_is_open(&world));
     }
 
     #[test]

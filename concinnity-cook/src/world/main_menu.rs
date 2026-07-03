@@ -34,7 +34,7 @@ const VIDEO_ROWS: [(&str, &str); 7] = [
     ("vsync", "Vsync"),
     ("fps_cap", "Frame Rate"),
     ("window_mode", "Window Mode"),
-    ("window_size", "Window Size"),
+    ("resolution", "Resolution"),
     // Stats-HUD display: the master toggle leads, then the per-readout toggles.
     // The master grays the two sub-rows out (rather than hiding them) when off.
     ("perf_stats", "Display Performance Stats"),
@@ -1190,7 +1190,7 @@ mod tests {
             ("vsync", "Vsync"),
             ("fps_cap", "Frame Rate"),
             ("window_mode", "Window Mode"),
-            ("window_size", "Window Size"),
+            ("resolution", "Resolution"),
             ("render_scale", "Render Scale"),
             ("upscale_backend", "Upscaler"),
         ] {

@@ -6,6 +6,7 @@ mod backend;
 mod context;
 mod cull;
 mod decal;
+mod display_mode;
 mod draw;
 mod fog;
 mod frame_pacing;

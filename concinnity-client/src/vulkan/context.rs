@@ -1815,6 +1815,21 @@ impl VkContext {
         self.window.set_window_size(width, height);
     }
 
+    // The display modes feeding the Resolution settings row; enumeration,
+    // the fullscreen mode hold, and the desktop-mode restore all live in
+    // window.rs (GLFW owns the video-mode switching).
+    pub fn display_modes(&self) -> Vec<crate::gfx::display_mode::DisplayMode> {
+        self.window.display_modes()
+    }
+
+    pub fn current_display_mode(&self) -> Option<crate::gfx::display_mode::DisplayMode> {
+        self.window.current_display_mode()
+    }
+
+    pub fn set_display_mode(&mut self, mode: crate::gfx::display_mode::DisplayMode) {
+        self.window.set_display_mode(mode);
+    }
+
     // Replace the live post-process parameters, pushed to the bloom + composite
     // shaders each frame. Code-only on macOS; verify on Linux/Windows.
     pub fn update_post_process(&mut self, params: crate::gfx::render_types::PostProcessParams) {

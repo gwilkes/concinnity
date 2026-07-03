@@ -1850,6 +1850,7 @@ impl DxContext {
 
         Ok(Self {
             win_state,
+            fullscreen_display: super::display_mode::FullscreenDisplayMode::new(),
             device,
             command_queue,
             swapchain,

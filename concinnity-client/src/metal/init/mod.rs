@@ -1162,6 +1162,7 @@ impl MtlContext {
             menu_mode: false,
             fullscreen,
             window_delegate,
+            fullscreen_display: super::display_mode::FullscreenDisplayMode::new(),
             keys: KeyState::default(),
             keymap: crate::gfx::keymap::KeyMap::default(),
             frame_stats: crate::gfx::profile::RenderStats::default(),

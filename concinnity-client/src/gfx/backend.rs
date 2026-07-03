@@ -506,6 +506,30 @@ pub trait RenderBackend: SceneControl + Send {
         let _ = (width, height);
     }
 
+    // The display modes (pixel resolution + refresh rate) the display this
+    // backend renders to supports, unshaped (the caller dedups + sorts).
+    // Default empty: a backend that cannot enumerate (or has no window) makes
+    // the Resolution row fall back to the static preset list.
+    fn display_modes(&self) -> Vec<crate::gfx::display_mode::DisplayMode> {
+        Vec::new()
+    }
+
+    // The mode the display is currently running, if the backend can read it.
+    // Shown by the Resolution row when the user has never chosen a mode (the
+    // display keeps its desktop mode until one is chosen). Default `None`.
+    fn current_display_mode(&self) -> Option<crate::gfx::display_mode::DisplayMode> {
+        None
+    }
+
+    // Select the display mode to hold while the window is in fullscreen. The
+    // backend applies it whenever the window is (or becomes) fullscreen and
+    // restores the display's original mode when the window leaves fullscreen
+    // or shuts down; outside fullscreen the choice is only remembered. Default
+    // no-op: a backend without mode switching leaves the display alone.
+    fn set_display_mode(&mut self, mode: crate::gfx::display_mode::DisplayMode) {
+        let _ = mode;
+    }
+
     // Replace the live post-process parameters (bloom / exposure / vignette /
     // LUT blend). These are pushed to the bloom + composite shaders each frame,
     // so a change takes effect on the next draw with no allocation or pipeline

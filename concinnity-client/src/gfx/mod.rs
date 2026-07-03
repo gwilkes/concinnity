@@ -45,6 +45,9 @@ pub(crate) mod camera_controller;
 pub(crate) mod csm;
 pub(crate) mod cursor;
 pub mod decal;
+// The display-mode list behind the "Resolution" settings row: label format,
+// dedup/sort, persisted-choice recovery, and the no-enumeration fallback.
+pub(crate) mod display_mode;
 pub mod draw_list;
 pub(crate) mod draw_slot;
 // Free pool for pre-reserved skinned instance slots, consumed by the runtime
